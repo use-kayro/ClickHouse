@@ -193,6 +193,8 @@ def rls_isolation(role):
         sql(role, f'GRANT SELECT ON lab.events TO {user}')
         sql(role, f'CREATE ROW POLICY IF NOT EXISTS tenant_{tenant} ON lab.events USING tenant = {tenant} TO {user}')
         expected[user] = sql(role, f'SELECT id FROM lab.events WHERE tenant={tenant} ORDER BY id')
+        assert expected[user], f'RLS fixture has no visible baseline for tenant {tenant}'
+    assert set(expected['lab_tenant_1'].splitlines()).isdisjoint(expected['lab_tenant_2'].splitlines())
     # Same SQL and alternating users exercise the reader filesystem cache.
     # Result caching is separate and is not enabled by our storage-cache rollout.
     for _ in range(3):
