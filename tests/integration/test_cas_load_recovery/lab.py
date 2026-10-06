@@ -19,9 +19,12 @@ def command(*args, timeout=40, input=None):
     return result.stdout.strip()
 
 
-def sql(role, query, timeout=20):
+def sql(role, query, timeout=20, user=None):
     assert role in ('writer', 'reader')
-    return command('exec', '-T', role, 'clickhouse-client', '--query', query, timeout=timeout)
+    args = ['exec', '-T', role, 'clickhouse-client']
+    if user:
+        args += ['--user', user]
+    return command(*args, '--query', query, timeout=timeout)
 
 
 def control(role, path, data=None):
@@ -182,6 +185,28 @@ def loading_fault(role, expect_recovery=False):
     assert all(m['lifecycle'] == 'live' for m in snapshot(role)['mount']), 'Storage itself has not recovered'
 
 
+def rls_isolation(role):
+    expected = {}
+    for tenant in (1, 2):
+        user = f'lab_tenant_{tenant}'
+        sql(role, f'CREATE USER {user}')
+        sql(role, f'GRANT SELECT ON lab.events TO {user}')
+        sql(role, f'CREATE ROW POLICY tenant_{tenant} ON lab.events USING tenant = {tenant} TO {user}')
+        expected[user] = sql(role, f'SELECT id FROM lab.events WHERE tenant={tenant} ORDER BY id')
+    # Same SQL and alternating users exercise cached reads without sharing results.
+    for _ in range(3):
+        for user, rows in expected.items():
+            actual = sql(role, 'SELECT id FROM lab.events ORDER BY id SETTINGS use_query_cache=1', user=user)
+            assert actual == rows, (user, actual, rows)
+    try:
+        sql(role, 'ALTER ROW POLICY tenant_1 ON lab.events USING 1', user='lab_tenant_1')
+    except RuntimeError as error:
+        assert 'ACCESS_DENIED' in str(error), str(error)
+    else:
+        raise AssertionError('Restricted user changed its row policy')
+    record('rls_same_query_isolated', {'role': role, 'visible_ids': expected, 'policy_change_denied': True})
+
+
 def terminal_fault(role):
     sql(role, 'SYSTEM CAS FORGET shared_s3')
     try:
@@ -217,7 +242,7 @@ def shutdown_fault(role):
 
 if __name__ == '__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('test', choices=['init','short','long','loading','terminal','shutdown','snapshot'])
+    p.add_argument('test', choices=['init','short','long','loading','terminal','shutdown','rls','snapshot'])
     p.add_argument('--role', choices=['writer','reader'], default='reader')
     p.add_argument('--expect-recovery', action='store_true', help='Require automatic recovery in the loading test')
     a=p.parse_args()
@@ -226,6 +251,7 @@ if __name__ == '__main__':
         elif a.test=='short': short_fault(a.role)
         elif a.test=='long': long_fault(a.role)
         elif a.test=='loading': loading_fault(a.role, a.expect_recovery)
+        elif a.test=='rls': rls_isolation(a.role)
         elif a.test=='terminal': terminal_fault(a.role)
         elif a.test=='shutdown': shutdown_fault(a.role)
         else: record('snapshot', {'role':a.role, **snapshot(a.role)})

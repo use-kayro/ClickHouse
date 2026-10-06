@@ -11,6 +11,8 @@ export CLICKHOUSE_IMAGE=REGISTRY/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc1
 python3 prepare.py
 docker compose up -d store keeper writer-proxy reader-proxy
 python3 lab.py init
+python3 lab.py rls --role writer
+python3 lab.py rls --role reader
 python3 lab.py loading --role writer --expect-recovery
 python3 lab.py loading --role reader --expect-recovery
 python3 lab.py loading --role writer --expect-recovery
