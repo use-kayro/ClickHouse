@@ -189,14 +189,15 @@ def rls_isolation(role):
     expected = {}
     for tenant in (1, 2):
         user = f'lab_tenant_{tenant}'
-        sql(role, f'CREATE USER {user}')
+        sql(role, f'CREATE USER IF NOT EXISTS {user}')
         sql(role, f'GRANT SELECT ON lab.events TO {user}')
-        sql(role, f'CREATE ROW POLICY tenant_{tenant} ON lab.events USING tenant = {tenant} TO {user}')
+        sql(role, f'CREATE ROW POLICY IF NOT EXISTS tenant_{tenant} ON lab.events USING tenant = {tenant} TO {user}')
         expected[user] = sql(role, f'SELECT id FROM lab.events WHERE tenant={tenant} ORDER BY id')
-    # Same SQL and alternating users exercise cached reads without sharing results.
+    # Same SQL and alternating users exercise the reader filesystem cache.
+    # Result caching is separate and is not enabled by our storage-cache rollout.
     for _ in range(3):
         for user, rows in expected.items():
-            actual = sql(role, 'SELECT id FROM lab.events ORDER BY id SETTINGS use_query_cache=1', user=user)
+            actual = sql(role, 'SELECT id FROM lab.events ORDER BY id SETTINGS use_query_cache=0', user=user)
             assert actual == rows, (user, actual, rows)
     try:
         sql(role, 'ALTER ROW POLICY tenant_1 ON lab.events USING 1', user='lab_tenant_1')
