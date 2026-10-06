@@ -11,6 +11,18 @@ Use an isolated ARM64 Ubuntu 24.04 AWS builder with Docker, CMake, Ninja,
 Clang/LLVM/LLD 21.1.8, nasm, yasm, gawk, pkg-config, and Rust
 `nightly-2026-03-22` (with `rust-src`) installed:
 
+For the isolated 64 GiB builder, reserve 64 GiB of temporary swap on its scratch
+EBS volume before linking the full debug/ThinLTO binary. This is builder-only;
+never run these commands on a serving ClickHouse node. The swap file is removed
+with the disposable builder volume:
+
+```sh
+sudo fallocate -l 64G /opt/tec-736/build.swap
+sudo chmod 600 /opt/tec-736/build.swap
+sudo mkswap /opt/tec-736/build.swap
+sudo swapon /opt/tec-736/build.swap
+```
+
 ```sh
 bash docker/kayro/build.sh REGISTRY/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc2
 ```
