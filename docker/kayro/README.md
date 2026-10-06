@@ -35,3 +35,20 @@ Shutdown during the outage completed in 3.61 seconds, exit 0.
 These synthetic tests do not establish production-load or RLS parity. Evidence is
 tracked in TEC-736 and use-kayro/kayro-infra PR #182. No production change is part
 of building or publishing this image.
+
+## Publish
+
+The publishing host needs AWS CLI v2 and permission to push to the existing ECR
+repository. Installing the AWS CLI ZIP distribution also requires `unzip`.
+Authenticate with the instance role; do not copy personal AWS credentials into
+the image or build context. After a successful build:
+
+```sh
+registry=474668394551.dkr.ecr.us-east-2.amazonaws.com
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin "$registry"
+docker push "$registry/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc1"
+docker logout "$registry"
+```
+
+The ECR repository is declared in `use-kayro/kayro-infra`, PR #184. No deployment
+is performed by these commands. Preserve the returned digest in the release record.
