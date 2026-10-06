@@ -8,20 +8,23 @@ and generic write retry/convergence errors retain their behavior.
 ## Build
 
 Use an isolated ARM64 Ubuntu 24.04 AWS builder with Docker, CMake, Ninja,
-Clang/LLVM/LLD 21.1.8, nasm, yasm, gawk and pkg-config installed:
+Clang/LLVM/LLD 21.1.8, nasm, yasm, gawk, pkg-config, and Rust
+`nightly-2026-03-22` (with `rust-src`) installed:
 
 ```sh
-bash docker/kayro/build.sh REGISTRY/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc1
+bash docker/kayro/build.sh REGISTRY/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc2
 ```
 
 The script builds this checkout, replaces the server binary in the pinned Altinity
 image, checks its SHA-256, and records the source commit in OCI labels. It does not
 push or change any deployed node. Use the registry digest, not a movable tag, in a
-future rollout. Build logs remain under `build/`.
+future rollout. Build logs remain under `build-release/`.
 
-This release candidate preserves the flags used in the successful AWS comparison:
-Release, thin LTO/tests/Rust/utilities/examples disabled. It is NOT yet qualified
-as feature-equivalent to the official distribution or approved for production.
+RC1 disabled Rust and was rejected by feature comparison: DeltaLake engines and
+table functions plus Wasmtime were missing. RC2 enables Rust and uses
+`RelWithDebInfo`, ThinLTO and the upstream ARM64 sysroot. Tests/utilities/examples
+remain disabled; those are build targets, not server features. Feature comparison
+and fault/RLS checks must pass on the resulting image before production rollout.
 The server version string stays upstream; identify this build by digest and labels.
 
 ## Validation
@@ -46,7 +49,7 @@ the image or build context. After a successful build:
 ```sh
 registry=474668394551.dkr.ecr.us-east-2.amazonaws.com
 aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin "$registry"
-docker push "$registry/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc1"
+docker push "$registry/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc2"
 docker logout "$registry"
 ```
 
