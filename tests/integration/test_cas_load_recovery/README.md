@@ -19,6 +19,10 @@ docker compose down -v
 ```
 
 Always run `docker compose down -v` after saving `.lab/results.jsonl`, including
-on test failure. For the unmodified control omit `--expect-recovery`: that test
-requires the cached `ASYNC_LOAD_WAIT_FAILED`/`NETWORK_ERROR` after storage recovery.
+on test failure. For the unmodified control, start a fresh environment and run only
+`python3 lab.py loading --role writer` after `init`. It requires the cached
+`ASYNC_LOAD_WAIT_FAILED`/`NETWORK_ERROR` after storage recovery; destroy that
+environment before running another control. The failed writer cannot be reused.
+To check terminal refusal, run `python3 lab.py terminal --role writer` after a
+successful recovery, then destroy the environment (do not reuse it for shutdown).
 Tests and compiles belong on AWS; redirect output to a build log for review.
