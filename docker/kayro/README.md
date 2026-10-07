@@ -48,9 +48,20 @@ recovered writer, reader and writer again, preserving exact rows and the table U
 a new row replicated after each recovery. Terminal disk refusal remained intact.
 Shutdown during the outage completed in 3.61 seconds, exit 0.
 
-These synthetic tests do not establish production-load or RLS parity. Evidence is
-tracked in TEC-736 and use-kayro/kayro-infra PR #182. No production change is part
-of building or publishing this image.
+The final RC2 image also passed comparison with the pinned official image:
+1,842 functions, 114 formats, 81 engines, 91 table functions and 1,713 settings
+matched exactly; enabled libraries include DeltaLake and Wasmtime. Build metadata
+is different, as expected for a downstream build.
+
+RC2 recovered writer and reader without a recovery restart, preserved the table
+UUID and replicated new rows. Identical queries by two restricted users returned
+disjoint, nonempty results before and after recovery; policy modification was
+refused. Terminal disk refusal remained intact. Shutdown during an outage took
+3.87 seconds with exit 0. These are isolated synthetic tests, not a production-load
+qualification or a guarantee against storage/network outages.
+
+Evidence is tracked in TEC-736 and attached to the RC2 release. No production
+change is part of building or publishing this image.
 
 ## Publish
 
