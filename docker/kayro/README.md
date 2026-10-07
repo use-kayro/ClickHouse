@@ -28,7 +28,8 @@ bash docker/kayro/build.sh REGISTRY/kayro/clickhouse:26.6.4.20001-kayro-cas1-rc2
 ```
 
 The script builds this checkout, replaces the server binary in the pinned Altinity
-image, checks its SHA-256, and records the source commit in OCI labels. It does not
+image using the upstream split-debug artifact, checks its SHA-256, and records
+the source commit in OCI labels. The complete binary stays in the build directory. It does not
 push or change any deployed node. Use the registry digest, not a movable tag, in a
 future rollout. Build logs remain under `build-release/`.
 

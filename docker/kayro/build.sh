@@ -17,7 +17,7 @@ CC=clang-21 CXX=clang++-21 cmake -S . -B build-release -G Ninja \
   > build-release/configure.log 2>&1
 cmake --build build-release --target clickhouse > build-release/compile.log 2>&1
 mkdir -p build-release/kayro-image
-cp build-release/programs/clickhouse build-release/kayro-image/clickhouse
+cp build-release/programs/stripped/bin/clickhouse build-release/kayro-image/clickhouse
 revision=$(git rev-parse HEAD)
 binary_sha=$(sha256sum build-release/kayro-image/clickhouse | cut -d ' ' -f 1)
 docker build -f docker/kayro/Dockerfile --build-arg SOURCE_COMMIT="$revision" \
