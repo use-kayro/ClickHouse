@@ -46,15 +46,26 @@ Disks casRecordDisks(const Disks & disks);
 /// that check; the part then replicates by the ordinary fetch.
 std::optional<String> makeCasPartRecord(const IMergeTreeDataPart & part);
 
+/// How the committing replica got the part. Only a replica that produced it (an insert, a local merge or
+/// mutation, a REPLACE clone) may create its record; a replica that fetched it only checks the record, so a
+/// fetch can never resurrect a record the pool's GC has removed (step 2). Parts that predate records get
+/// theirs from the boot backfill (`StorageReplicatedMergeTree::backfillCasPartRecords`).
+enum class CasPartRecordCommit : uint8_t
+{
+    Produced,
+    Fetched,
+};
+
 /// What a commit of `part` adds to `ops` for its Keeper record at `<records_path>/<part>`:
-///  - the part is held from its record (it was attached from Keeper), or the record already exists (another
-///    replica produced the same part): a check that the node exists;
-///  - else, the node is created when the part has a record (`makeCasPartRecord`).
-/// (Not a create-if-not-exists op: Keeper's `CREATE_IF_NOT_EXISTS` feature can be disabled.) Called after the
-/// part's disk transaction is committed, so its manifest is published.
+///  - the part is held from its record, or the record exists: a check that the node exists (the reader's
+///    side of the serialization with the GC's removal of the record);
+///  - else, for a produced part only, the node is created when the part has a record (`makeCasPartRecord`).
+/// Records are immutable and are never removed in step 1. (Not a create-if-not-exists op: Keeper's
+/// `CREATE_IF_NOT_EXISTS` feature can be disabled.) Called after the part's disk transaction is committed,
+/// so its manifest is published.
 void addCasPartRecordOps(
     const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & records_path, const IMergeTreeDataPart & part,
-    Coordination::Requests & ops);
+    CasPartRecordCommit how, Coordination::Requests & ops);
 
 /// Make the disk-relative part directory `part_path` hold the part `record` describes, on the disk of
 /// `candidates` whose pool the record names. Returns that disk, or nullptr -- changing nothing -- when no

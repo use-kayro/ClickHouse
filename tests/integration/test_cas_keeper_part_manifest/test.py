@@ -342,17 +342,15 @@ def test_writer_boot_backfills_missing_records():
             )
         )
 
-    # Both replicas commit as a build without records did (the reader's own commit of a part it fetched
-    # would otherwise create the missing record, the same online backfill every committing replica does).
-    for node in (writer, reader):
-        node.query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
+    # The writer commits as a build without records did. The reader fetches by relink (there is no record)
+    # and its fetch commit never creates one: only a replica that produced a part may.
+    writer.query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
     try:
         for i in range(3):
             insert(i * 1000)
-        reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)  # relink: there is no record
+        reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
     finally:
-        for node in (writer, reader):
-            node.query("SYSTEM DISABLE FAILPOINT cas_part_record_omit")
+        writer.query("SYSTEM DISABLE FAILPOINT cas_part_record_omit")
     assert record_lengths(writer, table) == {}
     # As a table created by a build without records: not even the parent node exists. The attach thread
     # creates it before backfilling.

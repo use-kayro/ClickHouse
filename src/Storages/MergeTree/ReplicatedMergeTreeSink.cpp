@@ -1044,7 +1044,7 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
         /// Rename parts before committing to ZooKeeper without holding DataPartsLock.
         transaction.renameParts();
         /// After the rename, which publishes the part's manifest: its Keeper record.
-        addCasPartRecordOps(zookeeper, casPartRecordsPath(storage.getZooKeeperPath()), *part, ops);
+        addCasPartRecordOps(zookeeper, casPartRecordsPath(storage.getZooKeeperPath()), *part, CasPartRecordCommit::Produced, ops);
 
         ThreadFuzzer::maybeInjectSleep();
 

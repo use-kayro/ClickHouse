@@ -2347,7 +2347,8 @@ bool StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(
     const DataPartPtr & part,
     Coordination::Requests & ops,
     String part_name,
-    NameSet & absent_replicas_paths)
+    NameSet & absent_replicas_paths,
+    CasPartRecordCommit cas_record_commit)
 {
     if (part_name.empty())
         part_name = part->name;
@@ -2435,7 +2436,7 @@ bool StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(
             ops.emplace_back(zkutil::makeCreateRequest(
                 fs::path(part_path) / "checksums", getChecksumsForZooKeeper(part->checksums), zkutil::CreateMode::Persistent));
         }
-        addCasPartRecordOps(zookeeper, casPartRecordsPath(zookeeper_path), *part, ops);
+        addCasPartRecordOps(zookeeper, casPartRecordsPath(zookeeper_path), *part, cas_record_commit, ops);
     }
     else
     {
@@ -2447,7 +2448,7 @@ bool StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(
 
 bool StorageReplicatedMergeTree::getOpsToCheckPartChecksumsAndCommit(const ZooKeeperWithFaultInjectionPtr & zookeeper,
     const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files, bool replace_zero_copy_lock,
-    Coordination::Requests & ops, size_t & num_check_ops)
+    Coordination::Requests & ops, size_t & num_check_ops, CasPartRecordCommit cas_record_commit)
 {
     LOG_DEBUG(log, "Committing part {} to zookeeper", part->name);
 
@@ -2457,7 +2458,7 @@ bool StorageReplicatedMergeTree::getOpsToCheckPartChecksumsAndCommit(const ZooKe
     getLockSharedDataOps(*part, zookeeper, replace_zero_copy_lock, hardlinked_files, ops);
 
     /// Checksums are checked here and `ops` is filled. In fact, the part is added to ZK just below, when executing `multi`.
-    bool part_found = checkPartChecksumsAndAddCommitOps(zookeeper, part, ops, part->name, absent_part_paths_on_replicas);
+    bool part_found = checkPartChecksumsAndAddCommitOps(zookeeper, part, ops, part->name, absent_part_paths_on_replicas, cas_record_commit);
 
     num_check_ops = 2 * absent_part_paths_on_replicas.size() + (ops.size() - prev_ops_size);
 
@@ -2485,7 +2486,8 @@ bool StorageReplicatedMergeTree::getOpsToCheckPartChecksumsAndCommit(const ZooKe
 
 
 MergeTreeData::DataPartsVector StorageReplicatedMergeTree::checkPartChecksumsAndCommit(Transaction & transaction,
-    const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files, bool replace_zero_copy_lock)
+    const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files, bool replace_zero_copy_lock,
+    CasPartRecordCommit cas_record_commit)
 {
     auto zookeeper = std::make_shared<ZooKeeperWithFaultInjection>(getZooKeeper());
 
@@ -2494,7 +2496,7 @@ MergeTreeData::DataPartsVector StorageReplicatedMergeTree::checkPartChecksumsAnd
         /// Do not commit if the part is obsolete, but check it's checksums just in case. It may throw if checksums mismatch
         Coordination::Requests ops;
         size_t num_check_ops = 0;
-        getOpsToCheckPartChecksumsAndCommit(zookeeper, part, hardlinked_files, replace_zero_copy_lock, ops, num_check_ops);
+        getOpsToCheckPartChecksumsAndCommit(zookeeper, part, hardlinked_files, replace_zero_copy_lock, ops, num_check_ops, cas_record_commit);
         return {};
     }
 
@@ -2509,7 +2511,7 @@ MergeTreeData::DataPartsVector StorageReplicatedMergeTree::checkPartChecksumsAnd
 
         Coordination::Requests ops;
         size_t num_check_ops = 0;
-        getOpsToCheckPartChecksumsAndCommit(zookeeper, part, hardlinked_files, replace_zero_copy_lock, ops, num_check_ops);
+        getOpsToCheckPartChecksumsAndCommit(zookeeper, part, hardlinked_files, replace_zero_copy_lock, ops, num_check_ops, cas_record_commit);
 
         Coordination::Responses responses;
         Coordination::Error e{};
@@ -3221,6 +3223,9 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
         /// A replica that will be used to fetch part
         String replica;
 
+        /// The part was cloned from the local source table (produced here), not fetched
+        bool cloned = false;
+
         HardlinkedFiles hardlinked_files;
 
         scope_guard temporary_part_lock;
@@ -3507,6 +3512,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
                 getContext()->getWriteSettings(),
                 true/*must_on_same_disk*/);
             part_desc->res_part = std::move(res_part);
+            part_desc->cloned = true;
             part_desc->temporary_part_lock = std::move(temporary_part_lock);
         }
         else if (!part_desc->replica.empty())
@@ -3565,8 +3571,9 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
         }
         transaction.renameParts();
         /// After the rename, which publishes the parts' manifests: their Keeper records.
-        for (const auto & part : res_parts)
-            addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part, ops);
+        for (const auto & part_desc : final_parts)
+            addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part_desc->res_part,
+                part_desc->cloned ? CasPartRecordCommit::Produced : CasPartRecordCommit::Fetched, ops);
 
 
         if (!ops.empty())
@@ -5971,7 +5978,8 @@ bool StorageReplicatedMergeTree::fetchPart(
             transaction.renameParts();
 
             chassert(!part_to_clone || !is_zero_copy_part(part));
-            replaced_parts = checkPartChecksumsAndCommit(transaction, part, /*hardlinked_files*/ {}, /*replace_zero_copy_lock*/ true);
+            replaced_parts = checkPartChecksumsAndCommit(transaction, part, /*hardlinked_files*/ {}, /*replace_zero_copy_lock*/ true,
+                CasPartRecordCommit::Fetched);
 
             /** If a quorum is tracked for this part, you must update it.
               * If you do not have time, in case of losing the session, when you restart the server - see the `ReplicatedMergeTreeRestartingThread::updateQuorumIfWeHavePart` method.
@@ -10008,7 +10016,8 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
             transaction.renameParts();
             /// After the rename, which publishes the parts' manifests: their Keeper records.
             for (const auto & part : dst_parts)
-                addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part, ops);
+                addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part,
+                    CasPartRecordCommit::Produced, ops);
 
             for (const auto & dst_part : dst_parts)
                 lockSharedData(*dst_part, false, /*hardlinked_files*/ {});

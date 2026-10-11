@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Interpreters/CancellationCode.h>
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/PartLog.h>
 #include <Parsers/SyncReplicaMode.h>
@@ -661,16 +662,19 @@ private:
         const DataPartPtr & part,
         Coordination::Requests & ops,
         String part_name,
-        NameSet & absent_replicas_paths);
+        NameSet & absent_replicas_paths,
+        CasPartRecordCommit cas_record_commit = CasPartRecordCommit::Produced);
 
     String getChecksumsForZooKeeper(const MergeTreeDataPartChecksums & checksums) const;
 
     bool getOpsToCheckPartChecksumsAndCommit(const ZooKeeperWithFaultInjectionPtr & zookeeper, const MutableDataPartPtr & part,
                                              std::optional<HardlinkedFiles> hardlinked_files, bool replace_zero_copy_lock,
-                                             Coordination::Requests & ops, size_t & num_check_ops);
+                                             Coordination::Requests & ops, size_t & num_check_ops,
+                                             CasPartRecordCommit cas_record_commit = CasPartRecordCommit::Produced);
 
     /// Accepts a PreActive part, atomically checks its checksums with ones on other replicas and commit the part
-    DataPartsVector checkPartChecksumsAndCommit(Transaction & transaction, const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files = {}, bool replace_zero_copy_lock=false);
+    DataPartsVector checkPartChecksumsAndCommit(Transaction & transaction, const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files = {}, bool replace_zero_copy_lock=false,
+                                                CasPartRecordCommit cas_record_commit = CasPartRecordCommit::Produced);
 
     bool partIsAssignedToBackgroundOperation(const DataPartPtr & part) const override;
 

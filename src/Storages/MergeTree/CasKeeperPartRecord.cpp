@@ -83,7 +83,7 @@ std::optional<String> makeCasPartRecord(const IMergeTreeDataPart & part)
 
 void addCasPartRecordOps(
     const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & records_path, const IMergeTreeDataPart & part,
-    Coordination::Requests & ops)
+    CasPartRecordCommit how, Coordination::Requests & ops)
 {
     const auto disk = part.storage.getStoragePolicy()->tryGetDiskByName(part.getDataPartStorage().getDiskName());
     const auto * ca = tryGetContentAddressedExchange(disk);
@@ -97,6 +97,8 @@ void addCasPartRecordOps(
         ops.emplace_back(zkutil::makeCheckRequest(path, -1));
         return;
     }
+    if (how != CasPartRecordCommit::Produced)
+        return;
     if (auto record = makeCasPartRecord(part))
         ops.emplace_back(zkutil::makeCreateRequest(path, *record, zkutil::CreateMode::Persistent));
 }
