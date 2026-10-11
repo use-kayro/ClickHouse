@@ -110,7 +110,7 @@ Regra de aceite (decisão do dono, 11/10 ~20:00Z): por evidência, não por rel�
 | Reader compartilhado `i-02369cef982eb67d2` | 21:55:05Z → 21:55:28Z; container às 21:55:11Z | Health OK às 22:06Z: CAS `reader` live na época 13; loader 1.223 OK, 0 falhas; 16 bancos, 0 readonly, atraso 0. A primeira consulta a `system.replicas` ficou bloqueada ~582 s durante o start. Nenhuma classe de erro nova. Leases do writer (época 33) e do reader-mdb intactos. Backups: `…pre-image-20261011T215505839721Z` e `…20261011T215505841755Z`. Aceite final: não registrado quando este arquivo foi escrito |
 | Writer `i-02e3809e0b416b25e` | **planejado** para 11/10 22:33Z, se a observação do compartilhado (21:55–22:25Z) sair limpa | Guarda de INSERT; depois do restart, `system.settings` tem que mostrar `wait_for_async_insert=1` e `async_insert_busy_timeout_max_ms=200` (limpa a sobra do perfil `kayro_batch`, kayro-infra #225, TEC-847). Resultado: não registrado quando este arquivo foi escrito |
 
-### Medição do fix: ainda pendente
+### Medição do fix no líder do GC
 
 O restart do reader-mdb soltou o lease do GC: o reader compartilhado (ainda RC2) virou líder às 20:55:25Z, então o critério wasted/hit não pôde ser lido no reader-mdb e passou para "o nó que liderar o GC já no RC3". Depois do restart do compartilhado, **o reader-mdb (RC3) voltou a liderar o GC por volta de 22:05Z** (`is_leader=1` às 22:07:02Z). É nele que se lê `CASGCReadAheadWasted == 0` com `Hit > 0`, com concorrência padrão:
 
@@ -120,7 +120,18 @@ SELECT toStartOfHour(event_time) h, sum(ProfileEvent_S3GetObject) get, sum(Profi
 FROM system.metric_log WHERE event_time >= toStartOfHour(now()) - INTERVAL 3 HOUR GROUP BY h ORDER BY h;
 ```
 
-Se der `wasted > 0`, a saída é só config (`cas_gc_read_concurrency=1`), sem efeito nas decisões do GC. O rollout só termina com essa medição registrada na TEC-844.
+Primeiras rodadas do reader-mdb como líder no RC3, com concorrência padrão (16):
+
+| Rodada | Hora | `CASGCReadAheadWasted` | `CASGCReadAheadHit` | GET 404 | Observação |
+|---|---|---:|---:|---:|---|
+| 1 | 22:07Z | 19 | 2.908 | 337 | rodada de tomada da liderança |
+| 2 | 22:18Z | 1 | 2.213 | 2 | |
+
+Referência no RC2: ~1.000 GET 404 por hora no reader-mdb com read-ahead desligado.
+
+Leitura: `CASGCReadAheadWasted` não conta só 404. Ele também conta slots de read-ahead esperados que a rodada não chegou a consumir, então um valor pequeno e diferente de zero não significa chave inexistente pedida ao S3. O número que mostra o fix é o de 404 por rodada: 2 na rodada 2, contra ~1.000/h no RC2.
+
+Se o desperdício voltar a crescer, a saída é só config (`cas_gc_read_concurrency=1`), sem efeito nas decisões do GC.
 
 Linha de base do reader-mdb no RC2 com concorrência 1, como líder (19:56Z): GET 89.615 / 76.221 / 35.365 por hora (16:00, 17:00, 18:00Z), read_err 604–1.060/h, `pending_reclaim` 472.
 
