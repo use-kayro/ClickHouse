@@ -476,27 +476,15 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             }
             break;
         }
-        case Type::CAS_GC_REBUILD:
-        {
-            /// SYSTEM CAS GC REBUILD [FORCE] <disk> [ON CLUSTER cluster]. Unlike the
-            /// per-round GC RUN command, REBUILD requires an EXPLICIT disk: the destructive
-            /// baseline rebuild must never fan out across every content-addressed disk from a bare
-            /// command. parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
-            /// syntax error.
-            res->cas_gc_rebuild_force = ParserKeyword{Keyword::FORCE}.ignore(pos, expected);
-            if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
-                return false;
-            break;
-        }
         case Type::CAS_FSCK:
         case Type::CAS_FORGET:
         case Type::CAS_GC_STOP:
         case Type::CAS_GC_START:
         {
             /// SYSTEM CAS FSCK/FORGET/GC STOP/GC START <disk> [ON CLUSTER cluster].
-            /// Unlike GC RUN, the disk is REQUIRED -- mirrors CAS_GC_REBUILD (minus the FORCE
-            /// keyword): parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
-            /// syntax error rather than a silent fan-out across every content-addressed disk.
+            /// Unlike GC RUN, the disk is REQUIRED: parseQueryWithOnClusterAndTarget requires the
+            /// target, so omitting the disk is a syntax error rather than a silent fan-out across every
+            /// content-addressed disk.
             if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
                 return false;
             break;

@@ -6,13 +6,12 @@
 ///
 /// THE KEY GATE (`ShardOfBitIdenticalToOldHighBitsOver200RandomValues` below): `DigestCodec`'s
 /// `shardOf` (an explicit big-endian read of the first 8 digest bytes) must be bit-identical to
-/// today's `static_cast<uint64_t>(blob_hash >> 64)` (`CasGcShardPlan.h`'s `blobShard`) for every
+/// today's `static_cast<uint64_t>(blob_hash >> 64)` for every
 /// 128-bit digest -- otherwise an existing cityHash128/xxh3-128 pool would silently reshard on
 /// upgrade. This is load-bearing: it is what makes Phase 2 safe to land under running pools.
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
@@ -83,10 +82,6 @@ TEST(CASBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
     {
         const UInt128 v = randomU128(rng);
         EXPECT_EQ(codec.shardOf(BlobDigest::fromU128(v)), static_cast<uint64_t>(v >> 64));
-        /// `blobShard` (`CasGcShardPlan.h`) additionally takes `% gc_shards`; at `gc_shards == 1`
-        /// every hash routes to shard 0, so this only pins the trivial single-shard case -- the
-        /// bit-identical pre-mod value is already pinned by the assertion above.
-        EXPECT_EQ(blobShard(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(v)}, /*gc_shards*/ 1), 0u);
     }
 }
 

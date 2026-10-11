@@ -2,7 +2,6 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -49,7 +48,7 @@ uint64_t totalRequestsFor(const CountingBackend & inner, const String & key)
 }
 
 /// The `ThrottlingBackend` gate: every user-visible statement -- table creation, an
-/// insert, a rename, a drop, the writable mount `Pool::open` itself performs, and one GC round -- must
+/// insert, a rename, a drop, and the writable mount `Pool::open` itself performs -- must
 /// still SUCCEED when every key it touches is refused exactly once (`FirstPerKey`, HTTP 429) before it
 /// is honored. `refusals(key) == 1` for every key the gate recorded, and every one of them was requested
 /// at least twice: once refused, at least once more to actually land.
@@ -84,10 +83,6 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     ASSERT_NO_THROW(store->dropRef(ns, "inserted"));
     EXPECT_TRUE(store->resolveRef(ns, "renamed").has_value());
     EXPECT_FALSE(store->resolveRef(ns, "inserted").has_value());
-
-    /// One GC round, still under throttling.
-    Gc gc(store, UInt128{7101});
-    ASSERT_NO_THROW(DB::Cas::tests::runRegularRoundReclaiming(gc));
 
     /// DROP-shaped: the whole namespace goes last, so the statements above still have something to act on.
     ASSERT_NO_THROW(store->dropNamespace(ns));

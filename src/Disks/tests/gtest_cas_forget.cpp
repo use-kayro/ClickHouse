@@ -250,7 +250,8 @@ TEST(CASForget, ForgetStopsAndJoinsRealGcScheduler)
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
 
-    Cas::CasGcScheduler sched(store, std::chrono::seconds(3600), "CasForgetTest", "forget-disk");
+    Cas::CasGcScheduler sched(store, std::chrono::seconds(3600), "CasForgetTest", "forget-disk",
+        [] { return Cas::KeeperRecordSources{}; });
     sched.start();
 
     bool gc_joined = false;
@@ -525,86 +526,4 @@ TEST(CASForget, GcRunAdmittedWhileLiveRefusesAfterConcurrentForget)
     EXPECT_FALSE(storage->gcHealth().has_value())
         << "a GC RUN refused post-FORGET must NOT recreate the scheduler on a Vanished pool";
     EXPECT_EQ(pool->lifecycle(), PoolLifecycle::VanishedForgotten);
-}
-
-/// (I-2 regression) A `SYSTEM CAS GC REBUILD` holds `gc_scheduler_mutex` for its whole
-/// duration, so a concurrent FORGET must SERIALIZE behind it — FORGET cannot report the disk decommissioned
-/// while the rebuild is still issuing durable `gc/`-plane writes. Deterministic (bounded cv waits + a bounded
-/// negative future poll anchored by a positive control, never a sleep-to-fix-a-race): the in-lock seam parks
-/// the rebuild WHILE it holds the mutex; a FORGET launched in that window must NOT complete until the rebuild
-/// releases the lock. The pre-fix `runGcRebuildNow` took NO lock, so an in-flight rebuild was invisible to
-/// FORGET and FORGET would complete immediately. Verified RED against the pre-fix code (see task-17-report.md).
-TEST(CASForget, GcRebuildInFlightSerializesForget)
-{
-    auto storage = openForgetStorage();
-    auto pool = storage->store();   /// captured while Live
-    ASSERT_EQ(pool->lifecycle(), PoolLifecycle::Live);
-
-    std::mutex m;
-    std::condition_variable cv;
-    bool rebuild_holds_lock = false;
-    bool may_release = false;
-
-    /// In-lock seam: fires WHILE the rebuild holds `gc_scheduler_mutex`. It parks there (bounded) until the
-    /// coordinator has verified FORGET is blocked, then lets the rebuild finish and release the lock.
-    storage->setGcVerbAdmitWindowHookForTest([&]
-    {
-        {
-            std::lock_guard lk(m);
-            rebuild_holds_lock = true;
-        }
-        cv.notify_all();
-        std::unique_lock lk(m);
-        EXPECT_TRUE(cv.wait_for(lk, std::chrono::seconds(30), [&] { return may_release; }))
-            << "the coordinator must release the in-flight rebuild within the bound";
-    });
-
-    /// The rebuild runs on its own thread; it holds the lock through the seam above.
-    std::promise<void> rebuild_done_p;
-    auto rebuild_done = rebuild_done_p.get_future();
-    std::thread rebuilder([&]
-    {
-        /// On release the pool may already be Vanished (RED path: FORGET ran unserialized) — `store()` then
-        /// throws; swallow it, the assertions below carry the verdict.
-        try { storage->runGcRebuildNow(/*force=*/false); } catch (...) {} // NOLINT(bugprone-empty-catch)
-        rebuild_done_p.set_value();
-    });
-
-    /// Wait until the rebuild is genuinely in flight (holding the lock).
-    {
-        std::unique_lock lk(m);
-        ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(30), [&] { return rebuild_holds_lock; }))
-            << "the rebuild must reach its in-lock seam";
-    }
-
-    /// Launch FORGET while the rebuild holds the lock. With the fix it BLOCKS on `gc_scheduler_mutex`;
-    /// without the fix (pre-fix rebuild took no lock) it runs straight through.
-    std::promise<void> forget_done_p;
-    auto forget_done = forget_done_p.get_future();
-    std::thread forgetter([&] { storage->forgetDisk(); forget_done_p.set_value(); });
-
-    /// The discriminator: FORGET must NOT complete while the rebuild holds the lock. This bounded negative
-    /// observation is anchored by the positive control below (FORGET DOES complete once the lock releases),
-    /// so the window's meaning is real, not a race hidden behind a sleep.
-    EXPECT_EQ(forget_done.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
-        << "FORGET must serialize behind an in-flight GC rebuild (the rebuild holds gc_scheduler_mutex)";
-
-    /// Release the in-flight rebuild; it finishes and drops the lock, and FORGET can now proceed.
-    {
-        std::lock_guard lk(m);
-        may_release = true;
-    }
-    cv.notify_all();
-
-    ASSERT_EQ(rebuild_done.wait_for(std::chrono::seconds(30)), std::future_status::ready)
-        << "the rebuild must complete after release";
-    ASSERT_EQ(forget_done.wait_for(std::chrono::seconds(30)), std::future_status::ready)
-        << "once the rebuild releases the lock, the serialized FORGET completes (positive control)";
-
-    rebuilder.join();
-    forgetter.join();
-    storage->setGcVerbAdmitWindowHookForTest({});
-
-    EXPECT_EQ(pool->lifecycle(), PoolLifecycle::VanishedForgotten)
-        << "FORGET settles the pool Vanished(forgotten) once it is no longer serialized behind the rebuild";
 }

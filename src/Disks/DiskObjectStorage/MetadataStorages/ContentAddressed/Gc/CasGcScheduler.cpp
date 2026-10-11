@@ -189,10 +189,8 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(GcRoundLogRecord::Trigger trigge
 
     Rec fin = start;
     fin.event_type = Rec::EventType::Finish;
-    /// Lives OUTSIDE the try and is filled progressively by the round (the `progress` out-parameter of
-    /// `runRegularRound`), so the Finish row of a THROWING round still carries everything the round
-    /// durably did before it died -- `round != 0` on such a row proves the round's `gc/state` CAS
-    /// committed and the failure hit the post-CAS tail.
+    /// Lives OUTSIDE the try and is filled progressively by `KeeperGc::runRound`, so the Finish row of a
+    /// THROWING round still carries everything the round did before it died.
     Cas::RoundReport rep;
     const auto fill_counters = [&fin](const Cas::RoundReport & r)
     {

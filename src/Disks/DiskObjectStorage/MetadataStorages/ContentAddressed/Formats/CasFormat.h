@@ -36,8 +36,8 @@ enum class FormatId : uint16_t
     PoolMeta = 8,
     Roster = 9,
     /// Value 10 is retired: discovery authority is the pool-wide `cas/ref_catalog` object rather
-    /// than a roots registry object or a physical stream listing.
-    GcOutcomes = 11,
+    /// than a roots registry object or a physical stream listing. Value 11 (the GC outcome log) is
+    /// retired with the S3-listing GC round. Keep both unused.
     PartManifest = 12,    /// Immutable root-local `cas_part_manifest` payload-hybrid text object.
     RunFile = 13,         /// Deterministic, uncompressed `cas_run` GC source-edge NDJSON stream.
     FoldSeal = 14,        /// Write-once `cas_fold_seal` coverage and blob-target/cleanup-run object.
@@ -55,7 +55,7 @@ enum class FormatId : uint16_t
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
-    GcMaintenanceState = 25, /// cas_gc_maintenance_state — leak-only namespace-janitor cursor
+    /// Value 25 (the namespace-janitor cursor) is retired with the S3-listing GC round. Keep it unused.
     PartFiles = 26,       /// cas_part_files  — a part's Inline entries, held in Keeper (`<zookeeper_path>/cas_parts/<part>`)
 };
 

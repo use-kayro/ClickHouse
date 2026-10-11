@@ -130,7 +130,7 @@ void seedAuthoritativeStream(Backend & backend, const Layout & layout, const Roo
 }
 
 /// This is deliberately caller-side plumbing, not a convenience overload in `CasRefProtocol`: production
-/// callers obtain `entry` from their frozen `RefPlan::catalogCut` and sample `_ckpt` in the same plan.
+/// callers obtain `entry` from a frozen catalog cut and sample `_ckpt` alongside it.
 /// The API under test receives those exact values and performs no catalog or checkpoint resolution itself.
 RecoveredRefTable recoverFromCurrentCatalogCut(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {

@@ -60,7 +60,7 @@ TEST(CASBlobMeta, DeleteMetaExactMatchesTheObservedIncarnation)
 
 /// Phase 3 T3 (mixed-algo pools, was CAS pluggable-blob-hash Phase 2 Task 5 crux Test 2): the `.meta`
 /// API round-trips a 32-byte (`sha256`-width) `BlobRef` key — the meta object lands under a 64-hex
-/// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface PartWriteTxn/Gc
+/// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface PartWriteTxn/GC
 /// use, just at a wider algo.
 TEST(CASBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
 {

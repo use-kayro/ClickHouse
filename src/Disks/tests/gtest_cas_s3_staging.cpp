@@ -960,7 +960,7 @@ TEST(CASStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
 
 /// (d) GC's blob-discovery LISTs ONLY `Layout::blobsPrefix()` (`<pool>/blobs/`) — a top-level prefix
 /// strictly disjoint from the S3-staging area (`<pool>/staging/<mount_id>/`), so a staging object can
-/// never be listed, HEAD'd, or condemned as an orphan blob by GC's fold (`CasGc.cpp`, `CasFsck.cpp`).
+/// never be listed, HEAD'd, or condemned as an orphan blob (`CasFsck.cpp`).
 /// This is a prefix-separation assertion (the GC fold itself is not unit-testable in isolation from a
 /// full round — see `gtest_cas_gc_fold.cpp` for that machinery); it pins the invariant a refactor that
 /// nested `staging/` under `blobs/` (or vice versa) would violate.

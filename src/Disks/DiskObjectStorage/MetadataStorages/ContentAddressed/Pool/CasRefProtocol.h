@@ -578,9 +578,9 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
 /// Pure ref-log intake primitives for a GC round. None of these read a
 /// manifest body, a snapshot body, or `gc/state`: they turn a global `LIST cas/ns/stream/` result and the
 /// decoded bodies of new transactions into (a) the per-table log/snapshot/marker listing, (b) the
-/// deterministic manifest-edge delta, and (c) the exact ref-object cleanup plan. The GC round
-/// (`CasGc.cpp`) drives the manifest-body reads (`foldManifestEdges`), the fold barrier, the durable
-/// cursor, and the batch deletions around these functions. Keeping the delta and cleanup logic pure
+/// deterministic manifest-edge delta, and (c) the exact ref-object cleanup plan. The GC round that
+/// drove the manifest-body reads, the fold barrier, the durable cursor, and the batch deletions around
+/// these functions is gone; see `Gc/CasKeeperGc.h`. Keeping the delta and cleanup logic pure
 /// makes it directly unit-testable (`gtest_cas_ref_intake.cpp`) without a full round.
 
 /// One `+1`/`-1` manifest edge emitted by one ref-log operation.
@@ -617,10 +617,7 @@ struct RefManifestEdge
 /// promote whose old/new ref_name disagree, or any other kind combination -- throws `CORRUPTED_DATA`.
 /// These are exactly the shapes `applyRefLogTxn`/`replay` already reject at the state-machine layer, so
 /// a hand-corrupted or adversarial log body is the only way this branch is reached; a legitimately
-/// written log never produces one. The GC fold (`CasGc.cpp`) extracts edges inside the same try-block
-/// as `decodeRefLogTxn`, so the throw gets the identical "ref log body invalid: ref folding aborted
-/// this round" treatment as an undecodable body -- no cursor advance, no deletions, an anomaly
-/// recorded. The orphan sweep (`CasOrphanManifestSweep.cpp`) catches it around the whole
+/// written log never produces one. The orphan sweep (`CasOrphanManifestSweep.cpp`) catches it around the whole
 /// `activeManifestKeys` construction and skips (or marks errored) that namespace's deletions rather
 /// than trusting an incomplete protection view.
 /// The `remove_namespace` operation changes lifecycle only; the exact owner removals that must precede

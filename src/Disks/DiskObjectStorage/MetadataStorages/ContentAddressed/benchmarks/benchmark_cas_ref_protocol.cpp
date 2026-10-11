@@ -33,7 +33,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-/// Pure measurement, no pass/fail assertions -- see the cas-gc-rebuild BACKLOG.md entries
+/// Pure measurement, no pass/fail assertions -- see the BACKLOG.md entries
 /// "OPTIMIZATION OPPORTUNITY -- ref-ledger JSON encoding writes byte-by-byte" and the (now
 /// RESOLVED) "admits() re-encodes the WHOLE ref table once per state-growing op" entry for the
 /// investigation these benchmarks measure. Build with `-DENABLE_BENCHMARKS=ON` and run the

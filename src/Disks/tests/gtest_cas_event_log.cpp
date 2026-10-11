@@ -1,7 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -16,8 +14,6 @@
 #include <utility>
 #include <vector>
 using namespace DB::Cas;
-using DB::Cas::tests::idOf;
-using DB::Cas::tests::u128Of;
 
 namespace DB::ErrorCodes
 {
@@ -610,154 +606,4 @@ TEST(CASEvent, EmitEventMovesSourceIntoSink)
     /// `e` here is the whole point of the test, not an oversight.
     EXPECT_TRUE(e.reason.empty()); // NOLINT(bugprone-use-after-move, hicpp-invalid-access-moved)
     EXPECT_TRUE(e.detail.empty()); // NOLINT(bugprone-use-after-move, hicpp-invalid-access-moved)
-}
-
-namespace
-{
-
-/// A single-blob part: upload one blob, stage a one-entry manifest naming it, precommit + promote the
-/// ref. Returns the blob's object_hash (lowercase hex) so the test can filter the captured rows by it.
-String publishOneBlobPart(const PoolPtr & s, const String & ns, const String & ref, const String & payload)
-{
-    const RootNamespace nsr{ns};
-    PartWriteInfo info;
-    info.intended_ref = ns + "/" + ref;
-    auto build = s->beginPartWrite(info);
-    ManifestEntry e;
-    e.path = "data.bin";
-    e.placement = EntryPlacement::Blob;
-    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(payload))};
-
-    e.blob_size = payload.size();
-    const ManifestId id = build->stageManifest({e});
-    build->precommitAdd(nsr, ref, id);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
-    build->promote(nsr, ref, build->buildId(), id);
-    /// Phase 3 (mixed-algo pools): every blob-content-hash event render is `blobIdOf(ref)`
-    /// ("<algoName>:<hex>"), never a bare hex -- the prime directive that a digest never appears
-    /// without its algo.
-    return DB::Cas::blobIdOf(e.ref);
-}
-
-/// Whether the CURRENT retired list (any gc-shard) still holds an entry (ack-floor pipeline in flight).
-bool anyRetiredPending(const PoolPtr & s)
-{
-    /// Condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
-    /// separate retired list — reconstruct the in-flight set from the seal.
-    return DB::Cas::tests::anyCondemnedInSeal(*s->poolBackendPtr(), s->layout());
-}
-
-/// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
-/// stay alive while any work counter is nonzero OR an in-flight retired entry remains).
-void runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
-{
-    for (size_t r = 0; r < max_rounds; ++r)
-    {
-        const RoundReport rep = DB::Cas::tests::runRegularRoundReclaiming(gc);
-        if (!rep.acquired_lease)
-            continue;
-        s->renewWatermarkOnce();
-        const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
-            && rep.replaced == 0 && rep.spared == 0;
-        if (no_work && !anyRetiredPending(s))
-            break;
-    }
-}
-
-bool hasType(const std::vector<CasEvent> & events, CasEventType t)
-{
-    for (const auto & e : events)
-        if (e.type == t)
-            return true;
-    return false;
-}
-
-}
-
-/// B170 Task 4 acceptance: drive a full publish -> drop -> GC-to-delete lifecycle through a capturing
-/// sink and assert (a) the taxonomy of events is emitted, (b) EVERY event carries a non-empty reason,
-/// (c) filtering by a deleted blob's object_hash reconstructs its edge/retire/delete chain in order.
-TEST(CASEvent, LifecycleReconstructionFromRows)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    /// Heap-owned, not a plain local: the Pool's background retired-view syncer can emit (e.g. a
-    /// view-advance event) right up to the Pool's destructor, and a background publish can hold an
-    /// extra `shared_from_this()` past this frame's return regardless of declaration order relative to
-    /// the Pool (found by ASan 2026-07-09; the production sink captures the Context shared_ptr by value
-    /// and is immune) -- a by-reference capture of a local would dangle.
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-
-    s->setEventSink([events](const CasEvent & e)
-    {
-        events->push(e);
-    });
-
-    const RootNamespace ns{"srv1/tbl"};
-    const String ref = "all_0_0_0";
-    const String payload = "the-doomed-blob-payload";
-
-    /// publish -> the blob's whole closure is born and a ref names it.
-    const String blob_hash = publishOneBlobPart(s, ns.string(), ref, payload);
-
-    /// drop the ref and advance the watermark so the now-unreferenced closure is collectable.
-    s->dropRef(ns, ref);
-    s->renewWatermarkOnce();
-
-    /// GC reclaims the tree and the blob to a fixpoint.
-    Gc gc(s, u128Of("gc-event-log"));
-    runGcToFixpoint(s, gc);
-
-    /// The blob must actually be gone (the delete fired).
-    {
-        DB::Cas::tests::OperationForTest blob_op(b);
-        ASSERT_FALSE((*blob_op).head(s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))}), Retry::standard()).has_value())
-            << "GC must have deleted the now-unreferenced blob";
-    }
-
-    /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no standalone trees).
-    const std::vector<CasEvent> observed_events = events->snapshot();
-    EXPECT_TRUE(hasType(observed_events, CasEventType::BlobPut));
-    EXPECT_TRUE(hasType(observed_events, CasEventType::RootAdd))
-        << "a fold must have recorded the manifest owner's blob edge (+1)";
-    EXPECT_TRUE(hasType(observed_events, CasEventType::RefDrop));
-    EXPECT_TRUE(hasType(observed_events, CasEventType::IndegZero));
-    EXPECT_TRUE(hasType(observed_events, CasEventType::GcRetireObserve)
-        || hasType(observed_events, CasEventType::GcRetireDecision)
-        || hasType(observed_events, CasEventType::GcRecheckVerdict))
-        << "a GC retire/recheck transition must be recorded";
-    EXPECT_TRUE(hasType(observed_events, CasEventType::BlobDelete) || hasType(observed_events, CasEventType::ManifestDelete))
-        << "the single content-delete site must emit a delete row";
-
-    /// (b) completeness mandate: every emitted event has a non-empty reason (the human WHY).
-    for (const auto & e : observed_events)
-        EXPECT_FALSE(e.reason.empty())
-            << "event " << toString(e.type) << " (" << e.object_hash << ") has an empty reason";
-
-    /// (c) lifecycle reconstruction: filtering by the deleted blob's object_hash yields, in time
-    /// order, at least its in-degree-zero -> retire-observe -> delete chain — its whole story.
-    std::vector<CasEventType> chain;
-    for (const auto & e : observed_events)
-        if (e.object_hash == blob_hash)
-            chain.push_back(e.type);
-
-    ASSERT_FALSE(chain.empty()) << "no rows reference the deleted blob " << blob_hash;
-
-    /// The decisive ordering: the blob's in-degree hit 0 BEFORE GC observed/condemned it, which was
-    /// BEFORE it was deleted. Find the first index of each and assert the order.
-    auto firstIndexOf = [&](CasEventType t) -> int
-    {
-        for (size_t i = 0; i < chain.size(); ++i)
-            if (chain[i] == t)
-                return static_cast<int>(i);
-        return -1;
-    };
-    const int i_indeg = firstIndexOf(CasEventType::IndegZero);
-    const int i_observe = firstIndexOf(CasEventType::GcRetireObserve);
-    const int i_delete = firstIndexOf(CasEventType::BlobDelete);
-    ASSERT_GE(i_indeg, 0) << "the blob's indegree_zero must be in its chain";
-    ASSERT_GE(i_observe, 0) << "the blob's gc_retire_observe must be in its chain";
-    ASSERT_GE(i_delete, 0) << "the blob's blob_delete must be in its chain";
-    EXPECT_LT(i_indeg, i_observe) << "in-degree hit 0 before GC observed it";
-    EXPECT_LT(i_observe, i_delete) << "GC observed it before deleting it";
 }

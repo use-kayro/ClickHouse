@@ -587,21 +587,6 @@ inline uint64_t addPrecommitTransition(
     return sequence;
 }
 
-/// Promote a precommit to committed at the SAME manifest_ref (old=Precommit, new=Committed). No edge
-/// (net-zero owner move). `build_id` is dropped. Returns the allocated `ref_sequence`.
-inline uint64_t promoteTransition(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
-    const DB::UInt128 & /*build_id*/, const String & final_ref_name, const DB::Cas::ManifestRef & ref,
-    uint64_t /*shard*/ = 0)
-{
-    const uint64_t sequence = appendRefLogSeed(backend, layout, ns,
-        {ownerTransitionOp(
-            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, final_ref_name, ref},
-            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, final_ref_name, ref})});
-    publishRecoverableCkptForSemanticWrapper(backend, layout, ns, RefTxnId{1, sequence});
-    return sequence;
-}
-
 /// Exact-token delete of a manifest body (HEAD then deleteExact). No-op when absent.
 inline void deleteManifestBody(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::ManifestId & id)
@@ -722,151 +707,12 @@ inline void injectRetire(
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
-/// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` and point
-/// gc/state at it (snap_generation / snap_attempt / gc_shards), bypassing a real GC round. If a seal
-/// already exists at (generation, attempt) it is overwritten with the new summary (its other fields are
-/// preserved); otherwise a fresh minimal seal is created. Read-modify-CAS on gc/state preserves the lease.
-/// Used by graduationDue tests to drive the zero-I/O signal directly off a controlled seal.
-inline void injectCondemnedSummarySeal(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    uint64_t generation, uint64_t attempt, uint64_t gc_shards,
-    const std::map<uint64_t, DB::Cas::CondemnedSummary> & summary)
-{
-    OperationForTest operation(backend);
-    const String seal_key = layout.foldSealKey(generation, attempt);
-    DB::Cas::CasFoldSeal seal;
-    const auto existing = (*operation).read(seal_key, DB::Cas::Retry::standard());
-    if (existing)
-        seal = DB::Cas::decodeFoldSeal(existing->bytes);
-    else
-        seal.parent_generation = generation ? generation - 1 : 0;
-    seal.generation = generation;
-    seal.condemned_summary = summary;
-    const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
-    if (existing)
-        (*operation).replace(seal_key, seal_bytes, existing->etag, DB::Cas::Retry::standard());
-    else
-        (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
-
-    DB::Cas::GcState gc_state;
-    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (existing_state)
-        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
-    gc_state.gc_shards = gc_shards;
-    gc_state.snap_generation = generation;
-    gc_state.snap_attempt = attempt;
-    const String state = DB::Cas::encodeGcState(gc_state);
-    if (!existing_state)
-        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
-    else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
-}
-
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
     OperationForTest op(backend);
     return !(*op).head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}),
                        DB::Cas::Retry::standard()).has_value();
-}
-
-/// ONE round that is allowed to RECLAIM -- the name is the point, so that grepping for the tests whose
-/// subject is reclamation finds exactly them.
-///
-/// The policy is spelled out rather than defaulted so that grepping this name finds every test whose
-/// subject is reclamation, and so that a future change to the default cannot silently change what those
-/// tests mean. It says the same thing the production default says (`UniversePolicy`); a test whose
-/// subject is a SUPPRESSOR passes `StageA_Suppressed` explicitly instead.
-inline DB::Cas::RoundReport runRegularRoundReclaiming(DB::Cas::Gc & gc)
-{
-    return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::Authoritative);
-}
-
-/// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's
-/// own heartbeat after each round (`renewWatermarkOnce` — keeps the lease + build-watermark floor
-/// current; unrelated to graduation, which paces on GC rounds alone). A blob condemned at round K is
-/// deleted by round K+2 (condemn at K -> graduate to delete_pending at K+1, unconditionally -> physical
-/// delete at K+2). Returns true as soon as the blob became absent. Reclamation is the whole point of the
-/// loop, so every round it drives is an authoritative one.
-inline bool runRoundsUntilAbsent(
-    const DB::Cas::PoolPtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
-    const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
-{
-    for (int i = 0; i < max_rounds; ++i)
-    {
-        runRegularRoundReclaiming(gc);
-        store->renewWatermarkOnce();
-        if (blobAbsent(backend, layout, hash))
-            return true;
-    }
-    return blobAbsent(backend, layout, hash);
-}
-
-/// The CURRENT condemned entries for `shard`, read from the adopted fold seal's `blob_target_runs`
-///: the round no longer writes a separate retired-list object — condemned
-/// entries RIDE the source-edge run as `RunMarker::Condemned` sentinel rows at the zero-sentinel key. This reads
-/// the seal at (snap_generation, snap_attempt), opens every run for `shard`, and reconstructs the
-/// `RetiredEntry` shape (hash from the run key, the rest from the decoded `CondemnedRow`). Empty when
-/// gc/state / the seal / the runs are absent. Used by ack-floor tests to assert pending/condemn state.
-inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
-{
-    OperationForTest operation(backend);
-    const auto st = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (!st)
-        return {};
-    const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
-    if (gc_state.snap_generation == 0)
-        return {};
-    const auto seal_bytes = (*operation).read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), DB::Cas::Retry::standard());
-    if (!seal_bytes)
-        return {};
-    const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(seal_bytes->bytes);
-
-    std::vector<DB::Cas::RetiredEntry> out;
-    for (const DB::Cas::RunRef & run : seal.blob_target_runs)
-    {
-        if (run.shard != shard)
-            continue;
-        auto r = DB::Cas::openSourceEdgeRun(*operation, run.key);
-        String k;
-        String p;
-        while (r.next(k, p))
-        {
-            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Condemned)
-                continue;
-            DB::Cas::BlobRef ref;
-            DB::UInt128 source_id{};
-            DB::Cas::SourceEdgeKeyCodec::parse(k, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-            const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
-            out.push_back(DB::Cas::RetiredEntry{
-                .kind = DB::Cas::ObjectKind::Blob,
-                .ref = ref,
-                .token = row.token,
-                .size = row.size,
-                .condemn_round = row.condemn_round,
-                .delete_pending = row.delete_pending,
-                .marker_confirmed = row.marker_confirmed});
-        }
-    }
-    return out;
-}
-
-/// True iff ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row — the ack-floor deletion
-/// pipeline is in flight while this is true. `gc_shards` is read from gc/state when 0 is passed.
-inline bool anyCondemnedInSeal(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t gc_shards = 0)
-{
-    OperationForTest operation(backend);
-    const auto st = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (!st)
-        return false;
-    const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
-    const uint64_t shards = gc_shards ? gc_shards : gc_state.gc_shards;
-    for (uint64_t shard = 0; shard < shards; ++shard)
-        if (!currentRetiredSet(backend, layout, shard).empty())
-            return true;
-    return false;
 }
 
 /// Displace a blob's incarnation out-of-band (as a racing writer would): GET it, mint a fresh
@@ -907,25 +753,16 @@ inline DB::Cas::Etag displaceBlobToken(
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
 /// Open a Pool over `backend`.
-///
-/// `gc_fold_max_defer_rounds` defaults to the PoolConfig default (8) -- unchanged behaviour for every
-/// existing caller. A test that drives MANY consecutive genuinely-idle `runRegularRound` calls and
-/// asserts each one performs a full fold (round/generation advance, trim/sweep/retention) -- exactly
-/// what Phase-4 Lever A (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to skip -- passes 0
-/// here to force fold-every-round (shouldDeferRound's liveness bound: rounds_since_last_fold(0) >= 0
-/// is always true).
 /// Templated on the backend's own pointer type (an `InMemoryBackend`, one of its many test subclasses,
 /// or a decorator that is not itself an `InMemoryBackend`, e.g. `ThrottlingBackend`) rather than fixed
 /// to `InMemoryBackend`/`BackendPtr`: a fixed pair of non-template overloads is genuinely AMBIGUOUS for
 /// a `shared_ptr<Derived>` argument, since "derived-to-`InMemoryBackend`" and "derived-to-`Backend`" are
 /// equally-ranked conversions with no tiebreaker; template argument deduction has none of that problem.
 template <typename BackendT>
-DB::Cas::PoolPtr openPoolForTest(
-    std::shared_ptr<BackendT> backend, uint64_t gc_fold_max_defer_rounds = 8)
+DB::Cas::PoolPtr openPoolForTest(std::shared_ptr<BackendT> backend)
 {
     return DB::Cas::Pool::open(std::move(backend),
-        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                            .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Seed the mandatory control objects for an already-existing pool so a subsequent `Pool::open`
@@ -1047,7 +884,7 @@ inline uint64_t currentAttemptOf(DB::Cas::Backend & backend, const DB::Cas::Layo
 
 /// The current seal's `blob_target_runs` filtered to `shard` (2026-07-02 T0: consumers resolve runs
 /// through seal refs, not by key construction). Scans downward from the current generation for the most
-/// recent existing fold seal (mirrors `foldCursorOf`'s reasoning); absent => empty.
+/// recent existing fold seal; absent => empty.
 inline std::vector<DB::Cas::RunRef> runsForShard(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
 {
@@ -1136,17 +973,6 @@ namespace fixture
     }
 }
 
-/// Resolve the opaque life id that keys this namespace's single fold-coverage row.
-inline UInt128 catalogLifeIdForTest(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
-{
-    OperationForTest operation(backend);
-    const std::optional<DB::Cas::NamespaceLifeId> life =
-        DB::Cas::CasRefCatalog::lifeIfCataloged(*operation, layout, ns);
-    chassert(life.has_value());
-    return life->incarnation;
-}
-
 /// Seed the ADOPTED fold seal's catalog-life coverage row for `ns` and point `gc/state` at it, bypassing a
 /// real round. This is the durable fact the sweep's §6 deletion premise reads
 /// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
@@ -1228,37 +1054,6 @@ inline void seedFoldCursorForTest(
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
         (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
-}
-
-/// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
-/// round the gc/state generation pointer is the recheck's COMPLETION generation (G+2 for a round started
-/// at G), but the fold seal is written at the FOLD generation (G+1) — recheck writes a completion seal,
-/// not a fold seal. So scan downward from the current generation for the most recent existing fold seal.
-inline uint64_t foldCursorOf(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns, uint64_t shard)
-{
-    chassert(shard == 0);
-    OperationForTest operation(backend);
-    const std::optional<DB::Cas::NamespaceLifeId> life =
-        DB::Cas::CasRefCatalog::lifeIfCataloged(*operation, layout, ns);
-    if (!life)
-        return 0;
-    const uint64_t gen = currentGenerationOf(backend, layout);
-    const uint64_t attempt = currentAttemptOf(backend, layout);
-    for (uint64_t g = gen; ; --g)
-    {
-        if (const auto got = (*operation).read(layout.foldSealKey(g, attempt), DB::Cas::Retry::standard()))
-        {
-            const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
-            const auto it = seal.ref_lives.find(life->incarnation);
-            /// Snapshot+log ref model: the per-table durable cursor is `last_folded_ref_id` (a RefTxnId).
-            /// Seeds allocate `writer_epoch = 1`, so the `ref_sequence` is the monotone cursor the seeding
-            /// wrappers return and tests compare against.
-            return it != seal.ref_lives.end() ? it->second.coverage.last_folded_ref_id.ref_sequence : 0;
-        }
-        if (g == 0)
-            return 0;
-    }
 }
 
 /// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
@@ -2461,47 +2256,6 @@ public:
     }
 };
 
-/// Fault decorator for the condemn-marker gate tests: while armed, every write against a blob `.meta`
-/// key throws. Every other write passes through. Armed by default; disarm
-/// (`fail_meta_writes = false`) to model the backend healing.
-///
-/// The fault's CLASS is chosen at arming, because the two classes model different failures and the
-/// engine treats them differently. `Propagates` is a local error the write loop rethrows on the first
-/// attempt, so the caller's own handler sees it at once. `Ambiguous` is a timeout the loop cannot
-/// distinguish from a lost response: it resolves by a read and reissues until its policy bound, so a
-/// test arming it against a PERMANENT fault must drive the operation's clock or spend the whole
-/// retry window in real time.
-class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
-{
-public:
-    enum class FaultKind : uint8_t { Propagates, Ambiguous };
-
-    /// Fault every `.meta` write with `kind`. Construction arms `Propagates`.
-    void armWriteFault(FaultKind kind = FaultKind::Propagates)
-    {
-        fault_kind.store(kind);
-        fail_meta_writes.store(true);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (fail_meta_writes.load() && key.ends_with(".meta"))
-        {
-            if (fault_kind.load() == FaultKind::Ambiguous)
-                throw Poco::TimeoutException("injected fault: blob meta write response lost");
-            throw std::runtime_error("injected fault: blob meta write lost");
-        }
-        return InMemoryBackend::write(key, bytes, expected_value, access);
-    }
-
-    std::atomic<bool> fail_meta_writes{true};
-
-private:
-    std::atomic<FaultKind> fault_kind{FaultKind::Propagates};
-};
-
 /// Blocks INSIDE a blob-meta mutation until `release` is called, so a test can hold a real meta job in
 /// flight and observe that it got there. `entered` is set before blocking.
 ///
@@ -2554,31 +2308,6 @@ private:
     std::mutex latch_mutex;
     std::condition_variable latch_cv;
     bool released = false;
-};
-
-/// Makes a GC round throw at its outcome-log write -- after the round has scheduled its confirmed-meta
-/// delete (`Gc/CasGc.cpp`) and before the round's meta-pool wait. Inherits the `.meta` latch so that
-/// job can be held in flight across the throw. Both the fault and the latch start off.
-class OutcomeLogFaultBackend : public MetaWriteLatchBackend
-{
-public:
-    std::atomic<bool> fail_outcome_logs{false};
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (fail_outcome_logs.load() && key.contains("outcomes/"))
-            return std::unexpected(RawConflict{});
-        return MetaWriteLatchBackend::write(key, bytes, expected_value, access);
-    }
-
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        if (fail_outcome_logs.load() && key.contains("outcomes/"))
-            return std::nullopt;
-        return DB::Cas::InMemoryBackend::read(key, access);
-    }
 };
 
 /// Wait until a latched job has provably reached the backend. A bounded wait that FAILS rather than

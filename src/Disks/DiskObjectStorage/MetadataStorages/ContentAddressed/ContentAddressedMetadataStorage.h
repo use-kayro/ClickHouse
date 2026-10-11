@@ -121,7 +121,7 @@ struct CasLifecycleSnapshot
 /// parses disk paths, maps them to pool namespaces and references, and translates manifest entries
 /// into `StoredObjects` or in-memory read sources. Transaction and GC entry points are exposed here
 /// because disk lifecycle and system-query code own those operations; the CAS protocol itself stays
-/// in `Cas::Pool`, `Cas::PartWriteTxn`, and `Cas::Gc`.
+/// in `Cas::Pool`, `Cas::PartWriteTxn`, and `Cas::KeeperGc`.
 ///
 /// Namespace mapping:
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR
@@ -202,12 +202,6 @@ public:
     /// Coalesce an administrative liveness hint into the existing periodic GC worker. If this disk has
     /// no running scheduler, the normal operator-visible retry path remains unchanged.
     void requestGcRoundSoon();
-
-    /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
-    /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
-    /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
-    /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
-    Cas::RebuildReport runGcRebuildNow(bool force) const;
 
     /// The `SYSTEM CAS FSCK` handler: a read-only, independent reachability audit.
     ///
@@ -567,9 +561,7 @@ public:
     /// can deterministically interleave a concurrent FORGET. For the round verbs
     /// (`runOneGcRoundForTest`/`runGarbageCollectionRoundNow`) it fires PRE-lock, in the admission->lock
     /// TOCTOU window (I-1: the call is admitted while `Live`, parks here until FORGET drives the pool
-    /// `Vanished`, then hits the under-lock re-check). For `runGcRebuildNow` it fires WHILE the rebuild HOLDS
-    /// `gc_scheduler_mutex` (I-2: the in-flight window a concurrent FORGET must serialize behind). Empty by
-    /// default; production installs none.
+    /// `Vanished`, then hits the under-lock re-check). Empty by default; production installs none.
     void setGcVerbAdmitWindowHookForTest(std::function<void()> fn) { gc_verb_admit_window_hook_for_test = std::move(fn); }
 
     /// Test-only: sees every round-log row the storage's own scheduler emits (Start, Phase, Finish),
@@ -622,18 +614,7 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
-    const uint64_t manifest_sweep_list_budget_keys;
-    const uint64_t manifest_sweep_delete_budget_keys;
-    const uint64_t gc_round_graduation_budget;
-    const uint64_t gc_round_redelete_budget;
-    const uint64_t gc_round_sweep_namespace_budget;
-    const uint64_t gc_round_sweep_recovery_op_budget;
-    const uint64_t gc_round_ref_cleanup_budget;
-    const uint64_t gc_round_prefix_wholesale_budget;
-    const uint64_t gc_round_handoff_prefix_wholesale_budget;
-    const uint64_t gc_round_outcome_entry_budget;
     const std::chrono::milliseconds mount_lease_ttl;
     const std::chrono::milliseconds mount_renew_period;
     /// See `PoolConfig::unsafe_remount_no_delay` -- the operator's explicit acceptance of an
@@ -647,10 +628,6 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
-    /// Bounded pool size for the GC fold's read-ahead; 1 disables it.
-    const uint64_t gc_read_concurrency;
-    /// Keys per batch delete request for the write-once families.
-    const uint64_t gc_bulk_delete_chunk_keys;
     /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds
     /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
     /// `attemptTimeoutMs()`.

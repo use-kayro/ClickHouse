@@ -1,6 +1,5 @@
 #include "cas_test_helpers.h"
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 
 #include <algorithm>
@@ -289,49 +288,6 @@ TEST(CASDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetire
         << report.warnings.front();
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
-}
-
-TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation catalog_op = catalog_requests.admit();
-    const RootNamespace ns("victim/db/folded_terminal");
-    std::optional<NamespaceLifeId> life;
-    std::vector<String> stream_before;
-    {
-        PoolConfig config{
-            .pool_prefix = "p",
-            .server_root_id = "victim",
-            .gc_fold_threshold = 1,
-            .gc_fold_max_defer_rounds = 0};
-        auto victim = Pool::open(backend, config);
-        life = victim->namespaceLife(ns);
-        victim->putNamespaceFile(*life, "format_version.txt", "1\n");
-        victim->dropNamespace(ns);
-
-        Gc gc(victim, UInt128{811});
-        ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
-        ASSERT_EQ(catalogEntry(catalog_op, victim->layout(), ns).state, NsState::Removing);
-        for (const ListedKey & key : catalog_op.list(victim->layout().namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
-            stream_before.push_back(key.key);
-        ASSERT_FALSE(stream_before.empty());
-    }
-
-    std::atomic<uint64_t> wake_requests{0};
-    const DecommissionReport report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim", {},
-        [&] { wake_requests.fetch_add(1); });
-
-    EXPECT_EQ(wake_requests.load(), 1u);
-    EXPECT_EQ(report.namespaces_already_removed, 1u);
-    EXPECT_FALSE(report.slot_removed);
-    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), ns).state, NsState::Removing);
-    std::vector<String> stream_after;
-    for (const ListedKey & key : catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
-        stream_after.push_back(key.key);
-    EXPECT_EQ(stream_after, stream_before)
-        << "decommission must not append a second terminal or become a catalog deletion driver";
 }
 
 TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNotBlockRetirement)

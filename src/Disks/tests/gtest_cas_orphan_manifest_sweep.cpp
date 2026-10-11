@@ -2,13 +2,11 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
-#include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 #include <algorithm>
 #include <limits>
@@ -110,55 +108,6 @@ private:
     bool did_switch = false;
 };
 
-/// Rewrites a listed manifest after the page captured it but before the page takes its lifecycle cut.
-/// The old implementation performed its candidate GET after that cut and would delete this replacement
-/// with its new token. The fixed path may nominate the old observation, but exact-token deletion loses.
-class ReplacingManifestAfterObservationBackend : public InMemoryBackend
-{
-public:
-    void arm(const Layout & layout, String manifest_key_)
-    {
-        catalog_key = layout.refCatalogKey();
-        manifests_prefix = layout.casManifestsPrefix();
-        manifest_key = std::move(manifest_key_);
-        listed_page = false;
-        replaced_manifest = false;
-        armed = true;
-    }
-
-    bool didReplace() const { return replaced_manifest; }
-
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
-        if (armed && prefix == manifests_prefix)
-            listed_page = true;
-        return page;
-    }
-
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        auto result = InMemoryBackend::read(key, access);
-        if (armed && listed_page && !replaced_manifest && key == catalog_key)
-        {
-            const auto current = InMemoryBackend::read(manifest_key, access);
-            if (!current)
-                throw std::runtime_error("test manifest disappeared before replacement");
-            if (!InMemoryBackend::write(manifest_key, current->bytes, current->value, access).has_value())
-                throw std::runtime_error("test manifest replacement conflicted");
-            replaced_manifest = true;
-        }
-        return result;
-    }
-
-private:
-    String catalog_key;
-    String manifests_prefix;
-    String manifest_key;
-    bool armed = false;
-    bool listed_page = false;
-    bool replaced_manifest = false;
-};
 }
 
 /// A staged-but-unowned body in an ELIGIBLE prefix, absent from the owner view, is deleted (#7).
@@ -296,29 +245,6 @@ TEST(CASOrphanManifestSweep, EmitsNoBlobDeltas)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
-TEST(CASOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
-    const ManifestRef r1 = ref(5, 0xE1);
-    const ManifestRef r2 = ref(5, 0xE2);
-    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
-    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
-
-    const ManifestSweepResult first = sweepManifestCursorPageForTest(*store, "", /*list_budget*/1, /*delete_budget*/0);
-    EXPECT_EQ(first.listed, 1u);
-    EXPECT_FALSE(first.wrapped);
-    EXPECT_FALSE(first.next_cursor.empty());
-
-    const ManifestSweepResult second = sweepManifestCursorPageForTest(*store, first.next_cursor, /*list_budget*/100, /*delete_budget*/0);
-    EXPECT_GE(second.listed, 1u);
-    EXPECT_TRUE(second.wrapped);
-    EXPECT_TRUE(second.next_cursor.empty());
-}
-
 /// A NON-eligible prefix (no watermark fact) deletes NOTHING (#9: frozen-seq is not authority).
 TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
 {
@@ -329,136 +255,6 @@ TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     // No setWatermarkMinActive — no durable fact => not eligible.
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
-    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
-}
-
-TEST(CASOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
-    const ManifestRef r = ref(5, 0xAC);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
-    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
-    EXPECT_GE(result.listed, 1u);
-    EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
-}
-
-TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
-    const ManifestRef r1 = ref(5, 0xAD);
-    const ManifestRef r2 = ref(5, 0xAE);
-    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
-    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
-    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/1);
-    EXPECT_EQ(result.deleted, 1u);
-    const bool first_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r1}));
-    const bool second_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r2}));
-    EXPECT_NE(first_exists, second_exists);
-}
-
-/// A physical manifest captured before a catalog cut which omits its name is dead-life debris: a live
-/// creation cannot publish a life-owned object before its catalog row. It therefore has an eventual
-/// page-sweep owner without trying to reconstruct a deleted incarnation from the key.
-TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamespace)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/catalog-absent-debris@cas@"};
-    const ManifestRef r = ref(5, 0xA9);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("debris", DB::UInt128(9))});
-    /// No mount lease/watermark exists: after legal catalog-row deletion there may be no server-root
-    /// state left to supply one. The post-observation absent row is the complete dead-life proof.
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
-
-    EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
-}
-
-/// Manifest keys are write-once, so a same-key rewrite after the observation below never happens in
-/// production; this backend forces one anyway to prove the page does not need the old freeze-before-cut
-/// discipline to stay correct. The body is read only after the catalog cut, so it sees whatever
-/// incarnation is actually there at that point and deletes it under its own current token.
-TEST(CASOrphanManifestSweep, CursorPageDeletesTheIncarnationSeenAfterTheCatalogCut)
-{
-    auto backend = std::make_shared<ReplacingManifestAfterObservationBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/replace-after-observation@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
-    const ManifestRef r = ref(5, 0xAA);
-    const String key = store->layout().manifestKey(ManifestId{ns, r});
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("body", DB::UInt128(10))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
-    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
-    backend->arm(store->layout(), key);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
-
-    EXPECT_TRUE(backend->didReplace());
-    EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(headExists(*backend, key));
-}
-
-/// Any duplicate current life id makes the catalog-to-physical join ambiguous. The cursor page is
-/// destructive, so the whole cut must be rejected before it can nominate even an unrelated body.
-TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/ambiguous-life@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
-    const ManifestRef r = ref(5, 0xAB);
-    const String key = store->layout().manifestKey(ManifestId{ns, r});
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("body", DB::UInt128(11))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
-    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
-
-    CasOperation op = store->openRequests().admit();
-    const CasRefCatalog::Snapshot before = CasRefCatalog::read(op, store->layout());
-    RefCatalog damaged = before.catalog;
-    CatalogEntry duplicate = damaged.entries.front();
-    duplicate.ns = RootNamespace{"00/ambiguous-life-twin@cas@"};
-    damaged.entries.push_back(duplicate);
-    std::sort(damaged.entries.begin(), damaged.entries.end(),
-        [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
-    ASSERT_TRUE(before.etag.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.etag, Retry::standard())));
-
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10); });
-    EXPECT_TRUE(headExists(*backend, key));
-}
-
-TEST(CASOrphanManifestSweep, CursorPageSkipsOwnedBody)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(5, 0xAF);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
-    EXPECT_EQ(result.deleted, 0u);
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -485,162 +281,6 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "without the exact _ckpt required by a Live catalog row, the sweep must retain rather than "
            "derive an empty owner set";
-}
-
-/// A decoded fold cursor at an `EpochSeal` advances to the next GLOBAL writer epoch. Even when this
-/// namespace was inactive, every intermediate epoch exists as a chained sequence-1 empty seal, so the
-/// exact tail begins at `{E+1, 1}` and must consume each one before reaching a later removal. The
-/// removal's target stays protected while an unrelated eligible body remains deletable; retaining both
-/// would hide a false missing-log failure at the first intermediate seal.
-TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccessor)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/seal-cursor-tail@cas@"};
-    fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->openRequests().admit();
-    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
-    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
-
-    const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
-    const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
-    const ManifestRef still_owned{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
-    publishAt(*backend, store->layout(), ns, RefTxnId{1, 1}, "dropped", removed.build_sequence, DB::UInt128(0xA1), /*birth=*/true);
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{1, 2});
-    writeTxnAt(*backend, store->layout(), ns, RefTxnId{2, 1}, publishCommittedOps("still-owned", still_owned), RefTxnId{1, 2});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{2, 2});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{3, 1}, RefTxnId{2, 2});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{4, 1}, RefTxnId{3, 1});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{5, 1}, RefTxnId{4, 1});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{6, 1}, RefTxnId{5, 1});
-    for (uint64_t epoch = 3; epoch <= 6; ++epoch)
-        ASSERT_TRUE(headExists(*backend, store->layout().refLogKey(life, RefTxnId{epoch, 1})))
-            << "fixture must deposit every intermediate exact successor in the catalog life";
-    writeTxnAt(*backend, store->layout(), ns, RefTxnId{7, 1},
-        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "dropped", removed}, std::nullopt)},
-        RefTxnId{6, 1});
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{7, 2});
-    writeManifestRaw(*backend, store->layout(), ns, unowned, {blobEntryFor("unowned", DB::UInt128(0xA2))});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{7, 2},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{7, 2}}), Retry::standard())));
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
-    seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{2, 2});
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
-
-    EXPECT_EQ(result.deleted, 1u);
-    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, removed})))
-        << "the exact successor of the folded epoch seal contains this body's unconsumed -1";
-    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, unowned})))
-        << "an unrelated eligible body must still drain; retaining it would mask a geometry failure";
-}
-
-/// A cleaned inherited cursor does not let a later epoch backlink skip the mandatory immediately-next
-/// global epoch. `{3,1}` is missing here, so the direct `{7,1} -> {2,2}` link cannot authorize a tail
-/// scan; the whole namespace must fail closed and retain even an otherwise unowned eligible body.
-TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkippedByLaterBacklink)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/missing-next-epoch@cas@"};
-    fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->openRequests().admit();
-    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
-    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
-
-    const RefTxnId cursor{2, 2};
-    writeSealAt(*backend, store->layout(), ns, cursor);
-    const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
-    ASSERT_TRUE(cursor_head.has_value());
-    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->etag, Retry::standard()), Removal::Removed);
-
-    const ManifestRef phantom{.writer_epoch = 7, .build_sequence = 1, .manifest_ordinal = 1};
-    /// The codec refuses this skipped predecessor when a writer tries to create it. Inject the malformed
-    /// physical lure explicitly: a reader must still not enumerate forward to it when `{3,1}` is absent.
-    RefLogTxn direct_later_link{
-        .ns = ns.string(),
-        .txn_id = RefTxnId{7, 1},
-        .ops = publishCommittedOps("phantom", phantom),
-        .prev_epoch_seal = RefTxnId{6, 1}};
-    String malformed_later_link = encodeRefLogTxn(direct_later_link);
-    const String encoded_predecessor{R"("!prev_epoch":"6")"};
-    const size_t predecessor_pos = malformed_later_link.find(encoded_predecessor);
-    ASSERT_NE(predecessor_pos, String::npos);
-    malformed_later_link.replace(
-        predecessor_pos, encoded_predecessor.size(), R"("!prev_epoch":"2")");
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
-        store->layout().refLogKey(life, RefTxnId{7, 1}), sealObject(FormatId::RefLog, malformed_later_link), Retry::standard())));
-    writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
-        .ns = ns.string(),
-        .snapshot_id = RefTxnId{7, 1},
-        .committed = {committedRow("phantom", phantom)},
-        .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{7, 1},
-        .checkpoint_snapshot_id = RefTxnId{7, 1},
-        .last_epoch_seal = RefTxnId{6, 1}}), Retry::standard())));
-
-    const ManifestRef victim{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
-    writeManifestRaw(*backend, store->layout(), ns, victim, {blobEntryFor("victim", DB::UInt128(0xC1))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedFoldCursorForTest(*backend, store->layout(), ns, cursor);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
-
-    EXPECT_EQ(result.deleted, 0u);
-    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, victim})));
-}
-
-/// Control for the cleaned-cursor path: the exact immediately-next epoch head exists and names the
-/// deleted seal, so the tail is readable. Its `-1` protects the removed body while an unrelated eligible
-/// body proves the namespace was scanned rather than retained wholesale. The checkpoint base is the
-/// following same-epoch transaction: recovery therefore has a retained exact anchor without turning the
-/// deliberately cleaned predecessor seal into part of that anchor's proof.
-TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochHead)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/exact-next-epoch@cas@"};
-    fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->openRequests().admit();
-    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
-    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
-
-    const RefTxnId cursor{2, 2};
-    writeSealAt(*backend, store->layout(), ns, cursor);
-    const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
-    ASSERT_TRUE(cursor_head.has_value());
-    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->etag, Retry::standard()), Removal::Removed);
-
-    const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
-    writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 1},
-        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "removed", removed}, std::nullopt)}, cursor);
-    const ManifestRef absent_anchor{.writer_epoch = 1, .build_sequence = 7, .manifest_ordinal = 1};
-    writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 2},
-        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "absent-anchor", absent_anchor}, std::nullopt)});
-    writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
-        .ns = ns.string(), .snapshot_id = RefTxnId{3, 2}, .committed = {}, .precommits = {}});
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{3, 2},
-        .checkpoint_snapshot_id = RefTxnId{3, 2},
-        .last_epoch_seal = cursor}), Retry::standard())));
-
-    const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
-    writeManifestRaw(*backend, store->layout(), ns, removed, {blobEntryFor("removed", DB::UInt128(0xC2))});
-    writeManifestRaw(*backend, store->layout(), ns, unowned, {blobEntryFor("unowned", DB::UInt128(0xC3))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
-    seedFoldCursorForTest(*backend, store->layout(), ns, cursor);
-
-    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
-
-    EXPECT_EQ(result.deleted, 1u);
-    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, removed})));
-    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, unowned})));
 }
 
 /// The catalog row used to obtain coverage and the life used to recover ownership must be ONE frozen

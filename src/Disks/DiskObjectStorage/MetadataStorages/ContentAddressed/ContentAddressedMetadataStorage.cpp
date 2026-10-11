@@ -27,7 +27,6 @@
 #include <Common/LoggingHelpers.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
-#include <Common/thread_local_rng.h>
 #include <Poco/String.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
@@ -67,18 +66,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsString server_root_id;
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
-    extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_shards;
-    extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
-    extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
-    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
-    extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
@@ -87,8 +75,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
-    extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
-    extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
@@ -164,7 +150,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///              (the ONE ContentRead entry that converts the gate's refusal into its own typed
 ///              `Unknown` answer instead of propagating it -- a confirm never throws at its caller).
 /// Write:       adoptPartFromManifest.
-/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runGcRebuildNow, runFsckNow (the
+/// Admin:       runOneGcRoundForTest, runGarbageCollectionRoundNow, runFsckNow (the
 ///              rev.8 FSCK-on-running path -- an FSCK of a not-live disk is refused by the Admin gate).
 /// Lifecycle/uncgated drivers (NOT op-gated -- they DRIVE the state): startup, shutdown, forgetDisk,
 ///   gcStop, gcStart. store()/partAccess()/poolAccess() are the internal accessors, not public op entries.
@@ -291,18 +277,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , context(context_ ? std::optional<ContextWeakPtr>(context_) : std::nullopt)
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
-    , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
-    , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
-    , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
-    , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
-    , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
-    , gc_round_sweep_namespace_budget(settings_[ContentAddressedSetting::gc_round_sweep_namespace_budget].value)
-    , gc_round_sweep_recovery_op_budget(settings_[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value)
-    , gc_round_ref_cleanup_budget(settings_[ContentAddressedSetting::gc_round_ref_cleanup_budget].value)
-    , gc_round_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value)
-    , gc_round_handoff_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value)
-    , gc_round_outcome_entry_budget(settings_[ContentAddressedSetting::gc_round_outcome_entry_budget].value)
     , mount_lease_ttl(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_lease_ttl_ms].value))
     , mount_renew_period(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_renew_period_ms].value))
     , cas_unsafe_remount_no_delay(settings_[ContentAddressedSetting::unsafe_remount_no_delay].value)
@@ -311,8 +286,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
-    , gc_read_concurrency(settings_[ContentAddressedSetting::gc_read_concurrency].value)
-    , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
     , staging_backend(settings_.stagingBackend())
@@ -657,43 +630,6 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     return snapshot->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
 }
 
-Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const
-{
-    checkNotReadOnly("GC rebuild");
-    if (!gc_enabled)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Garbage collection is not enabled on this content-addressed disk");
-    /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool. (`store()` below
-    /// already throws on a terminal pool, but not on the merely-transient one -- this closes that gap and
-    /// keeps the refusal uniform with the other GC entry points.) Pre-lock: only a fast-fail.
-    checkOpAdmitted(CasOpClass::Admin);
-    /// Serialize the whole rebuild under `gc_scheduler_mutex`, exactly as a synchronous round and FORGET's
-    /// teardown are (both hold this same mutex). Held for the rebuild's DURATION so a concurrent FORGET waits
-    /// it out (fail-closed) instead of reporting the disk decommissioned while the rebuild's one-shot
-    /// `Cas::Gc` is still issuing durable `gc/`-plane writes. `Gc::rebuildBaseline` holds only the
-    /// Pool/backend (no back-reference to this storage), so it never re-takes this mutex -- no deadlock; and
-    /// `store()` takes only the brief `pointer_mutex` (lock order gc_scheduler -> pointer), so
-    /// gcHealth/store/partAccess never block behind this rebuild.
-    std::lock_guard round_lock(gc_scheduler_mutex);
-    /// Re-run the admission gate under the lock (mirroring the round verbs): a rebuild admitted while `Live`
-    /// but blocked here behind a FORGET refuses once the pool is `Vanished` (the later `store()` is also
-    /// fail-closed, so this is a fast-fail before minting the GC identity).
-    checkOpAdmitted(CasOpClass::Admin);
-    /// Test-only seam (inert in production): fires WHILE this rebuild holds `gc_scheduler_mutex` -- the
-    /// in-flight window a concurrent FORGET must serialize behind (I-2). Lets a test hold the lock here and
-    /// observe that FORGET blocks until the rebuild releases it.
-    if (gc_verb_admit_window_hook_for_test)
-        gc_verb_admit_window_hook_for_test();
-    /// A one-shot Gc instance is fine here (unlike the scheduler's stable-instance requirement for
-    /// the lease's observation-window steal protocol): rebuildBaseline does its own lease
-    /// acquire/steal check internally and this command runs exactly one round.
-    const UInt128 gc_id = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
-    const auto cas_store_snapshot = store();
-    Cas::Gc gc(cas_store_snapshot, gc_id, {}, {},
-        getLogger(fmt::format("CasGc({})", cas_store_snapshot->poolConfig().server_root_id)));
-    return gc.rebuildBaseline(force);
-}
-
 std::optional<uint64_t> ContentAddressedMetadataStorage::freezeConnectTimeoutCapMs(
     [[maybe_unused]] const ObjectStoragePtr & object_storage, [[maybe_unused]] uint64_t cas_attempt_timeout_ms)
 {
@@ -785,21 +721,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.blob_hash_algo = blob_hash_algo;
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
-    pool_config.gc_snapshot_generations_to_keep = gc_snapshot_generations_to_keep;
     pool_config.gc_shards = gc_shards;
-    pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
-    pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
-    pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
-    pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
-    pool_config.gc_round_sweep_namespace_budget = gc_round_sweep_namespace_budget;
-    pool_config.gc_round_sweep_recovery_op_budget = gc_round_sweep_recovery_op_budget;
-    pool_config.gc_round_ref_cleanup_budget = gc_round_ref_cleanup_budget;
-    pool_config.gc_round_prefix_wholesale_budget = gc_round_prefix_wholesale_budget;
-    pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
-    pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
-    pool_config.gc_read_concurrency = gc_read_concurrency;
-    pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`. A later reload that widens the disk's
@@ -1133,7 +1056,7 @@ void ContentAddressedMetadataStorage::gcStart()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Admin class (rev.7 spec §1): refuse on a transient / `IdentityLost` / `Vanished` pool (typed 668 /
     /// [D5]) and on a null pool (`throwStorageNotStarted`). Only a `Live` pool proceeds -- the same uniform
-    /// gate every GC entry point uses (`runGarbageCollectionRoundNow` / `runGcRebuildNow`).
+    /// gate every GC entry point uses (`runGarbageCollectionRoundNow`).
     checkOpAdmitted(CasOpClass::Admin);
     if (shutdown_called)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -1169,7 +1092,7 @@ Cas::FsckReport ContentAddressedMetadataStorage::runFsckNow(bool detail) const
 
     /// FSCK scans the LIVE running pool directly (rev.8). Admin class -- refuse on a transient /
     /// IdentityLost / Vanished / null pool before touching it, exactly like the GC entry points
-    /// (`runGarbageCollectionRoundNow`/`runGcRebuildNow`). The scan is read-only and its findings are
+    /// (`runGarbageCollectionRoundNow`). The scan is read-only and its findings are
     /// revalidated against a fresh authoritative read (`CasFsck`'s Dangling / missing-manifest rechecks),
     /// so concurrent writers never yield a phantom finding.
     checkOpAdmitted(CasOpClass::Admin);
@@ -1645,7 +1568,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff SOME shadow namespace
             /// under this path still has a LIVE ref. A raw object LIST of the mirrored subtree would count
             /// tombstoned-but-not-yet-GC'd shard/manifest objects — CA removal is tombstone + deferred GC
-            /// (`removeRecursive`/`dropNamespace` only tombstone; `Cas::Gc` physically deletes later) — so a
+            /// (`removeRecursive`/`dropNamespace` only tombstone; GC physically deletes later) — so a
             /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs. Instead
             /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
             /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so

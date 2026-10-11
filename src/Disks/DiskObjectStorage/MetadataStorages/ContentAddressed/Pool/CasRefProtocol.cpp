@@ -871,7 +871,7 @@ EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, co
     }
 
     /// `life`: REQUIRED, not resolved here -- an internal fallback resolve was tried once already
-    /// (in `Gc::fold`) and once more here (fsck's own independent walk defaulted to `nullopt` and
+    /// (in the former GC fold) and once more here (fsck's own independent walk defaulted to `nullopt` and
     /// re-resolved), and both times a caller that had already committed to one `life` for the rest of
     /// its walk could silently diverge from this function's OWN resolution if the namespace is dropped
     /// and recreated between the two reads. `CasFsck.cpp`'s stream walk resolves `life` once, at the

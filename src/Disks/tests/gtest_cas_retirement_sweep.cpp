@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -21,17 +20,11 @@
 
 /// THE RETIREMENT SWEEP's executable half.
 ///
-/// Two mechanisms of the pre-v9 ref protocol lost their premise when the ref stream became a
-/// contiguous, arithmetically-walkable chain, and this file is where each retirement is proved rather
-/// than asserted in a comment:
+/// A mechanism of the pre-v9 ref protocol lost its premise when the ref stream became a contiguous,
+/// arithmetically-walkable chain, and this file is where its retirement is proved rather than asserted
+/// in a comment:
 ///
-///   1. PROBE A's ABORT. The detector compared the round's two enumerations of `cas/ns/stream/` and, on any
-///      disagreement, aborted ref folding for the whole round -- because the fold ITERATED the listing,
-///      so a hole in it meant a record was about to be skipped forever. The intake reads by exact key
-///      now, so a hole folds through; a detector that still aborted would be halting a round that is
-///      provably doing the right thing. It was demoted to a sampled store-quality detector and then
-///      deleted outright: the round enumerates `cas/ns/stream/` exactly once, on every round.
-///   2. THE MATERIALIZATION GRACE (`T_mat`). A post-reclaim sleep, long enough for a straggler
+///   THE MATERIALIZATION GRACE (`T_mat`). A post-reclaim sleep, long enough for a straggler
 ///      conditional `PUT` from a dying epoch to land or exhaust its retries BEFORE the successor
 ///      trusted its recovery LISTINGS. Recovery does not trust listings; it closes every dead epoch
 ///      with an in-band `EpochSeal` written as a conditional create, and the straggler's own create
@@ -53,87 +46,6 @@ using DB::Cas::tests::u128Of;
 
 namespace
 {
-
-/// A backend that drops ONE chosen key from ONE chosen `list` call while exact `get`/`head` of that key
-/// keep working: the minimal realisation of "the store returned an incomplete answer". WHICH call is
-/// load-bearing here, because the round enumerates the ref prefix exactly once -- so `nth = 0` is
-/// always the round's own enumeration, the one the fold regroups.
-///
-/// `nth` counts only those `list` calls that WOULD have returned the key, so unrelated prefix
-/// enumerations cannot shift it; arm it AFTER every seeding write, since the writer's own namespace
-/// listings would otherwise consume a qualifying call.
-class HoleyListBackend : public InMemoryBackend
-{
-public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
-    void omitFromNthListCall(const String & key, size_t nth)
-    {
-        std::lock_guard lock(m);
-        omitted = key;
-        target_call = nth;
-        seen_calls = 0;
-        served = false;
-    }
-
-    /// Whether the hole was actually served. Asserted by every test that plants one, so a mistyped key
-    /// or a miscounted `nth` cannot let a test pass vacuously.
-    bool holeServed() const
-    {
-        std::lock_guard lock(m);
-        return served;
-    }
-
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
-        std::lock_guard lock(m);
-        if (omitted.empty())
-            return page;
-        auto it = std::find_if(page.keys.begin(), page.keys.end(),
-                               [&](const RawListedKey & k) { return k.key == omitted; });
-        if (it == page.keys.end())
-            return page;              /// not a qualifying call -- do not count it
-        if (seen_calls++ != target_call)
-            return page;
-        page.keys.erase(it);
-        served = true;
-        omitted.clear();              /// one hole only
-        return page;
-    }
-
-private:
-    mutable std::mutex m;
-    String omitted;
-    size_t target_call = 0;
-    size_t seen_calls = 0;
-    bool served = false;
-};
-
-/// Counts full enumerations of the ref prefix -- one increment per `list` call whose prefix is EXACTLY
-/// `cas/ns/stream/`, which is how "the round lists this prefix once" becomes an assertion instead of a
-/// claim. `janitor_prefix_lists` counts the bounded `cas/ns/` janitor page separately, by the same exact
-/// match: the two prefixes are distinct strings (`cas/ns/stream/` vs `cas/ns/`), so a hot scan and the
-/// janitor's own bounded page can never be conflated by this counter.
-class RefPrefixListCountingBackend : public InMemoryBackend
-{
-public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
-    String refs_prefix;
-    String janitor_prefix;
-    std::atomic<size_t> ref_prefix_lists{0};
-    std::atomic<size_t> janitor_prefix_lists{0};
-
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        if (!refs_prefix.empty() && prefix == refs_prefix)
-            ++ref_prefix_lists;
-        if (!janitor_prefix.empty() && prefix == janitor_prefix)
-            ++janitor_prefix_lists;
-        return InMemoryBackend::list(prefix, cursor, limit, access);
-    }
-};
 
 /// Every write of a matching key is a lost response, for as long as `fault_key_substr` names one. It
 /// has to be every one: the request engine settles an ambiguity by an exact read and then reissues, so
@@ -235,102 +147,6 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeDiskConfig(const std::string & i
     return new Poco::Util::XMLConfiguration(iss);
 }
 
-}
-
-/// The blob the hidden removal releases must actually be reclaimed. This is the retention half of the
-/// skipped-transaction class, and it is the outcome the abort used to buy at the price of a lost round:
-/// under arithmetic intake the very round that was served the hole folds the removal, so the blob dies
-/// on the normal schedule rather than waiting for a listing to become honest again.
-TEST(CASRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
-{
-    auto backend = std::make_shared<HoleyListBackend>();
-    auto store = Pool::open(backend, PoolConfig{
-        .pool_prefix = "p", .server_root_id = "test",
-        .gc_fold_max_defer_rounds = 0,
-    });
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv/tbl"};
-    const String payload = "reclaimed-payload";
-    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
-    /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
-    /// as a completed production birth before `publishOneBlobPart` invokes recovery.
-    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
-    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = std::nullopt,
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    publishOneBlobPart(store, ns, "part_a", payload);
-    Gc gc(store, hexToU128("00000000000000000000000000000012"));
-    /// Reclaiming rounds: Stage A's destructive gate refuses a universe it cannot enumerate, and this
-    /// test's subject IS the reclamation (see `runRegularRoundReclaiming`).
-    ASSERT_TRUE(DB::Cas::tests::runRegularRoundReclaiming(gc).acquired_lease);
-    store->renewWatermarkOnce();
-    const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128,
-                                                   BlobDigest::fromU128(u128Of(payload))});
-    ASSERT_TRUE(headExists(*backend, blob_key));
-
-    const std::set<String> before_drop = listRefLogKeys(*backend, layout, ns);
-    store->dropRef(ns, "part_a");
-    String removal_key;
-    for (const String & k : listRefLogKeys(*backend, layout, ns))
-        if (!before_drop.contains(k))
-            removal_key = k;
-    ASSERT_FALSE(removal_key.empty());
-    store->renewWatermarkOnce();
-
-    backend->omitFromNthListCall(removal_key, /*nth=*/0);
-
-    /// condemn -> graduate -> exact-token delete needs several rounds; the first of them is the one
-    /// served the hole.
-    for (int i = 0; i < 12; ++i)
-    {
-        ASSERT_TRUE(DB::Cas::tests::runRegularRoundReclaiming(gc).acquired_lease);
-        store->renewWatermarkOnce();
-    }
-    ASSERT_TRUE(backend->holeServed()) << "the sabotage never fired";
-
-    EXPECT_FALSE(headExists(*backend, blob_key))
-        << "the removal was hidden from one enumeration and never folded -- the retention half of the "
-           "skipped-transaction class, which arithmetic intake is supposed to close";
-}
-
-/// THE RETIREMENT's whole point, made observable: a folding round enumerates `cas/ns/stream/` exactly
-/// ONCE, on EVERY round of a multi-round run -- not just the first, since a regression that quietly
-/// reintroduced a second enumeration only on a LATER round would pass a one-round check for the wrong
-/// reason. The bounded `cas/ns/` janitor page is a separate exact-string prefix and runs every round
-/// too; it must never be counted as, or mistaken for, a hot scan of the ref prefix. 32 rounds exercises
-/// the deleted detector's own cadence (every 16th folding round) twice over, so a regression that only
-/// reintroduces the second enumeration on that cadence cannot hide inside a shorter run.
-TEST(CASRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
-{
-    auto backend = std::make_shared<RefPrefixListCountingBackend>();
-    auto store = Pool::open(backend, PoolConfig{
-        .pool_prefix = "p", .server_root_id = "test",
-        .gc_fold_max_defer_rounds = 0,
-    });
-    backend->refs_prefix = store->layout().casRefsPrefix();
-    backend->janitor_prefix = store->layout().namespaceRootPrefix();
-    const RootNamespace ns{"srv/tbl"};
-    publishOneBlobPart(store, ns, "part_a", "counted-payload");
-    store->renewWatermarkOnce();
-
-    Gc gc(store, hexToU128("00000000000000000000000000000013"));
-    for (int round = 0; round < 32; ++round)
-    {
-        backend->ref_prefix_lists.store(0);
-        backend->janitor_prefix_lists.store(0);
-        const RoundReport report = gc.runRegularRound();
-        ASSERT_TRUE(report.acquired_lease);
-        ASSERT_FALSE(report.deferred);
-        EXPECT_EQ(backend->ref_prefix_lists.load(), 1u)
-            << "round " << round << " enumerated cas/ns/stream/ a number of times other than once";
-        EXPECT_GT(backend->janitor_prefix_lists.load(), 0u)
-            << "round " << round << " never took the bounded cas/ns/ janitor page";
-        store->renewWatermarkOnce();
-    }
 }
 
 

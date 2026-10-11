@@ -1054,12 +1054,6 @@ BlockIO InterpreterSystemQuery::execute()
             result = runContentAddressedGcRun(query.disk);
             break;
         }
-        case Type::CAS_GC_REBUILD:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_REBUILD);
-            result = runContentAddressedGcRebuild(query.disk, query.cas_gc_rebuild_force);
-            break;
-        }
         case Type::CAS_FSCK:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CAS_FSCK);
@@ -2406,47 +2400,6 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.pending_retired);
 }
 
-ColumnsDescription contentAddressedGcRebuildColumns()
-{
-    return ColumnsDescription{NamesAndTypesList{
-        {"disk", std::make_shared<DataTypeString>()},
-        {"performed", std::make_shared<DataTypeUInt8>()},
-        {"round", std::make_shared<DataTypeUInt64>()},
-        {"generation", std::make_shared<DataTypeUInt64>()},
-        {"namespaces", std::make_shared<DataTypeUInt64>()},
-        {"shards", std::make_shared<DataTypeUInt64>()},
-        {"committed_refs", std::make_shared<DataTypeUInt64>()},
-        {"live_precommits", std::make_shared<DataTypeUInt64>()},
-        {"unowned_alive_manifests", std::make_shared<DataTypeUInt64>()},
-        {"edges", std::make_shared<DataTypeUInt64>()},
-        {"clamped_shards", std::make_shared<DataTypeUInt64>()},
-        /// 1 => the rebuild found no fold seal at all and carried NO durable hold forward, having
-        /// concluded from enumeration alone that the pool never sealed a baseline. On a pool that has
-        /// ever completed a GC round this means the object listing lied.
-        {"virgin_by_enumeration", std::make_shared<DataTypeUInt8>()},
-        /// Which generation's fold seal the rebuild carried holds from; 0 when it carried none.
-        {"adopted_seal_generation", std::make_shared<DataTypeUInt64>()},
-    }};
-}
-
-void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const String & disk_name, const Cas::RebuildReport & rep)
-{
-    size_t i = 0;
-    res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.performed));
-    res_columns[i++]->insert(rep.round);
-    res_columns[i++]->insert(rep.generation);
-    res_columns[i++]->insert(rep.namespaces);
-    res_columns[i++]->insert(rep.shards);
-    res_columns[i++]->insert(rep.committed_refs);
-    res_columns[i++]->insert(rep.live_precommits);
-    res_columns[i++]->insert(rep.unowned_alive_manifests);
-    res_columns[i++]->insert(rep.edges);
-    res_columns[i++]->insert(rep.clamped_shards);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.virgin_by_enumeration));
-    res_columns[i++]->insert(rep.adopted_seal_generation);
-}
-
 /// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
 /// keyword (YAGNI -- the offline `clickhouse-disks cas-fsck --detail` applet already covers per-object
 /// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
@@ -2560,45 +2513,6 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRun(const String & disk_nam
         if (ran == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
     }
-
-    size_t num_rows = res_columns[0]->size();
-    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
-    BlockIO result;
-    result.pipeline = QueryPipeline(std::move(source));
-    return result;
-}
-
-BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
-{
-    /// REBUILD requires an EXPLICIT disk (E1): the destructive baseline rebuild must never fan out
-    /// across every content-addressed disk on the node. The parser enforces this syntactically; this is
-    /// the fail-closed backstop for a directly-constructed AST.
-    if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "SYSTEM CAS GC REBUILD requires an explicit disk name");
-
-    auto disk = getContext()->getDisk(disk_name);
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-
-    Cas::RebuildReport rep = ca->runGcRebuildNow(force);   /// synchronous, one rebuild
-    if (!rep.performed)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
-    LOG_INFO(log,
-        "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
-        "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={} "
-        "virgin_by_enumeration={} adopted_seal_generation={}",
-        disk_name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
-        rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards,
-        rep.virgin_by_enumeration, rep.adopted_seal_generation);
-
-    ColumnsDescription columns = contentAddressedGcRebuildColumns();
-    Block sample_block;
-    for (const auto & column : columns)
-        sample_block.insert({column.type->createColumn(), column.type, column.name});
-    MutableColumns res_columns = sample_block.cloneEmptyColumns();
-    appendContentAddressedGcRebuildRow(res_columns, disk_name, rep);
 
     size_t num_rows = res_columns[0]->size();
     auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
@@ -3276,11 +3190,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CAS_GC_RUN:
         {
             required_access.emplace_back(AccessType::SYSTEM_CAS_GC_RUN);
-            break;
-        }
-        case Type::CAS_GC_REBUILD:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_REBUILD);
             break;
         }
         case Type::CAS_DROP_POOL_MEMBER:

@@ -9,7 +9,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
@@ -38,7 +37,6 @@ using DB::Cas::tests::writeMetaClean;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::expectThrowsCode;
-using DB::Cas::tests::runRoundsUntilAbsent;
 using DB::Cas::tests::blobAbsent;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::OperationForTest;
@@ -719,7 +717,7 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
 
 /// Test 3: one task fails (a poisoned source), one sibling succeeds. Merge-nothing means the build stays
 /// at its pre-fan-out state; the abandoned precommit turns the successful sibling's uploaded body into
-/// ORDINARY GC-reclaimable debris (NOT a new orphan class) -- a GC round reclaims it.
+/// ORDINARY GC-reclaimable debris (NOT a new orphan class).
 TEST(CASUploadFanout, PendingFanoutFailureCreatesNoDependency)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -761,12 +759,8 @@ TEST(CASUploadFanout, PendingFanoutFailureCreatesNoDependency)
     EXPECT_EQ(build->dependencyProof(idOf(poisoned)), std::nullopt);
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u);
 
-    /// Abandon the precommit (the existing failure path), then GC reclaims the orphaned sibling body.
+    /// Abandon the precommit (the existing failure path).
     build->abandon();
-    s->renewWatermarkOnce();
-    Gc gc(s, DB::Cas::hexToU128("00000000000000000000000000000001"));
-    EXPECT_TRUE(runRoundsUntilAbsent(s, gc, *b, s->layout(), u128Of(good)))
-        << "the successful sibling's body is ordinary GC-reclaimable debris after abandon";
     EXPECT_TRUE(blobAbsent(*b, s->layout(), u128Of(poisoned))) << "the poisoned sibling never uploaded a body";
 }
 

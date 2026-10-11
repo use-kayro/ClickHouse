@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
@@ -311,18 +310,7 @@ TEST(CASPersistedEtag, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
         EXPECT_FALSE(reader.next(back));
     }
 
-    /// 3. The GC outcome log.
-    {
-        OutcomeLog log;
-        log.entries.push_back(OutcomeEntry{ObjectKind::Blob,
-            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, recorded, OutcomeKind::Deleted});
-        const OutcomeLog back = decodeOutcomeLog(encodeOutcomeLog(log));
-        ASSERT_EQ(back.entries.size(), 1u);
-        EXPECT_EQ(back.entries[0].token.dialect, recorded.dialect);
-        EXPECT_EQ(back.entries[0].token.value, recorded.value);
-    }
-
-    /// 4. The condemned row's packed byte form, whose dialect rides one byte rather than a word.
+    /// 3. The condemned row's packed byte form, whose dialect rides one byte rather than a word.
     {
         const CondemnedRow row{.delete_pending = false, .token = recorded, .size = 5,
                                .condemn_round = 11, .marker_confirmed = true};

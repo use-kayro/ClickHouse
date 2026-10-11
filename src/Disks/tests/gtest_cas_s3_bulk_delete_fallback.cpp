@@ -43,8 +43,7 @@ extern const int NOT_IMPLEMENTED;
 /// way the generic `deleteFilesFromS3` does, but WITHOUT looping over the objects itself: once the
 /// capability is known false (a configured `false`, or one just learned from a `DeleteObjects` reply in
 /// the "batch delete not implemented" error class), it throws `NOT_IMPLEMENTED` without sending anything
-/// else, and leaves per-key retry to the caller (the CAS engine admits each such retry as its own
-/// request -- see CasGc.cpp's `removeChunkWriteOnceOrOneByOne`). A request failure of any other class
+/// else, and leaves per-key retry to the caller. A request failure of any other class
 /// must keep today's fail-close behaviour. The one exception to all of this is a batch of exactly one
 /// object, which is always a plain `DeleteObject` -- never gated on the capability at all, since a
 /// single physical request is never something the capability check exists to rule out.
@@ -226,7 +225,7 @@ DB::ContextPtr contextForTest()
     return getContext().context;
 }
 
-/// The CAS-side fallback (CasGc.cpp's `removeChunkWriteOnceOrOneByOne`) keys specifically on
+/// A caller-side per-key fallback keys specifically on
 /// `NOT_IMPLEMENTED`; a capability-rejection test that only checks "threw a DB::Exception" would still
 /// pass if this storage started throwing, say, BAD_ARGUMENTS instead -- which would silently break that
 /// fallback while every assertion here kept passing.
@@ -303,7 +302,7 @@ TEST(S3BulkDeleteFallback, UnsupportedBatchReplyRecordsCapabilityFalseAndThrowsN
 /// A batch of exactly one object is always a plain `DeleteObject`: never sent as `DeleteObjects`, and
 /// never gated on `s3_capabilities` at all -- proven here with the capability both explicitly false AND
 /// left unknown (the default), since a single physical request is never something that check exists to
-/// refuse. This is what makes the CAS engine's per-key fallback (CasGc.cpp) actually delete anything on
+/// refuse. This is what makes a caller's per-key fallback actually delete anything on
 /// a backend that rejects `DeleteObjects` outright (GCS): a "batch" of one sent as `DeleteObjects` would
 /// fail there identically to a bigger one.
 TEST(S3BulkDeleteFallback, ExactlyOneObjectIsAlwaysAPlainDeleteObjectRegardlessOfCapability)

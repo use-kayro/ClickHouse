@@ -153,6 +153,29 @@ private:
     std::vector<GcRoundLogRecord> records;
 };
 
+/// The record source of one table this server writes, with no part on the disk: a round reads it and
+/// runs as the writer (`acquired_lease`), with nothing to mark or remove.
+class WriterWithNoRecords : public DB::ICasKeeperRecordSource
+{
+public:
+    DB::CasKeeperRecordSnapshot snapshotCasRecords(const String &) override
+    {
+        DB::CasKeeperRecordSnapshot snapshot;
+        snapshot.writer = true;
+        return snapshot;
+    }
+    void markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override {}
+    Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> &) override
+    {
+        return {};
+    }
+};
+
+Cas::KeeperRecordSourcesFn writerSources()
+{
+    return [source = std::make_shared<WriterWithNoRecords>()] { return Cas::KeeperRecordSources{source}; };
+}
+
 /// A generous wait bound for a background round to land -- trips only on a real deadlock/regression.
 constexpr std::chrono::milliseconds kRoundWait{60000};
 
@@ -182,7 +205,7 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
 
     RoundLogSink sink;
     /// 1s interval: the loop ticks ~1s; the cv wait below (never a sleep) synchronizes on real records.
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitTest", "ca-disk", sink.logger());
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitTest", "ca-disk", writerSources(), sink.logger());
     sched.start();
 
     /// Prove the loop is genuinely RUNNING first: a background round must land and acquire the lease.
@@ -214,7 +237,7 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnIdentityLost)
     auto store = openPoolForTest(backend);
 
     RoundLogSink sink;
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcIdentityLostTest", "ca-disk", sink.logger());
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcIdentityLostTest", "ca-disk", writerSources(), sink.logger());
     sched.start();
 
     ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
@@ -240,7 +263,7 @@ TEST(CASGCStopStart, StopAndDestroyCleanAfterSelfExit)
     auto store = openPoolForTest(backend);
     {
         RoundLogSink sink;
-        CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitCleanupTest", "ca-disk", sink.logger());
+        CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitCleanupTest", "ca-disk", writerSources(), sink.logger());
         sched.start();
         ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
 
@@ -263,7 +286,7 @@ TEST(CASGCStopStart, StopJoinsWorkersAndClearsLeadershipHint)
     auto store = openPoolForTest(backend);
 
     /// A long interval keeps any BACKGROUND round from firing; the manual round below is what leads.
-    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStopStartTest", "ca-disk");
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStopStartTest", "ca-disk", writerSources());
     sched.start();
 
     /// Acquire REAL leadership: a manual round on a free lease acquires it.
@@ -292,7 +315,7 @@ TEST(CASGCStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
     RoundLogSink sink;
     /// 1s interval: the background loop's first round fires ~1s after start(); the cv wait (not a sleep)
     /// synchronizes on the actual Finish record.
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopStartTest", "ca-disk", sink.logger());
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopStartTest", "ca-disk", writerSources(), sink.logger());
 
     /// First run: background rounds start and one acquires the lease.
     sched.start();
@@ -325,7 +348,7 @@ TEST(CASGCStopStart, StopAndStartAreIdempotent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
-    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStopStartTest", "ca-disk");
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStopStartTest", "ca-disk", writerSources());
 
     sched.start();
     EXPECT_NO_THROW(sched.start()) << "a second START on a running scheduler is a no-op";
@@ -454,7 +477,7 @@ TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
 
     RoundLogSink sink;
     /// 1s interval so a RUNNING scheduler would pace rounds within the observation window below.
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopPersistTest", "ca-disk", sink.logger());
+    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopPersistTest", "ca-disk", writerSources(), sink.logger());
 
     /// The operator has GC running and leading.
     sched.start();

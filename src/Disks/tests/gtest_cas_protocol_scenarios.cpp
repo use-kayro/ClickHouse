@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -507,64 +506,6 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     /// NO-LOSS / NO-RETURN: t0 is dead — a deleteExact against it TokenMismatches (the GC delete of the
     /// condemned t0 spares the live t1).
     EXPECT_EQ(removeAtIncarnation(*b, blob_key, t0), Removal::Mismatch);
-}
-
-TEST(CASProtocol, NewNamespacePublishGatedByShardFenceFloor)
-{
-    /// Regression test (test name is legacy — the fence machinery is gone): build B adopts a blob, the
-    /// ack-floor GC pipeline retires + deletes it, then B publishes into a fresh namespace. §4 manifest-
-    /// trust: B's leaf is a committed-source adopted leaf, so promote TRUSTS it (no HEAD/loadMeta probe) and
-    /// COMMITS. On the real path this dangle is UNREACHABLE — B's precommit edge pins the blob at in-degree
-    /// >= 1 through promote (CasPartWriteTxn.cpp precommitAdd → promote's WPromote owner==bld re-proof precedes the
-    /// trust), so GC cannot delete it; here the test drives GC to delete the blob while B has NOT yet
-    /// precommitted, which the live-precommit invariant excludes. The dangle is DETECTED by fsck's
-    /// reachable-but-absent scan (the backstop), not prevented at promote.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openPool(b);
-
-    /// 1. part_1 → a blob in namespace A, through the real PartWriteTxn.
-    const RootNamespace ns_a{"srv1/tbl"};
-    auto build_a = startBuildFor(s, ns_a, "part_1");
-    const ManifestId id_a = build_a->stageManifest({blobEntry("data.bin", "floor-payload")});
-    build_a->precommitAdd(ns_a, "part_1", id_a);
-    build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
-    build_a->promote(ns_a, "part_1", build_a->buildId(), id_a);
-    const String blob_key = s->layout().blobKey(idOf("floor-payload"));
-
-    /// 2. build B adopts the blob (tokenless W-EVIDENCE) while the view is still at round 0.
-    auto build_b = startBuildFor(s, RootNamespace{"srv2/new"}, "part_x");
-    build_b->adoptEvidence(blobEntry("data.bin", "floor-payload"));
-
-    /// 3. drop part_1 from A; the ack-floor GC pipeline retires the blob at t0 and deletes it. build_a
-    /// finished, so advancing the watermark floor condemns the blob. Drive rounds advancing the store's
-    /// own mount ack after each (so the floor graduates the condemned entry and the delete lands).
-    s->dropRef(ns_a, "part_1");
-    build_a.reset();
-    s->renewWatermarkOnce();
-    Gc gc(s, hexToU128("00000000000000000000000000000001"));
-    DB::Cas::tests::OperationForTest blob_op(*b);
-    for (size_t r = 0; r < 16; ++r)
-    {
-        const RoundReport rep = DB::Cas::tests::runRegularRoundReclaiming(gc);
-        s->renewWatermarkOnce();
-        if (!(*blob_op).head(blob_key, Retry::once()).has_value())
-            break;
-    }
-    /// The blob (unreachable) was deleted at t0.
-    EXPECT_FALSE((*blob_op).head(blob_key, Retry::once()).has_value());
-
-    /// 4. build B publishes into a BRAND-NEW namespace. §4 manifest-trust: the adopted leaf is trusted at
-    /// promote (no probe) ⇒ promote SUCCEEDS and commits a manifest naming the deleted blob (the dangle).
-    const ManifestId id_b = build_b->stageManifest({blobEntry("data.bin", "floor-payload")});
-    build_b->precommitAdd(RootNamespace{"srv2/new"}, "part_x", id_b);
-    EXPECT_NO_THROW(build_b->promote(RootNamespace{"srv2/new"}, "part_x", build_b->buildId(), id_b));
-
-    /// The ref committed over the deleted blob (the D4 trade-off); the backstop is fsck's reachable-but-
-    /// absent scan (INV-NO-DANGLE-via-fsck).
-    EXPECT_TRUE(s->resolveRef(RootNamespace{"srv2/new"}, "part_x").has_value());
-    const FsckReport rep = runFsck(*s, /*detail=*/true);
-    EXPECT_GE(rep.dangling, 1u) << "§4 D4 backstop: part_x committed over the GC-deleted blob; fsck must "
-                                   "report it dangling (dangling=" << rep.dangling << ")";
 }
 
 TEST(CASProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)

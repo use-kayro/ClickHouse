@@ -381,7 +381,8 @@ TEST(CASOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
     auto backend = std::make_shared<Cas::InMemoryBackend>();
     auto pool = Cas::tests::openPoolForTest(backend);
     auto scheduler = std::make_shared<Cas::CasGcScheduler>(
-        pool, std::chrono::seconds(3600), "op-gate-test-gc", "disk", Cas::GcRoundLogger{});
+        pool, std::chrono::seconds(3600), "op-gate-test-gc", "disk",
+        [] { return Cas::KeeperRecordSources{}; }, Cas::GcRoundLogger{});
     EXPECT_TRUE(scheduler->isQuiescent());
     scheduler->setRoundInFlightForTest(true);
     EXPECT_FALSE(scheduler->isQuiescent()) << "a round in flight must NOT read as GC-quiescent";

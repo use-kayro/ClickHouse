@@ -17,7 +17,7 @@ namespace ErrorCodes
 }
 
 /// Read-only "decode any object" command: takes the RAW object-storage key (e.g. as printed by
-/// `cas-gc-dryrun` or `fsck`) rather than a ClickHouse-relative path, GETs its bytes straight from
+/// `fsck`) rather than a ClickHouse-relative path, GETs its bytes straight from
 /// the pool's backend, and dispatches to `Cas::caInspectToJson` (the same free function the unit
 /// tests exercise directly against encoder output). Never writes; safe to run against a live pool.
 class CommandCaInspect final : public ICommand

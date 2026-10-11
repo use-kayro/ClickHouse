@@ -23,8 +23,7 @@ namespace DB::Cas
 /// bound: it occupied no log key, so it fenced nothing and needed a separate after-the-fact detector for
 /// the writes it let through. All `RefTxnId` components are still encoded as decimal strings. Rows are
 /// emitted in canonical order, making re-encoding deterministic by construction; these objects are
-/// published through the ordinary single-owner `putIfAbsentControlled` path, not a
-/// `putDeterministicArtifact` byte-adoption gate.
+/// published through the ordinary single-owner `putIfAbsentControlled` path.
 
 /// In-memory ref-table lifecycle. Only `Live` is serializable as a snapshot; terminal
 /// state lives in the removal log and fold evidence and has no snapshot DTO representation.
