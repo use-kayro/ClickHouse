@@ -1693,7 +1693,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::attachPartFromKeeperRecord(
 
     String record;
     const String records_path = casPartRecordsPath(data.getZooKeeperPath());
-    if (!data.getZooKeeper()->tryGet(fs::path(records_path) / part_name, record))
+    if (!data.getContext()->getDefaultOrAuxiliaryZooKeeper(data.getZooKeeperName())->tryGet(fs::path(records_path) / part_name, record))
         return nullptr;
 
     /// Staged under the tmp-fetch dir, exactly where the byte fetch and the relink put a part, so
