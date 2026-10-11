@@ -1,4 +1,5 @@
 #include <Storages/StorageMergeTree.h>
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 
 #include <optional>
 #include <ranges>
@@ -257,6 +258,9 @@ void StorageMergeTree::startup()
         startBackgroundMoves();
         startOutdatedAndUnexpectedDataPartsLoadingTask();
         startStatisticsCache();
+        for (const auto & disk : casRecordDisks(getDisks()))
+            tryGetContentAddressedExchange(disk)->registerKeeperRecordSource(
+                std::static_pointer_cast<StorageMergeTree>(shared_from_this()));
     }
     catch (...)
     {
@@ -296,10 +300,26 @@ void StorageMergeTree::flushAndPrepareForShutdown()
     LOG_TRACE(log, "Finished preparing for shutdown");
 }
 
+CasKeeperRecordSnapshot StorageMergeTree::snapshotCasRecords(const String & pool_uuid)
+{
+    CasKeeperRecordSnapshot snapshot;
+    snapshot.writer = true;
+    for (const auto & part : getDataPartsVectorForInternalUsage({MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
+    {
+        const auto * ca = tryGetContentAddressedExchange(getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName()));
+        if (ca && ca->getPoolUUID() == pool_uuid)
+            ++snapshot.unrecorded_listed;
+    }
+    return snapshot;
+}
+
 void StorageMergeTree::shutdown(bool)
 {
     if (shutdown_called.exchange(true))
         return;
+
+    for (const auto & disk : casRecordDisks(getDisks()))
+        tryGetContentAddressedExchange(disk)->unregisterKeeperRecordSource(this);
 
     if (refresh_parts_task)
         refresh_parts_task->deactivate();

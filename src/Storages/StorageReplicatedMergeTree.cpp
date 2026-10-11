@@ -257,6 +257,7 @@ namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
     extern const MergeTreeSettingsBool allow_remote_fs_zero_copy_replication;
+    extern const MergeTreeSettingsSeconds old_parts_lifetime;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
     extern const MergeTreeSettingsBool table_readonly;
@@ -5113,6 +5114,138 @@ void StorageReplicatedMergeTree::backfillCasPartRecords()
         LOG_INFO(log, "Backfilled {} Keeper part records ({} already present)", created, futures.size() - created);
 }
 
+void StorageReplicatedMergeTree::registerCasKeeperRecordSource()
+{
+    for (const auto & disk : casRecordDisks(getDisks()))
+    {
+        auto * ca = tryGetContentAddressedExchange(disk);
+        ca->unregisterKeeperRecordSource(this);
+        ca->registerKeeperRecordSource(std::static_pointer_cast<StorageReplicatedMergeTree>(shared_from_this()));
+    }
+}
+
+void StorageReplicatedMergeTree::unregisterCasKeeperRecordSource()
+{
+    for (const auto & disk : casRecordDisks(getDisks()))
+        tryGetContentAddressedExchange(disk)->unregisterKeeperRecordSource(this);
+}
+
+CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const String & pool_uuid)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::snapshotCasRecords");
+    IContentAddressedExchange * ca = nullptr;
+    for (const auto & disk : casRecordDisks(getDisks()))
+        if (auto * candidate = tryGetContentAddressedExchange(disk); candidate->getPoolUUID() == pool_uuid)
+            ca = candidate;
+
+    CasKeeperRecordSnapshot snapshot;
+    snapshot.writer = is_leader && !is_readonly;
+    snapshot.retention_ms = (*getSettings())[MergeTreeSetting::old_parts_lifetime].totalMilliseconds();
+    if (!ca)
+        return snapshot;
+
+    auto zookeeper = getZooKeeper();
+    if (snapshot.writer)
+    {
+        Coordination::Stat is_active_stat;
+        Coordination::Stat host_stat;
+        if (!zookeeper->exists(fs::path(replica_path) / "is_active", &is_active_stat)
+            || !zookeeper->exists(fs::path(replica_path) / "host", &host_stat))
+        {
+            snapshot.writer = false;
+            return snapshot;
+        }
+        snapshot.is_active_version = is_active_stat.version;
+        snapshot.host_version = host_stat.version;
+    }
+
+    const String records_path = casPartRecordsPath(zookeeper_path);
+    Strings names;
+    if (zookeeper->tryGetChildren(records_path, names) != Coordination::Error::ZOK)
+        names.clear();
+    Strings paths;
+    paths.reserve(names.size());
+    for (const auto & name : names)
+        paths.push_back(fs::path(records_path) / name);
+    auto got = zookeeper->tryGet(paths);
+
+    /// Listings read AFTER the records: a part committed in between is not mistaken for an unlisted one
+    /// (its record and its first part znode are created in one multi-op).
+    NameSet listed;
+    for (const auto & replica : zookeeper->getChildren(fs::path(zookeeper_path) / "replicas"))
+    {
+        Strings parts;
+        if (zookeeper->tryGetChildren(fs::path(zookeeper_path) / "replicas" / replica / "parts", parts) == Coordination::Error::ZOK)
+            listed.insert(parts.begin(), parts.end());
+    }
+
+    NameSet recorded;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        if (got[i].error != Coordination::Error::ZOK)
+            continue;   /// removed meanwhile
+        CasKeeperRecordState state{.part = names[i], .data = std::move(got[i].data), .blobs = {}, .listed = listed.contains(names[i]),
+                                   .version = got[i].stat.version, .mtime_ms = got[i].stat.mtime};
+        try
+        {
+            const CasKeeperPartRecord decoded = ca->decodeKeeperPartRecord(state.data);
+            if (decoded.pool_uuid != pool_uuid)
+                continue;   /// a record of another pool of the policy
+            state.blobs = casRecordBlobFiles(decoded);
+        }
+        catch (const Exception & e)
+        {
+            /// Blobs unknown: never removed, and while its part is listed, nothing is deleted.
+            LOG_WARNING(log, "Cannot read the Keeper record of part {}: {}", names[i], e.message());
+            continue;
+        }
+        recorded.insert(names[i]);
+        snapshot.records.push_back(std::move(state));
+    }
+
+    /// A listed part without a record: its blobs are unknown unless this replica holds it on a disk that
+    /// is not content-addressed.
+    for (const auto & name : listed)
+    {
+        if (recorded.contains(name))
+            continue;
+        const auto part = getPartIfExists(name, {MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+        if (part && !tryGetContentAddressedExchange(getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName())))
+            continue;
+        ++snapshot.unrecorded_listed;
+    }
+    return snapshot;
+}
+
+void StorageReplicatedMergeTree::markCasRecords(const std::vector<const CasKeeperRecordState *> & records)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::markCasRecords");
+    auto zookeeper = getZooKeeper();
+    const String records_path = casPartRecordsPath(zookeeper_path);
+    for (const auto * record : records)
+        (void)zookeeper->trySet(fs::path(records_path) / record->part, record->data, record->version);   /// a lost race: next round
+}
+
+Strings StorageReplicatedMergeTree::removeCasRecords(
+    const CasKeeperRecordSnapshot & snapshot, const std::vector<const CasKeeperRecordState *> & records)
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::removeCasRecords");
+    auto zookeeper = getZooKeeper();
+    const Strings replicas = zookeeper->getChildren(fs::path(zookeeper_path) / "replicas");
+    Strings removed;
+    for (const auto * record : records)
+    {
+        const Coordination::Requests ops = casRecordRemovalOps(*zookeeper, zookeeper_path, replica_path, replicas, record->part,
+            record->version, snapshot.is_active_version, snapshot.host_version);
+        Coordination::Responses responses;
+        if (zookeeper->tryMulti(ops, responses) == Coordination::Error::ZOK)
+            removed.push_back(record->part);
+    }
+    if (!removed.empty())
+        LOG_DEBUG(log, "Removed the Keeper records of {} parts no replica lists", removed.size());
+    return removed;
+}
+
 void StorageReplicatedMergeTree::getRemovePartFromZooKeeperOps(const String & part_name, Coordination::Requests & ops, bool has_children)
 {
     String part_path = fs::path(replica_path) / "parts" / part_name;
@@ -6264,6 +6397,8 @@ void StorageReplicatedMergeTree::startupImpl(bool from_attach_thread, const ZooK
 
         part_moves_between_shards_orchestrator.start();
 
+        registerCasKeeperRecordSource();
+
         /// After finishing startup() create_query_zk_retries_info won't be used anymore.
         clearCreateQueryZooKeeperRetriesInfo();
     }
@@ -6389,6 +6524,8 @@ void StorageReplicatedMergeTree::shutdown(bool)
         return;
 
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::shutdown");
+
+    unregisterCasKeeperRecordSource();
 
     LOG_TRACE(log, "Shutdown started");
 

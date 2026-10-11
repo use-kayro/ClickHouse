@@ -400,9 +400,7 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
             /// (which would abort under debug/ASan builds).
             if (!cas_store)
                 throwStorageNotStarted();
-            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
-                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-                disk_name, makeGcRoundLogger());
+            gc_scheduler = makeGcScheduler(cas_store);
         }
         snapshot = gc_scheduler;
     }
@@ -652,9 +650,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             /// -- a normal `INVALID_STATE` refusal, never a `LOGICAL_ERROR` abort.
             if (!cas_store)
                 throwStorageNotStarted();
-            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
-                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-                disk_name, makeGcRoundLogger());
+            gc_scheduler = makeGcScheduler(cas_store);
         }
         snapshot = gc_scheduler;
     }
@@ -910,9 +906,7 @@ void ContentAddressedMetadataStorage::startup()
     std::shared_ptr<Cas::CasGcScheduler> scheduler;
     if (startup_context && gc_enabled && !read_only)
     {
-        scheduler = std::make_shared<Cas::CasGcScheduler>(
-            pool, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            disk_name, makeGcRoundLogger());
+        scheduler = makeGcScheduler(pool);
         scheduler->start();
     }
 
@@ -1156,9 +1150,7 @@ void ContentAddressedMetadataStorage::gcStart()
             /// points, so START is meaningful. (`checkOpAdmitted` above already proved `cas_store` is live.)
             if (!cas_store)
                 throwStorageNotStarted();
-            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
-                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-                disk_name, makeGcRoundLogger());
+            gc_scheduler = makeGcScheduler(cas_store);
         }
         snapshot = gc_scheduler;
     }
@@ -2477,6 +2469,39 @@ bool ContentAddressedMetadataStorage::isHeldFromKeeper(const String & part_path)
     auto p = Cas::parsePartFilePath(part_path);
     auto r = p ? route(*p) : std::nullopt;
     return r && !r->ref.empty() && r->file.empty() && partAccess()->isKeeperPart(r->refKey());
+}
+
+void ContentAddressedMetadataStorage::registerKeeperRecordSource(std::weak_ptr<ICasKeeperRecordSource> source)
+{
+    std::lock_guard lock(record_sources_mutex);
+    record_sources.push_back(std::move(source));
+}
+
+void ContentAddressedMetadataStorage::unregisterKeeperRecordSource(const ICasKeeperRecordSource * source)
+{
+    std::lock_guard lock(record_sources_mutex);
+    std::erase_if(record_sources, [&](const auto & weak)
+    {
+        const auto locked = weak.lock();
+        return !locked || locked.get() == source;
+    });
+}
+
+std::vector<std::shared_ptr<ICasKeeperRecordSource>> ContentAddressedMetadataStorage::keeperRecordSources() const
+{
+    std::lock_guard lock(record_sources_mutex);
+    std::vector<std::shared_ptr<ICasKeeperRecordSource>> out;
+    for (const auto & weak : record_sources)
+        if (auto source = weak.lock())
+            out.push_back(std::move(source));
+    return out;
+}
+
+std::shared_ptr<Cas::CasGcScheduler> ContentAddressedMetadataStorage::makeGcScheduler(Cas::PoolPtr pool) const
+{
+    return std::make_shared<Cas::CasGcScheduler>(
+        std::move(pool), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full), disk_name,
+        [this] { return keeperRecordSources(); }, makeGcRoundLogger());
 }
 
 /// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary

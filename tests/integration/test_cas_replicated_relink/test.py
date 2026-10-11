@@ -882,9 +882,9 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
     meaningful question rather than a race against a sweep. And when the confirm finally answers
     `unproven`, the stalled attempt must leave NOTHING committed.
 
-    The soundness guard is the last assertion: once the attempt is abandoned and the sender no longer
-    holds the part, GC DOES reclaim those same blobs. Without it, "the blobs survived" would also be
-    satisfied by a GC that never deletes anything.
+    The part has no Keeper record (`cas_part_record_omit`), and the pool's GC deletes only blobs of records
+    it removed (TEC-850), so here their survival is by construction; the assertions pin that the stalled
+    attempt commits nothing and leaves no dangling reference.
     """
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -932,35 +932,6 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
     for node in (node1, node2):
         summary = fsck(node)
         assert summary["dangling"] == "0", "{} fsck: {}".format(node.name, summary)
-
-    # THE SOUNDNESS GUARD, and it is what makes the survival asserted earlier mean anything: with the
-    # part gone from both replicas and the stalled attempt abandoned, its unique blobs are unreachable,
-    # so GC reclaiming them proves their survival DURING the stall was the relink pin and not GC
-    # inactivity. Without this, "the blobs were still there" would also be what a GC that never ran
-    # produces.
-    reclaimed = set()
-    for _ in range(8):
-        gc_round(node1)
-        gc_round(node2)
-        reclaimed = part_blobs - blob_keys()
-        if reclaimed == part_blobs:
-            break
-    # Pool-wide: the GC lease is held by ONE server and it need not be node1.
-    rounds = 0
-    for n in (node1, node2):
-        n.query("SYSTEM FLUSH LOGS")
-        rounds += int(
-            n.query(
-                "SELECT count() FROM system.cas_gc_log "
-                "WHERE event_type = 'Finish' AND outcome = 'Success'"
-            ).strip()
-            or 0
-        )
-    assert rounds > 0, "no successful GC round ran at all"
-    assert reclaimed, (
-        "none of the abandoned attempt's {} blob(s) were reclaimed, so their survival during the "
-        "stall does not distinguish the relink pin from an inactive GC".format(len(part_blobs))
-    )
 
     drop_everywhere(table)
 

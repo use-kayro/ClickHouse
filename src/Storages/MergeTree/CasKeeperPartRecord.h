@@ -67,6 +67,17 @@ void addCasPartRecordOps(
     const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & zookeeper_path, const IMergeTreeDataPart & part,
     const std::optional<String> & copied_from_replica_path, Coordination::Requests & ops);
 
+/// The one multi-op that removes the record of `part` (at `<zookeeper_path>/cas_parts/<part>`, at
+/// `record_version`): it checks that no replica of `replicas` lists the part and that the writer epoch the GC
+/// read -- the versions of `<replica_path>/is_active` and `<replica_path>/host` -- still holds.
+Coordination::Requests casRecordRemovalOps(
+    const zkutil::ZooKeeper & zookeeper, const String & zookeeper_path, const String & replica_path, const Strings & replicas,
+    const String & part, Int32 record_version, Int32 is_active_version, Int32 host_version);
+
+/// The blob-backed files a decoded record references: every file its `checksums.txt` (and each projection's)
+/// names that the record does not carry inline. Throws `CORRUPTED_DATA` when it has no `checksums.txt`.
+std::vector<CasKeeperBlobFile> casRecordBlobFiles(const CasKeeperPartRecord & decoded);
+
 /// Make the disk-relative part directory `part_path` hold the part `record` describes, on the disk of
 /// `candidates` whose pool the record names. Returns that disk, or nullptr -- changing nothing -- when no
 /// candidate is on the pool, the record is malformed (logged), or the chosen disk's ref table already holds

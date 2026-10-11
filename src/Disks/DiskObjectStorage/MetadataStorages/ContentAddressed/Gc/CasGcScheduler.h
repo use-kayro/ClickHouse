@@ -1,6 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasKeeperGc.h>
 #include <Common/ThreadPool.h>
 #include <base/types.h>
 #include <atomic>
@@ -93,13 +93,11 @@ using GcRoundLogger = std::function<void(const GcRoundLogRecord &)>;
 bool isTransientGcRoundError(int code);
 
 /// Paces regular content-addressed garbage-collection rounds for one pool. The scheduler does not
-/// implement the GC protocol: `Cas::Gc` owns lease acquisition, work deduplication, and the
-/// split-brain-safe round operations, so schedulers on different mounters may run independently.
+/// implement the GC protocol: `Cas::KeeperGc` does, and only the writer's round deletes.
 /// This class waits for a tick, runs one round, records its result, and retries after exceptions;
 /// round operations are idempotent, while `LOGICAL_ERROR` exceptions remain visible in the log.
 ///
-/// The background and heartbeat workers are `ThreadFromGlobalPool` instances. The background worker
-/// therefore has the attached `ThreadStatus` required by `ProfileEventsScope` for per-round
+/// The background worker is a `ThreadFromGlobalPool` instance. It therefore has the attached `ThreadStatus` required by `ProfileEventsScope` for per-round
 /// `ProfileEvents` deltas. A manual round runs on the caller's thread; if that thread has no
 /// `ThreadStatus`, the per-round delta is omitted rather than making the GC round fail.
 class CasGcScheduler
@@ -110,23 +108,22 @@ public:
         std::chrono::seconds interval_,
         const String & log_name,
         String disk_name_,
+        Cas::KeeperRecordSourcesFn sources_,
         GcRoundLogger logger_ = {});
     ~CasGcScheduler();
 
-    /// Starts the periodic round and heartbeat workers. Calling `start` more than once while the
-    /// scheduler is running is a no-op; after `stop`, it may be started again on the SAME instance --
-    /// the persistent `gc` observer and `gc_id` are preserved, so the lease's observation-window
-    /// protocol continues across a stop/start (`SYSTEM CAS GC START`).
+    /// Starts the periodic round worker. Calling `start` more than once while the scheduler is running
+    /// is a no-op; after `stop`, it may be started again on the SAME instance, which keeps the round's
+    /// condemnations (`SYSTEM CAS GC START`).
     void start();
 
-    /// Stops both workers, wakes them if they are waiting, and joins them before returning. It is
-    /// safe to call `stop` when the scheduler is not running and from the destructor. It also clears
-    /// the in-process `i_am_leader` hint (after the joins), so a stopped scheduler reports it no longer
-    /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CAS GC STOP`).
+    /// Stops the worker, wakes it if it is waiting, and joins it before returning. It is safe to call
+    /// `stop` when the scheduler is not running and from the destructor. It also clears `i_am_leader`
+    /// (after the join), so a stopped scheduler reports it no longer runs GC (`SYSTEM CAS GC STOP`).
     void stop();
 
     /// Wake the periodic worker so it starts the next ordinary round promptly. This does not create a
-    /// second execution path: the same worker, lease protocol, and `gc_round_mutex` remain the sole
+    /// second execution path: the same worker and `gc_round_mutex` remain the sole
     /// scheduled-round authority. Requests coalesce into one boolean while a round is pending.
     void requestRoundSoon();
 
@@ -160,10 +157,10 @@ public:
     /// "running round => not quiescent" without spinning up a real round against a live backend.
     void setRoundInFlightForTest(bool v) { round_in_flight.store(v, std::memory_order_release); }
 
-    /// Test seam (rev.7 §3 [C1]): block up to `timeout` for BOTH the pacing and heartbeat loops to have
+    /// Test seam (rev.7 §3 [C1]): block up to `timeout` for the pacing loop to have
     /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
     /// opposed to exiting through `stop()`'s `stopping` flag. Returns false on timeout. Predicate-based
-    /// wait (no sleeps); the loops set their flag under `terminal_exit_mutex` before notifying, so there is
+    /// wait (no sleeps); the loop sets its flag under `terminal_exit_mutex` before notifying, so there is
     /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
     /// delay.
     bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
@@ -174,40 +171,25 @@ private:
     /// with `runOneRoundNow` because the persistent `gc` object is not thread-safe.
     void loop();
 
-    /// While this scheduler believes it owns the lease, periodically advances the advisory
-    /// heartbeat independently of round progress. The cadence is shorter than the lease
-    /// observation window, so a long round does not look like a dead leader to another scheduler.
-    /// Heartbeat failures are advisory and are retried on the next cadence.
-    void heartbeatLoop();
 
-    /// Runs synchronously when `Cas::Gc` acquires or renews the lease, before the round's potentially
-    /// long fold begins. It marks this scheduler as the heartbeat owner and sends the first pulse
-    /// immediately; otherwise a new leader's first round could appear inactive until it returned.
-    /// The same hook is used by scheduled and manual rounds so both acquisition paths are protected.
-    void onLeaseAcquired();
 
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
     /// record). Used by BOTH loop() and runOneRoundNow. Logging is best-effort - the logger sink
     /// never throws into the round. Rethrows a round exception (after emitting an Aborted Finish).
-    /// `allow_steal` is forwarded to `Cas::Gc::runRegularRound` verbatim (see its doc comment).
-    Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
-                                     std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
+    Cas::RoundReport runRoundLogged(GcRoundLogRecord::Trigger trigger);
 
     const Cas::PoolPtr store;
     const std::chrono::seconds interval;
-    const std::chrono::milliseconds hb_interval;   /// advisory heartbeat cadence, interval / 4 with a 50 ms minimum
     const LoggerPtr log;
     const UInt128 gc_id;
     const String disk_name;
     const GcRoundLogger logger;
 
-    /// One persistent Gc for BOTH loop() and runOneRoundNow: the lease's observation-window steal
-    /// protocol REQUIRES a stable observer (it compares the lease across consecutive runRegularRound
-    /// calls of the same instance). A throwaway per call could never recover a dead-incumbent lease.
-    Cas::Gc gc;
+    /// One Gc for BOTH loop() and runOneRoundNow: it keeps the round's condemnations between rounds.
+    Cas::KeeperGc gc;
     /// Serializes the manual round against the background round so the two never touch the single
     /// (not-thread-safe) `gc` concurrently. Distinct from `mutex`: the loop releases `mutex` before
-    /// the round so stop()/heartbeatLoop are not blocked, so the round cannot hold `mutex`.
+    /// the round so stop() is not blocked, so the round cannot hold `mutex`.
     std::mutex gc_round_mutex;
 
     std::mutex mutex;
@@ -215,29 +197,26 @@ private:
     bool stopping = false;
     bool round_requested = false;   /// guarded by `mutex`; coalesced external wake request
     ThreadFromGlobalPool thread;
-    /// Set by the round worker and read by the heartbeat worker. It is only an in-process hint: the
-    /// durable lease remains the authority, and a failed round clears the hint before retrying.
+    /// Whether the last round ran as the writer (this server writes every table on the disk).
     std::atomic<bool> i_am_leader{false};
-    ThreadFromGlobalPool hb_thread;
 
     /// Set true for the whole body of one round (`runRoundLogged`, held across the `gc_round_mutex`
     /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
     /// success AND exception paths. Read by `isQuiescent` (the FORGET / GC-STOP join-completion signal).
     std::atomic<bool> round_in_flight{false};
 
-    /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop`/`heartbeatLoop`
-    /// respectively when they SELF-EXIT via the terminal-lifecycle check, NOT when `stop()` flips
-    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
+    /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop` when it
+    /// SELF-EXITS via the terminal-lifecycle check, NOT when `stop()` flips
+    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for it, so a test proves
     /// the self-exit path fired without any sleep. Purely diagnostic; production behavior never reads them.
     std::atomic<bool> loop_exited_on_terminal_for_test{false};
-    std::atomic<bool> hb_exited_on_terminal_for_test{false};
     std::mutex terminal_exit_mutex;
     std::condition_variable terminal_exit_cv;
 
     /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
     /// led. It is an approximate health gauge, not durable GC state.
     std::atomic<Int64> pending_reclaim{0};
-    /// Steady-clock timestamp of the last round that acquired the lease; zero means never.
+    /// Steady-clock timestamp of the last round that ran as the writer; zero means never.
     std::atomic<UInt64> last_success_ms{0};
 };
 
