@@ -107,8 +107,14 @@ Regra de aceite (decisão do dono, 11/10 ~20:00Z): por evidência, não por rel�
 | Nó | Apply | Resultado |
 |---|---|---|
 | Reader-mdb `i-0bc5ccb44d4141059` | 20:45:05Z → 20:45:13Z; container às 20:45:10Z | **Aceito às 21:46Z.** CAS `reader-mdb` live na época 15 (era 14); loader 196 OK, 0 falhas; mdb 54 tabelas, 0 readonly, atraso 0. Rajada de LIST: 160.347 em 10 min (27.682 throttled). Lease do writer intacto (época 33). `NoSuchKey` 186 (20:45–21:00) e 108 (21:00–21:45), só Debug. Nenhuma classe de erro nova. Backups: `kayro-clickhouse.service.pre-image-20261011T204506017766Z`, `server.xml.pre-image-20261011T204506018408Z` |
-| Reader compartilhado `i-02369cef982eb67d2` | 21:55:05Z → 21:55:28Z; container às 21:55:11Z | Health OK às 22:06Z: CAS `reader` live na época 13; loader 1.223 OK, 0 falhas; 16 bancos, 0 readonly, atraso 0. A primeira consulta a `system.replicas` ficou bloqueada ~582 s durante o start. Nenhuma classe de erro nova. Leases do writer (época 33) e do reader-mdb intactos. Backups: `…pre-image-20261011T215505839721Z` e `…20261011T215505841755Z`. Aceite final: não registrado quando este arquivo foi escrito |
-| Writer `i-02e3809e0b416b25e` | **planejado** para 11/10 22:33Z, se a observação do compartilhado (21:55–22:25Z) sair limpa | Guarda de INSERT; depois do restart, `system.settings` tem que mostrar `wait_for_async_insert=1` e `async_insert_busy_timeout_max_ms=200` (limpa a sobra do perfil `kayro_batch`, kayro-infra #225, TEC-847). Resultado: não registrado quando este arquivo foi escrito |
+| Reader compartilhado `i-02369cef982eb67d2` | 21:55:05Z → 21:55:28Z; container às 21:55:11Z | Health OK às 22:06Z: CAS `reader` live na época 13; loader 1.223 OK, 0 falhas; 16 bancos, 0 readonly, atraso 0. A primeira consulta a `system.replicas` ficou bloqueada ~582 s durante o start. Nenhuma classe de erro nova. Leases do writer (época 33) e do reader-mdb intactos. Backups: `…pre-image-20261011T215505839721Z` e `…20261011T215505841755Z`. Saudável no RC3 na verificação final das 22:43Z (critério de encerramento do rollout) |
+| Writer `i-02e3809e0b416b25e` | 22:33:00Z, um restart só; a guarda de INSERT liberou na hora | `system.settings` com `wait_for_async_insert=1` e `async_insert_busy_timeout_max_ms=200`: a sobra do perfil `kayro_batch` (kayro-infra #225, TEC-847) saiu. Replicação às 22:43Z: 17 bancos, 0 readonly, atraso 0, fila 0. O refresh da Gazzoni recebeu 2× `NOT_A_LEADER` (529) às 22:34Z e passou no retry |
+
+**Rollout encerrado às 22:43Z de 11/10:** os três nós saudáveis no RC3 e o fix medido no líder do GC (abaixo).
+
+### Efeitos do restart
+
+A rajada de LIST do mount do writer no boot provocou 503 do S3 (300–630 por minuto). Entre 22:36Z e 22:42Z isso fez o fencing do lease CAS nos três nós: épocas writer 33→35, reader-mdb 15→16, reader compartilhado 13→16. Os três remontaram sozinhos até 22:43Z. A causa é a tempestade de LIST no boot (TEC-845), não o RC3. É o mesmo efeito registrado nos restarts de config de 11/10 (TEC-837).
 
 ### Medição do fix no líder do GC
 
@@ -126,10 +132,12 @@ Primeiras rodadas do reader-mdb como líder no RC3, com concorrência padrão (1
 |---|---|---:|---:|---:|---|
 | 1 | 22:07Z | 19 | 2.908 | 337 | rodada de tomada da liderança |
 | 2 | 22:18Z | 1 | 2.213 | 2 | |
+| 3 | depois do restart do writer | 0 | 1.871 | ~0 | |
+| 4 | | 0 | ~2.670 | ~0 | |
 
 Referência no RC2: ~1.000 GET 404 por hora no reader-mdb com read-ahead desligado.
 
-Leitura: `CASGCReadAheadWasted` não conta só 404. Ele também conta slots de read-ahead esperados que a rodada não chegou a consumir, então um valor pequeno e diferente de zero não significa chave inexistente pedida ao S3. O número que mostra o fix é o de 404 por rodada: 2 na rodada 2, contra ~1.000/h no RC2.
+Leitura: `CASGCReadAheadWasted` não conta só 404. Ele também conta slots de read-ahead esperados que a rodada não chegou a consumir, então um valor pequeno e diferente de zero não significa chave inexistente pedida ao S3. O número que mostra o fix é o de 404 por rodada: 337 → 2 → ~0, contra ~1.000/h no RC2. A partir da rodada 3, `Wasted` também ficou em 0.
 
 Se o desperdício voltar a crescer, a saída é só config (`cas_gc_read_concurrency=1`), sem efeito nas decisões do GC.
 
@@ -137,6 +145,6 @@ Linha de base do reader-mdb no RC2 com concorrência 1, como líder (19:56Z): GE
 
 ## Depois do rollout
 
-- PR no kayro-infra: `clickhouse_shared_image` → digest do RC3 e saída de `cas_gc_read_concurrency` da lista `tunable`.
+- kayro-infra #229 mergeado (`cas_gc_read_concurrency` fora de todos os papéis). O #234 (imagem padrão do módulo → digest do RC3, `cas_gc_read_concurrency` fora da lista `tunable` do `configure-filesystem-cache.py`) estava sendo mergeado quando isto foi escrito.
 - Este código morre no passo 3 da milestone 6 (ver [ROADMAP](ROADMAP.md)), junto com o read-ahead e o sweep que ele corrige. Até lá é a mitigação.
 - Não resolvido no RC3: sem `_snap`, a visão de proteção ainda refaz cada namespace desde o início a cada página (a maior parte dos ~956 mil GETs bem-sucedidos por dia), e a tempestade de LIST no restart (TEC-845).
