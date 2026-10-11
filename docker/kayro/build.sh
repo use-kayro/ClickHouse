@@ -21,4 +21,5 @@ cp build-release/programs/stripped/bin/clickhouse build-release/kayro-image/clic
 revision=$(git rev-parse HEAD)
 binary_sha=$(sha256sum build-release/kayro-image/clickhouse | cut -d ' ' -f 1)
 docker build -f docker/kayro/Dockerfile --build-arg SOURCE_COMMIT="$revision" \
-  --build-arg BINARY_SHA256="$binary_sha" -t "$image" build-release/kayro-image
+  --build-arg BINARY_SHA256="$binary_sha" --build-arg IMAGE_VERSION="${image##*:}" \
+  -t "$image" build-release/kayro-image
