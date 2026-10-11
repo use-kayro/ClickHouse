@@ -51,6 +51,7 @@ def start_cluster():
             macros={"replica": name},
             with_rustfs=True,
             with_zookeeper=True,
+            keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
             stay_alive=True,
         )
     try:
@@ -378,3 +379,36 @@ def test_writer_boot_backfills_missing_records():
     assert log_lines(reader, r"default\.{} .*Attached part .* from its Keeper record".format(table))
     for node in (writer, reader):
         node.query("DROP TABLE {} SYNC".format(table))
+
+
+def test_replace_partition_creates_records():
+    """REPLACE PARTITION FROM (the nightly refresh) commits the cloned parts with their records and still
+    reads its own log entry back; the reader gets the parts from the records."""
+    writer = cluster.instances["writer"]
+    reader = cluster.instances["reader"]
+    table, source = "keeper_parts_replace", "keeper_parts_replace_src"
+    for node in (writer, reader):
+        node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    writer.query("DROP TABLE IF EXISTS {} SYNC".format(source))
+    create_table(writer, table, wide=True, reader=False)
+    create_table(reader, table, wide=True, reader=True)
+    writer.query(
+        "CREATE TABLE {source} AS {table} ENGINE = MergeTree PARTITION BY id % 2 ORDER BY id "
+        "SETTINGS storage_policy = '{policy}', min_bytes_for_wide_part = 0".format(source=source, table=table, policy=STORAGE_POLICY)
+    )
+    writer.query(
+        "INSERT INTO {} SELECT number, number % 7919, toString(number % 97), NULL FROM numbers(4000)".format(source)
+    )
+
+    writer.query("ALTER TABLE {} REPLACE PARTITION 0 FROM {} SETTINGS alter_sync = 1".format(table, source))
+    writer.query("ALTER TABLE {} REPLACE PARTITION 1 FROM {} SETTINGS alter_sync = 1".format(table, source))
+    reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
+
+    active = active_parts(writer, table)
+    assert active and set(active) <= set(record_lengths(writer, table))
+    assert active_parts(reader, table) == active
+    assert results(reader, table) == results(writer, table)
+    assert log_lines(reader, r"default\.{} .*Attached part .* from its Keeper record".format(table))
+    for node in (writer, reader):
+        node.query("DROP TABLE {} SYNC".format(table))
+    writer.query("DROP TABLE {} SYNC".format(source))

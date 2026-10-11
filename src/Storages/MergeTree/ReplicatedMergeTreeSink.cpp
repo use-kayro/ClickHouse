@@ -1,7 +1,6 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSink.h>
-#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Storages/MergeTree/InsertBlockInfo.h>
 #include <Storages/MergeTree/MergeAlgorithm.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
@@ -1018,8 +1017,6 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
         storage.getLockSharedDataOps(*part, zookeeper, /*replace_zero_copy_lock*/ false, {}, ops);
         size_t shared_lock_op_id_end = ops.size();
 
-        storage.getCommitPartOps(ops, part, block_id_pathes);
-
         /// It's important to create it outside of lock scope because
         /// otherwise it can lock parts in destructor and deadlock is possible.
         MergeTreeData::Transaction transaction(storage, NO_TRANSACTION_RAW); /// If you can not add a part to ZK, we'll remove it back from the working set.
@@ -1043,8 +1040,10 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
 
         /// Rename parts before committing to ZooKeeper without holding DataPartsLock.
         transaction.renameParts();
-        /// After the rename, which publishes the part's manifest: its Keeper record.
-        addCasPartRecordOps(zookeeper, casPartRecordsPath(storage.getZooKeeperPath()), *part, CasPartRecordCommit::Produced, ops);
+
+        /// After the rename, which publishes the part's manifest on a content-addressed disk, so the part's
+        /// Keeper record is created with its part znode. Nothing above reads `ops` positionally past here.
+        storage.getCommitPartOps(ops, part, block_id_pathes, /*copied_from_replica_path*/ std::nullopt);
 
         ThreadFuzzer::maybeInjectSleep();
 

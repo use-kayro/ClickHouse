@@ -1692,25 +1692,25 @@ MergeTreeData::MutableDataPartPtr Fetcher::attachPartFromKeeperRecord(
         return nullptr;
 
     String record;
-    const String records_path = casPartRecordsPath(data.getZooKeeperPath());
-    if (!data.getContext()->getDefaultOrAuxiliaryZooKeeper(data.getZooKeeperName())->tryGet(fs::path(records_path) / part_name, record))
+    const String record_path = casPartRecordPath(data.getZooKeeperPath(), part_name);
+    if (!data.getContext()->getDefaultOrAuxiliaryZooKeeper(data.getZooKeeperName())->tryGet(record_path, record))
         return nullptr;
 
     /// Staged under the tmp-fetch dir, exactly where the byte fetch and the relink put a part, so
     /// `renameTempPartAndReplace` re-keys it as it does any fetched part.
     const String part_dir = tmp_prefix + part_name;
     const String part_relative_path = data.getRelativeDataPath();
-    const DiskPtr held_on = holdPartFromCasRecord(candidates, data.getDisks(), fs::path(part_relative_path) / part_dir, record);
+    const DiskPtr held_on = holdPartFromCasRecord(candidates, fs::path(part_relative_path) / part_dir, record);
     if (!held_on)
     {
-        LOG_INFO(log, "Part {} has a Keeper record in {}, but it cannot be held from there; fetching it from the "
-            "replica instead", part_name, records_path);
+        LOG_INFO(log, "Part {} has a Keeper record at {}, but it cannot be held from there; fetching it from the "
+            "replica instead", part_name, record_path);
         return nullptr;
     }
 
     auto new_data_part = loadContentAddressedFetchedPart(part_name, held_on, part_relative_path, part_dir);
-    LOG_DEBUG(log, "Attached part {} onto disk {} from its Keeper record in {} ({} bytes; nothing fetched from the replica)",
-        part_name, held_on->getName(), records_path, record.size());
+    LOG_DEBUG(log, "Attached part {} onto disk {} from its Keeper record at {} ({} bytes; nothing fetched from the replica)",
+        part_name, held_on->getName(), record_path, record.size());
     return new_data_part;
 }
 

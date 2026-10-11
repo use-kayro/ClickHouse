@@ -413,7 +413,7 @@ bool MergeFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrite
 
     try
     {
-        storage.checkPartChecksumsAndCommit(*transaction_ptr, part);
+        storage.checkPartChecksumsAndCommit(*transaction_ptr, part, /*copied_from_replica_path*/ std::nullopt);
     }
     catch (const Exception & e)
     {

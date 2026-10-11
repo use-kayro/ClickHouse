@@ -281,7 +281,7 @@ bool MutateFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrit
     try
     {
         transaction_ptr->renameParts();
-        storage.checkPartChecksumsAndCommit(*transaction_ptr, new_part, hardlinked_files);
+        storage.checkPartChecksumsAndCommit(*transaction_ptr, new_part, /*copied_from_replica_path*/ std::nullopt, hardlinked_files);
     }
     catch (const Exception & e)
     {

@@ -6,6 +6,7 @@
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromString.h>
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Exception.h>
 #include <algorithm>
@@ -100,9 +101,7 @@ TEST(CASKeeperPart, MergeTreeFileHashIsTheBlobDigest)
         hashing.write(bytes.data(), bytes.size());
         hashing.finalize();
         const DB::MergeTreeDataPartChecksum checksum(hashing.count(), hashing.getHash());
-        const UInt128 from_checksum
-            = (static_cast<UInt128>(checksum.file_hash.high64) << 64) | static_cast<UInt128>(checksum.file_hash.low64);
-        EXPECT_EQ(from_checksum, contentHash(bytes)) << "size " << size;
+        EXPECT_EQ(DB::casBlobDigestOf(checksum), contentHash(bytes)) << "size " << size;
         EXPECT_EQ(checksum.file_size, size);
     }
 }

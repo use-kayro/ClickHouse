@@ -2449,7 +2449,7 @@ bool ContentAddressedMetadataStorage::holdKeeperPart(
         Cas::ManifestEntry e;
         e.path = f.path;
         e.placement = Cas::EntryPlacement::Inline;
-        e.ref = Cas::poolContentHash(Cas::BlobHashAlgo::CityHash128, f.bytes);
+        e.ref = Cas::poolContentHash(store()->writeAlgo(), f.bytes);
         e.inline_bytes = f.bytes;
         manifest->entries.push_back(std::move(e));
     }

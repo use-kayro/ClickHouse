@@ -32,6 +32,11 @@ class IMergeTreeDataPart;
 /// also what removes it at all; until then the nodes of merged-away parts accumulate).
 inline constexpr std::string_view CAS_PART_RECORDS_ZNODE = "cas_parts";
 String casPartRecordsPath(const String & zookeeper_path);
+String casPartRecordPath(const String & zookeeper_path, const String & part_name);
+
+struct MergeTreeDataPartChecksum;
+/// The `ch128` blob digest of a checksummed file: its MergeTree `file_hash`.
+UInt128 casBlobDigestOf(const MergeTreeDataPartChecksum & checksum);
 
 /// Resolve a disk to the content-addressed exchange facade, or nullptr if the disk is not CA. The cast
 /// targets the purpose-built INTERFACE, never the concrete metadata-storage class.
@@ -46,31 +51,26 @@ Disks casRecordDisks(const Disks & disks);
 /// that check; the part then replicates by the ordinary fetch.
 std::optional<String> makeCasPartRecord(const IMergeTreeDataPart & part);
 
-/// How the committing replica got the part. Only a replica that produced it (an insert, a local merge or
-/// mutation, a REPLACE clone) may create its record; a replica that fetched it only checks the record, so a
-/// fetch can never resurrect a record the pool's GC has removed (step 2). Parts that predate records get
-/// theirs from the boot backfill (`StorageReplicatedMergeTree::backfillCasPartRecords`).
-enum class CasPartRecordCommit : uint8_t
-{
-    Produced,
-    Fetched,
-};
-
-/// What a commit of `part` adds to `ops` for its Keeper record at `<records_path>/<part>`:
-///  - the part is held from its record, or the record exists: a check that the node exists (the reader's
-///    side of the serialization with the GC's removal of the record);
-///  - else, for a produced part only, the node is created when the part has a record (`makeCasPartRecord`).
-/// Records are immutable and are never removed in step 1. (Not a create-if-not-exists op: Keeper's
-/// `CREATE_IF_NOT_EXISTS` feature can be disabled.) Called after the part's disk transaction is committed,
-/// so its manifest is published.
+/// What a commit of `part` adds to `ops` for its Keeper record `<zookeeper_path>/cas_parts/<part>`.
+/// `copied_from_replica_path` is `nullopt` for the commit that PRODUCES the part (insert, merge, mutation,
+/// local REPLACE clone, ATTACH of a local detached part), else the replica the part was copied from.
+///  - Produced: the record is created when the part has one (`makeCasPartRecord`), as a create-if-absent
+///    (another replica that produced the same part wrote the same immutable bytes). Requires Keeper's
+///    `CREATE_IF_NOT_EXISTS` (`NOT_IMPLEMENTED` otherwise).
+///  - Copied: never created. The commit checks the record when the part was attached from it or the record
+///    exists; else -- the producer could not make one -- it checks that the source replica still lists the
+///    part. Either check fails once the pool's GC (step 2) removed the record, which it does only when no
+///    replica lists the part, so a copy can never resurrect a record or list a part whose blobs may be gone.
+/// Records are immutable and never removed in step 1. Called where the part znode is born, after the part's
+/// disk transaction is committed (so its manifest is published; an unpublished part gets no record).
 void addCasPartRecordOps(
-    const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & records_path, const IMergeTreeDataPart & part,
-    CasPartRecordCommit how, Coordination::Requests & ops);
+    const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & zookeeper_path, const IMergeTreeDataPart & part,
+    const std::optional<String> & copied_from_replica_path, Coordination::Requests & ops);
 
 /// Make the disk-relative part directory `part_path` hold the part `record` describes, on the disk of
 /// `candidates` whose pool the record names. Returns that disk, or nullptr -- changing nothing -- when no
-/// candidate is on the pool, the record is malformed (logged), another disk of `all_disks` has the part, or
-/// the chosen disk's ref table already holds it.
-DiskPtr holdPartFromCasRecord(const Disks & candidates, const Disks & all_disks, const String & part_path, std::string_view record);
+/// candidate is on the pool, the record is malformed (logged), or the chosen disk's ref table already holds
+/// the part.
+DiskPtr holdPartFromCasRecord(const Disks & candidates, const String & part_path, std::string_view record);
 
 }

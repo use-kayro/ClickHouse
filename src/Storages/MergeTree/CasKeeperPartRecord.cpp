@@ -22,6 +22,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -32,6 +33,16 @@ namespace FailPoints
 String casPartRecordsPath(const String & zookeeper_path)
 {
     return fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE;
+}
+
+String casPartRecordPath(const String & zookeeper_path, const String & part_name)
+{
+    return fs::path(casPartRecordsPath(zookeeper_path)) / part_name;
+}
+
+UInt128 casBlobDigestOf(const MergeTreeDataPartChecksum & checksum)
+{
+    return (static_cast<UInt128>(checksum.file_hash.high64) << 64) | static_cast<UInt128>(checksum.file_hash.low64);
 }
 
 IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk)
@@ -59,8 +70,7 @@ void appendChecksummedFiles(const String & prefix, const MergeTreeDataPartChecks
 {
     for (const auto & [name, checksum] : checksums.files)
         if (!name.ends_with(".proj"))
-            out.push_back({prefix + name, checksum.file_size,
-                (static_cast<UInt128>(checksum.file_hash.high64) << 64) | static_cast<UInt128>(checksum.file_hash.low64)});
+            out.push_back({prefix + name, checksum.file_size, casBlobDigestOf(checksum)});
 }
 
 }
@@ -82,28 +92,33 @@ std::optional<String> makeCasPartRecord(const IMergeTreeDataPart & part)
 }
 
 void addCasPartRecordOps(
-    const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & records_path, const IMergeTreeDataPart & part,
-    CasPartRecordCommit how, Coordination::Requests & ops)
+    const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & zookeeper_path, const IMergeTreeDataPart & part,
+    const std::optional<String> & copied_from_replica_path, Coordination::Requests & ops)
 {
-    const auto disk = part.storage.getStoragePolicy()->tryGetDiskByName(part.getDataPartStorage().getDiskName());
-    const auto * ca = tryGetContentAddressedExchange(disk);
-    if (!ca)
+    if (!part.getDataPartStorage().isContentAddressed())
         return;
-    const String path = fs::path(records_path) / part.name;
-    /// A part held from its record checks it. So does a part another replica already produced (a merge
-    /// every replica runs, a REPLACE a replica clones locally): the record exists, with the same content.
-    if (ca->isHeldFromKeeper(part.getDataPartStorage().getRelativePath()) || zookeeper->exists(path))
+    const String path = casPartRecordPath(zookeeper_path, part.name);
+    if (!copied_from_replica_path)
     {
-        ops.emplace_back(zkutil::makeCheckRequest(path, -1));
+        auto record = makeCasPartRecord(part);
+        if (!record)
+            return;
+        if (!zookeeper->isFeatureEnabled(KeeperFeatureFlag::CREATE_IF_NOT_EXISTS))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Keeper server doesn't have the feature flag CREATE_IF_NOT_EXISTS, required by the Keeper part records of "
+                "content-addressed parts");
+        ops.emplace_back(zkutil::makeCreateRequest(path, *record, zkutil::CreateMode::Persistent, /*ignore_if_exists*/ true));
         return;
     }
-    if (how != CasPartRecordCommit::Produced)
-        return;
-    if (auto record = makeCasPartRecord(part))
-        ops.emplace_back(zkutil::makeCreateRequest(path, *record, zkutil::CreateMode::Persistent));
+    const auto disk = part.storage.getStoragePolicy()->tryGetDiskByName(part.getDataPartStorage().getDiskName());
+    const auto * ca = tryGetContentAddressedExchange(disk);
+    if (ca && (ca->isHeldFromKeeper(part.getDataPartStorage().getRelativePath()) || zookeeper->exists(path)))
+        ops.emplace_back(zkutil::makeCheckRequest(path, -1));
+    else
+        ops.emplace_back(zkutil::makeCheckRequest(fs::path(*copied_from_replica_path) / "parts" / part.name, -1));
 }
 
-DiskPtr holdPartFromCasRecord(const Disks & candidates, const Disks & all_disks, const String & part_path, std::string_view record)
+DiskPtr holdPartFromCasRecord(const Disks & candidates, const String & part_path, std::string_view record)
 {
     for (const auto & disk : candidates)
     {
@@ -141,11 +156,6 @@ DiskPtr holdPartFromCasRecord(const Disks & candidates, const Disks & all_disks,
             LOG_WARNING(getLogger("CasKeeperPartRecord"), "Ignoring the Keeper record of {}: {}", part_path, e.message());
             return nullptr;
         }
-
-        /// A part another disk of the policy has (moved there by TTL or MOVE) stays there.
-        for (const auto & other : all_disks)
-            if (other != disk && other->existsDirectory(part_path))
-                return nullptr;
 
         return ca->holdKeeperPart(part_path, decoded.files, blobs) ? disk : nullptr;
     }
