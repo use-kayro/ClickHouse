@@ -681,14 +681,13 @@ private:
     /// Before `loadDataParts`: makes the content-addressed disks hold this replica's parts from their Keeper
     /// records (`<zookeeper_path>/cas_parts`, `CasKeeperPartRecord.h`), so a restart re-attaches them
     /// without listing the object store.
-    /// Returns the parts that have no record.
-    NameSet holdPartsFromCasRecords(const Strings & parts_on_replica);
+    void holdPartsFromCasRecords(const Strings & parts_on_replica);
 
-    /// After `loadDataParts`: creates the missing Keeper records of this replica's active parts on
-    /// content-addressed disks (parts committed before records existed), with the same bytes a commit
-    /// writes -- from the part views the load already read, so no object-store write or LIST. Idempotent:
-    /// a record another replica created meanwhile is left as it is.
-    void backfillCasPartRecords(const NameSet & parts_without_record);
+    /// In the attach thread, after `createNewZooKeeperNodes`: creates the missing Keeper records of this
+    /// replica's active parts on content-addressed disks (parts committed before records existed), with the
+    /// same bytes a commit writes -- from the part views the load already read, so no object-store write or
+    /// LIST. Idempotent: a record another replica created meanwhile is left as it is.
+    void backfillCasPartRecords();
 
     /// Adds actions to `ops` that remove a part from ZooKeeper.
     /// Set has_children to true for "old-style" parts (those with /columns and /checksums child znodes).

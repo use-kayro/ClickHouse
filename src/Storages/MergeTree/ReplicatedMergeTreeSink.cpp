@@ -1,6 +1,7 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSink.h>
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Storages/MergeTree/InsertBlockInfo.h>
 #include <Storages/MergeTree/MergeAlgorithm.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
@@ -1042,6 +1043,8 @@ std::vector<DeduplicationHash> ReplicatedMergeTreeSink::commitPart(
 
         /// Rename parts before committing to ZooKeeper without holding DataPartsLock.
         transaction.renameParts();
+        /// After the rename, which publishes the part's manifest: its Keeper record.
+        addCasPartRecordOps(zookeeper, casPartRecordsPath(storage.getZooKeeperPath()), *part, ops);
 
         ThreadFuzzer::maybeInjectSleep();
 

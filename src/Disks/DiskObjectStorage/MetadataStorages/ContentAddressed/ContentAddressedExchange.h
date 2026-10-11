@@ -143,8 +143,9 @@ struct CasKeeperInlineFile
     String bytes;
 };
 
-/// One blob-backed file of a part, as the reader derives it from the part's `checksums.txt`: the
-/// MergeTree per-file CityHash128 IS the `ch128` blob digest, so no blob key travels in the record.
+/// One file named by a part's `checksums.txt` (a projection file as `<proj>.proj/<file>`): its size and
+/// the MergeTree per-file CityHash128, which IS the `ch128` digest of the file's blob. No blob key
+/// travels in the record; the reader derives every checksummed file the record does not carry.
 struct CasKeeperBlobFile
 {
     String path;
@@ -259,14 +260,14 @@ public:
     /// inline `checksums.txt`. A replica that has the record materializes the part from it and the
     /// shared pool, with no request to the source replica and no write or LIST to the object store.
 
-    /// Writer: whether a part file of `size` bytes is one the record carries (the write path's own
-    /// placement rule, `Cas::partFileIsInline`).
-    virtual bool isKeeperRecordFile(std::string_view path, size_t size) const = 0;
-
-    /// Writer: encodes the record for a part whose record files are `files`. `nullopt` when the blobs of
-    /// this pool are not keyed by the MergeTree checksum (a write algorithm other than `ch128`): the record
-    /// could not be read back into blob keys, so the part travels by the ordinary fetch instead.
-    virtual std::optional<String> encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const = 0;
+    /// Writer: the record of the part at the disk-relative `part_path`, read from the part's published
+    /// manifest -- its Inline entries -- after checking that every other file is exactly what a reader will
+    /// derive: each file of `checksummed_files` that is not Inline must be a manifest Blob with
+    /// `ref == {ch128, hash}` and `size`, and the manifest has no Blob outside `checksummed_files`.
+    /// `nullopt` when the part has no published manifest here, or the check fails; the part then
+    /// replicates by the ordinary fetch.
+    virtual std::optional<String> encodeKeeperPartRecord(
+        const String & part_path, const std::vector<CasKeeperBlobFile> & checksummed_files) const = 0;
 
     /// Reader: decodes a record; throws `CORRUPTED_DATA` on a malformed one.
     virtual CasKeeperPartRecord decodeKeeperPartRecord(std::string_view record) const = 0;

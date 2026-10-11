@@ -629,7 +629,6 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     }
 
     std::optional<std::unordered_set<std::string>> expected_parts_on_this_replica;
-    NameSet parts_without_cas_record;
     bool skip_sanity_checks = false;
     /// It does not make sense for CREATE query
     if (LoadingStrictnessLevel::ATTACH <= mode)
@@ -672,7 +671,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
                     expected_parts_on_this_replica.emplace();
                     for (const auto & part : parts_on_replica)
                         expected_parts_on_this_replica->insert(part);
-                    parts_without_cas_record = holdPartsFromCasRecords(parts_on_replica);
+                    holdPartsFromCasRecords(parts_on_replica);
                 }
             }
         }
@@ -685,7 +684,6 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     }
 
     loadDataParts(skip_sanity_checks, expected_parts_on_this_replica);
-    backfillCasPartRecords(parts_without_cas_record);
     prewarmCaches(getActivePartsLoadingThreadPool().get(), getCachesToPrewarm(0));
 
     if (LoadingStrictnessLevel::ATTACH <= mode)
@@ -1081,9 +1079,8 @@ void StorageReplicatedMergeTree::createNewZooKeeperNodesAttempt() const
     }
 
     /// Keeper part records of content-addressed parts (`CasKeeperPartRecord.h`).
-    if (std::ranges::any_of(getDisks(), [](const DiskPtr & disk) { return tryGetContentAddressedExchange(disk) != nullptr; }))
-        futures.push_back(zookeeper->asyncTryCreateNoThrow(
-            fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE, String(), zkutil::CreateMode::Persistent));
+    if (!casRecordDisks(getDisks()).empty())
+        futures.push_back(zookeeper->asyncTryCreateNoThrow(casPartRecordsPath(zookeeper_path), String(), zkutil::CreateMode::Persistent));
 
     /// Part movement.
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/part_moves_shard", String(), zkutil::CreateMode::Persistent));
@@ -2438,7 +2435,7 @@ bool StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(
             ops.emplace_back(zkutil::makeCreateRequest(
                 fs::path(part_path) / "checksums", getChecksumsForZooKeeper(part->checksums), zkutil::CreateMode::Persistent));
         }
-        addCasPartRecordOps(getZooKeeper(), fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE, *part, ops);
+        addCasPartRecordOps(zookeeper, casPartRecordsPath(zookeeper_path), *part, ops);
     }
     else
     {
@@ -3567,6 +3564,9 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
             }
         }
         transaction.renameParts();
+        /// After the rename, which publishes the parts' manifests: their Keeper records.
+        for (const auto & part : res_parts)
+            addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part, ops);
 
 
         if (!ops.empty())
@@ -5029,55 +5029,63 @@ StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::c
 }
 
 
-NameSet StorageReplicatedMergeTree::holdPartsFromCasRecords(const Strings & parts_on_replica)
+void StorageReplicatedMergeTree::holdPartsFromCasRecords(const Strings & parts_on_replica)
 {
-    NameSet without_record;
-    Disks candidates;
-    for (const auto & disk : getDisks())
-        if (tryGetContentAddressedExchange(disk) && !disk->isReadOnly())
-            candidates.push_back(disk);
+    const Disks candidates = casRecordDisks(getDisks());
     if (candidates.empty() || parts_on_replica.empty())
-        return without_record;
+        return;
 
-    /// The records of this replica's parts, read in one batch. A part the disk already has in its ref table stays
-    /// there; the rest is attached from its record, so the `loadDataParts` that follows finds every part
-    /// without listing the object store.
+    /// The records of this replica's parts, read in one batch. A part the disk already has in its ref table,
+    /// or another disk of the policy has, stays there; the rest is attached from its record, so the
+    /// `loadDataParts` that follows finds every part without listing the object store.
+    const String records_path = casPartRecordsPath(zookeeper_path);
     Strings record_paths;
     record_paths.reserve(parts_on_replica.size());
     for (const auto & part : parts_on_replica)
-        record_paths.push_back(fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE / part);
+        record_paths.push_back(fs::path(records_path) / part);
     auto records = current_zookeeper->tryGet(record_paths);
 
+    const Disks all_disks = getDisks();
     size_t held = 0;
     for (size_t i = 0; i < parts_on_replica.size(); ++i)
-    {
-        if (records[i].error != Coordination::Error::ZOK)
-        {
-            without_record.insert(parts_on_replica[i]);
-            continue;
-        }
-        if (holdPartFromCasRecord(candidates, fs::path(getRelativeDataPath()) / parts_on_replica[i], records[i].data))
+        if (records[i].error == Coordination::Error::ZOK
+            && holdPartFromCasRecord(candidates, all_disks, fs::path(getRelativeDataPath()) / parts_on_replica[i], records[i].data))
             ++held;
-    }
     LOG_INFO(log, "Attached {} of {} parts of this replica from their Keeper records", held, parts_on_replica.size());
-    return without_record;
 }
 
-void StorageReplicatedMergeTree::backfillCasPartRecords(const NameSet & parts_without_record)
+void StorageReplicatedMergeTree::backfillCasPartRecords()
 {
-    if (parts_without_record.empty() || !current_zookeeper)
+    if (casRecordDisks(getDisks()).empty())
         return;
-    const fs::path records_path = fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE;
+    DataPartsVector parts;
+    for (const auto & part : getDataPartsVectorForInternalUsage({MergeTreeDataPartState::Active}))
+        if (tryGetContentAddressedExchange(getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName())))
+            parts.push_back(part);
+    if (parts.empty())
+        return;
+
+    /// One batched lookup; the missing records get the bytes a commit would have written, built from the
+    /// part views the load already read (no object-store write or LIST). Idempotent: a record another
+    /// replica created meanwhile is left as it is.
+    auto zookeeper = getZooKeeper();
+    const String records_path = casPartRecordsPath(zookeeper_path);
+    Strings paths;
+    paths.reserve(parts.size());
+    for (const auto & part : parts)
+        paths.push_back(fs::path(records_path) / part->name);
+    auto existing = zookeeper->exists(paths);
+
     Strings names;
     std::vector<zkutil::ZooKeeper::FutureCreate> futures;
-    for (const auto & part : getDataPartsVectorForInternalUsage({MergeTreeDataPartState::Active}))
+    for (size_t i = 0; i < parts.size(); ++i)
     {
-        if (!parts_without_record.contains(part->name))
+        if (existing[i].error == Coordination::Error::ZOK)
             continue;
-        if (auto record = makeCasPartRecord(*part))
+        if (auto record = makeCasPartRecord(*parts[i]))
         {
-            names.push_back(part->name);
-            futures.push_back(current_zookeeper->asyncTryCreateNoThrow(records_path / part->name, *record, zkutil::CreateMode::Persistent));
+            names.push_back(parts[i]->name);
+            futures.push_back(zookeeper->asyncTryCreateNoThrow(paths[i], *record, zkutil::CreateMode::Persistent));
         }
     }
     size_t created = 0;
@@ -9998,6 +10006,9 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
                     renameTempPartAndReplaceUnlocked(part, transaction, data_parts_lock, /*rename_in_transaction=*/ true);
             }
             transaction.renameParts();
+            /// After the rename, which publishes the parts' manifests: their Keeper records.
+            for (const auto & part : dst_parts)
+                addCasPartRecordOps(std::make_shared<ZooKeeperWithFaultInjection>(zookeeper), casPartRecordsPath(zookeeper_path), *part, ops);
 
             for (const auto & dst_part : dst_parts)
                 lockSharedData(*dst_part, false, /*hardlinked_files*/ {});
@@ -10621,7 +10632,6 @@ void StorageReplicatedMergeTree::getCommitPartOps(
             getChecksumsForZooKeeper(part->checksums),
             zkutil::CreateMode::Persistent));
     }
-    addCasPartRecordOps(getZooKeeper(), fs::path(zookeeper_path) / CAS_PART_RECORDS_ZNODE, *part, ops);
 }
 
 ReplicatedMergeTreeAddress StorageReplicatedMergeTree::getReplicatedMergeTreeAddress() const

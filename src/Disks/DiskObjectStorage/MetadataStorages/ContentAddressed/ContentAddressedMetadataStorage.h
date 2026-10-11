@@ -379,8 +379,8 @@ public:
         std::unique_ptr<ICaPreparedRelink> & out) override;
 
     /// Keeper part record (`cas_part_files`): see `IContentAddressedExchange`.
-    bool isKeeperRecordFile(std::string_view path, size_t size) const override;
-    std::optional<String> encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const override;
+    std::optional<String> encodeKeeperPartRecord(
+        const String & part_path, const std::vector<CasKeeperBlobFile> & checksummed_files) const override;
     CasKeeperPartRecord decodeKeeperPartRecord(std::string_view record) const override;
     bool holdKeeperPart(const String & part_path,
                         const std::vector<CasKeeperInlineFile> & inline_files,

@@ -232,20 +232,56 @@ TEST(CASKeeperPart, RefTablePartIsNeverShadowed)
     EXPECT_FALSE(storage->existsDirectory(part));
 }
 
-TEST(CASKeeperPart, RecordFilesFollowThePlacementRule)
+/// The record is the part's manifest, not a re-application of the placement rule: a part whose manifest
+/// carries `statistics.packed` inline (an older part, a hardlink clone of one) gets a record WITH it, and a
+/// manifest whose blob is not what the checksums name gets no record at all.
+TEST(CASKeeperPart, RecordIsTheManifestInlineEntries)
 {
     auto storage = openStorage();
-    EXPECT_TRUE(storage->isKeeperRecordFile("checksums.txt", 4096));
-    EXPECT_TRUE(storage->isKeeperRecordFile("p.proj/columns.txt", 100));
-    EXPECT_FALSE(storage->isKeeperRecordFile("data.bin", 10));
-    EXPECT_FALSE(storage->isKeeperRecordFile("statistics.packed", 10));
-    EXPECT_FALSE(storage->isKeeperRecordFile("primary.cidx", 2 * 1024 * 1024));   /// above INLINE_CAP: a blob
+    const String source_part = String(SOURCE_TABLE) + "/all_4_4_0";
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, source_part + "/data.bin", "content-C");
+        writeThroughTransaction(*tx, source_part + "/count.txt", "7");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    const auto ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
+    auto entries = storage->partAccess()->getView({ns, "all_4_4_0"}, DB::Cas::Freshness::ForceFresh)->manifest()->entries;
 
-    const auto record = storage->encodeKeeperPartRecord({{"checksums.txt", "x"}, {"count.txt", "3"}});
+    /// A manifest as an older build wrote it: `statistics.packed` Inline.
+    DB::Cas::ManifestEntry stats;
+    stats.path = "statistics.packed";
+    stats.placement = DB::Cas::EntryPlacement::Inline;
+    stats.inline_bytes = "stats-bytes";
+    entries.push_back(stats);
+    std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) { return a.path < b.path; });
+    storage->partAccess()->publishEntries({ns, "all_5_5_0"}, entries, DB::Cas::ProvenanceOp::Other);
+    const String legacy_part = String(SOURCE_TABLE) + "/all_5_5_0";
+
+    const std::vector<DB::CasKeeperBlobFile> checksummed{
+        {"count.txt", 1, contentHash("7")},
+        {"data.bin", 9, contentHash("content-C")},
+        {"statistics.packed", 11, contentHash("stats-bytes")}};
+    const auto record = storage->encodeKeeperPartRecord(legacy_part, checksummed);
     ASSERT_TRUE(record.has_value());
     const auto decoded = storage->decodeKeeperPartRecord(*record);
     EXPECT_EQ(decoded.pool_uuid, storage->getPoolUUID());
-    ASSERT_EQ(decoded.files.size(), 2u);
-    EXPECT_EQ(decoded.files[0].path, "checksums.txt");
-    EXPECT_EQ(decoded.files[1].bytes, "3");
+    std::vector<String> paths;
+    for (const auto & f : decoded.files)
+        paths.push_back(f.path);
+    EXPECT_EQ(paths, (std::vector<String>{"count.txt", "statistics.packed"}));
+    EXPECT_EQ(decoded.files[1].bytes, "stats-bytes");
+
+    /// A blob the checksums name differently, a checksummed file the manifest lacks, and a manifest blob
+    /// the checksums do not name: no record (the part replicates by the ordinary fetch).
+    auto wrong_hash = checksummed;
+    wrong_hash[1].hash = contentHash("other");
+    EXPECT_FALSE(storage->encodeKeeperPartRecord(legacy_part, wrong_hash).has_value());
+    auto extra = checksummed;
+    extra.push_back({"missing.bin", 3, contentHash("abc")});
+    EXPECT_FALSE(storage->encodeKeeperPartRecord(legacy_part, extra).has_value());
+    EXPECT_FALSE(storage->encodeKeeperPartRecord(legacy_part, {{"count.txt", 1, contentHash("7")}}).has_value());
+
+    /// No published manifest: no record.
+    EXPECT_FALSE(storage->encodeKeeperPartRecord(String(SOURCE_TABLE) + "/all_9_9_0", checksummed).has_value());
 }

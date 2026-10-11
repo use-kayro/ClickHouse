@@ -80,19 +80,6 @@ bool partFileMustStayBlob(std::string_view file_name)
     return false;
 }
 
-namespace
-{
-/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
-/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
-/// large eager file.
-constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
-}
-
-bool partFileIsInline(std::string_view file_name, size_t size)
-{
-    return !partFileMustStayBlob(file_name) && size <= INLINE_CAP;
-}
-
 }
 
 namespace DB
@@ -113,6 +100,10 @@ namespace
         "content-addressed write path.", op);
 }
 
+/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
+/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
+/// large eager file.
+constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
 
 }
 
@@ -976,7 +967,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// under EVERY algo, including sha256.
             const auto hash_algo = metadata_storage.store()->writeAlgo();
             const Cas::BlobRef ref = Cas::poolContentHash(hash_algo, bytes);
-            if (Cas::partFileIsInline(route.file, bytes.size()))
+            if (bytes.size() <= INLINE_CAP)
             {
                 auto & st = stagingFor(route);
                 /// An inline (no-blob) entry still requires a PartWriteTxn. `publishStaging` stages the

@@ -241,10 +241,6 @@ namespace DB::Cas
 /// `primary.idx`, which can be large (a size-threshold inlining of small primary.idx is a follow-up).
 /// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
 bool partFileMustStayBlob(std::string_view file_name);
-/// Whether a part file of `size` bytes is an Inline manifest entry: an inline candidate that fits
-/// INLINE_CAP. Every other part file is a content-addressed blob. The one placement rule, shared by the
-/// write path and by the Keeper part record (`cas_part_files`), which carries exactly these files.
-bool partFileIsInline(std::string_view file_name, size_t size);
 
 /// Test-only fault-injection seams for the intra-part blob-upload fan-out. Inert in production
 /// (`ContentAddressedTransaction::uploadPendingBlobs` passes `nullptr`).

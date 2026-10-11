@@ -132,10 +132,13 @@ struct PartFiles
 {
     UInt128 pool_id{};
     std::vector<ManifestEntry> entries;   /// Inline only
-    bool operator==(const PartFiles &) const = default;
 };
 String encodePartFiles(const PartFiles & part_files);
 PartFiles decodePartFiles(std::string_view data);
+
+/// Canonical path order with duplicate-path rejection (`CORRUPTED_DATA`, naming `what`): the order every
+/// entry-record codec writes and every part view relies on. The pointers alias `entries`.
+std::vector<const ManifestEntry *> sortedUniqueEntries(const std::vector<ManifestEntry> & entries, std::string_view what);
 
 /// Pure ordered-entry lookup primitives over a decoded manifest. `decodePartManifest` guarantees
 /// strict ascending order by `path`; `PartFolderView` composes these lookups with wiring policy.

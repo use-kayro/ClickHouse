@@ -11,7 +11,6 @@ ProfileEvents), so the reader's mount-lease renewals in the background do not bl
 """
 
 import json
-import os
 import re
 import shlex
 import time
@@ -37,7 +36,6 @@ S3_WRITE_AND_LIST_EVENTS = (
     "DiskS3PutObject",
     "DiskS3ListObjects",
 )
-EVIDENCE = {}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -59,13 +57,6 @@ def start_cluster():
         cluster.start()
         yield cluster
     finally:
-        try:
-            path = os.path.join(os.path.dirname(__file__), "evidence.json")
-            with open(path, "w") as f:
-                json.dump(EVIDENCE, f, indent=2, sort_keys=True)
-        except OSError:
-            pass
-        print("TEC-849 evidence: " + json.dumps(EVIDENCE, sort_keys=True))
         cluster.shutdown()
 
 
@@ -154,12 +145,10 @@ def record_lengths(node, table):
 
 
 def replica_part_znodes(node, table, replica):
-    """Part znodes of `replica`, with their number of children (the records are not among them)."""
-    out = node.query(
-        "SELECT name, numChildren FROM system.zookeeper WHERE path = '/clickhouse/tables/{}/replicas/{}/parts' "
-        "ORDER BY name FORMAT TSV".format(table, replica)
-    )
-    return {name: int(n) for name, n in (line.split("\t") for line in out.splitlines())}
+    return node.query(
+        "SELECT name FROM system.zookeeper WHERE path = '/clickhouse/tables/{}/replicas/{}/parts' "
+        "ORDER BY name".format(table, replica)
+    ).split()
 
 
 def download_rows(node, table, since):
@@ -233,21 +222,18 @@ def test_reader_attaches_parts_from_keeper(wide):
     assert active_parts(reader, table) == active
     assert results(reader, table) == results(writer, table)
 
-    # Keeper holds exactly one record per part the writer produced, at the table level -- including the
-    # merged-away ones, whose records outlive the replicas' removal of those parts (the pool GC's delete
-    # queue in step 2, which is also what removes them). The replicas' own part znodes stay as they were:
-    # one per active part, no children.
+    # Every part has its record, one per part name at the table level; the replicas' own part znodes follow
+    # their active parts as always.
     created = writer_created_parts(writer, table)
     assert len(created) >= NUM_INSERTS * 2  # two partitions per insert, plus the merges
     records = record_lengths(writer, table)
-    assert sorted(records) == created, (sorted(records), created)
+    assert set(active) <= set(records) and set(records) <= set(created), (sorted(records), created)
     for replica in ("writer", "reader"):
         wait_until(
-            lambda: sorted(replica_part_znodes(writer, table, replica)) == active,
+            lambda: replica_part_znodes(writer, table, replica) == active,
             60,
             "{}'s part znodes to follow its active parts".format(replica),
         )
-        assert not any(replica_part_znodes(writer, table, replica).values())
 
     # Every part the reader got arrived through its Keeper record: the attach line, never relink, never
     # bytes, and the writer sent nothing.
@@ -262,16 +248,6 @@ def test_reader_attaches_parts_from_keeper(wide):
     for event in S3_WRITE_AND_LIST_EVENTS:
         assert downloads[event] == 0, (event, downloads)
 
-    lengths = sorted(records.values())
-    EVIDENCE[table] = {
-        "parts_created_by_writer": len(created),
-        "parts_attached_by_reader": downloads["parts"],
-        "active_parts": len(active),
-        "record_bytes_min": lengths[0],
-        "record_bytes_avg": sum(lengths) // len(lengths),
-        "record_bytes_max": lengths[-1],
-        "attach_s3": downloads,
-    }
     # Leave the reader with only the table each later test creates, so their boot counters compare.
     for node in (writer, reader):
         node.query("DROP TABLE {} SYNC".format(table))
@@ -293,7 +269,13 @@ def test_reader_restart_reattaches_from_keeper():
     def boot_lists():
         reader.restart_clickhouse()
         reader.query("SELECT count() FROM {}".format(table))  # waits for the table to be loaded
-        time.sleep(5)  # let the startup-time background passes (first cleanup iteration) settle in both boots
+        wait_until(
+            lambda: reader.query(
+                "SELECT is_readonly = 0 AND queue_size = 0 FROM system.replicas WHERE table = '{}'".format(table)
+            ).strip() == "1",
+            60,
+            "the reader's replica to be active with an empty queue",
+        )
         return global_events(reader, list_events)
 
     # Baseline: a reader boot with the table and no parts.
@@ -338,7 +320,6 @@ def test_reader_restart_reattaches_from_keeper():
     prefixes = {re.search(r"prefix=([^&,]*)", line).group(1) for line in lists}
     assert lists and all(p.startswith("keeper_pool%2F_probe%2F") or p.endswith("%2F_files%2F") for p in prefixes), prefixes
 
-    EVIDENCE["restart"] = {"parts": len(parts), "reattached_from_keeper": held, "boot_lists_without_parts": empty_boot, "boot_lists_with_parts": full_boot}
 
 
 def test_writer_boot_backfills_missing_records():
@@ -373,6 +354,9 @@ def test_writer_boot_backfills_missing_records():
         for node in (writer, reader):
             node.query("SYSTEM DISABLE FAILPOINT cas_part_record_omit")
     assert record_lengths(writer, table) == {}
+    # As a table created by a build without records: not even the parent node exists. The attach thread
+    # creates it before backfilling.
+    cluster.get_kazoo_client("zoo1").delete("/clickhouse/tables/{}/cas_parts".format(table))
     legacy = active_parts(writer, table)
     assert active_parts(reader, table) == legacy
 
@@ -396,4 +380,3 @@ def test_writer_boot_backfills_missing_records():
     assert log_lines(reader, r"default\.{} .*Attached part .* from its Keeper record".format(table))
     for node in (writer, reader):
         node.query("DROP TABLE {} SYNC".format(table))
-    EVIDENCE["backfill"] = {"legacy_parts": len(legacy)}

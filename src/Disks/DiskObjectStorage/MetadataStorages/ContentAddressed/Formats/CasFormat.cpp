@@ -126,8 +126,8 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
     {FormatId::GcMaintenanceState, "cas_gc_maintenance_state", TextFamily::Control, KeyStrictness::Strict, CompressionPolicy::Never, 512 * kKiB, 512 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
-    /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`), and the same caps as
-    /// the manifest whose Inline entries it carries.
+    /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`). The caps only bound
+    /// decoding (the manifest's); what bounds a record in practice is Keeper's request size.
     {FormatId::PartFiles,    "cas_part_files",    TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},

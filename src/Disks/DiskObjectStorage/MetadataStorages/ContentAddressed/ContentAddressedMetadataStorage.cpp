@@ -34,6 +34,7 @@
 #include <chrono>
 #include <filesystem>
 #include <ctime>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -1487,8 +1488,6 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
     for (const auto & [ref, _] : store()->listRefs(ns))
         if (ref.starts_with(Cas::kMovingRefPrefix))
             refs.push_back(ref);
-    for (auto & ref : partAccess()->keeperRefs(ns, Cas::kMovingRefPrefix))
-        refs.push_back(std::move(ref));
     return refs;
 }
 
@@ -1706,8 +1705,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                 || !partAccess()->keeperRefs(dr.r->ns, Cas::kDetachedRefPrefix).empty();
         case DirShape::MovingContainer:
             /// Exists iff it has at least one staging ref (MOVE-to-CA fix, mirrors DetachedContainer).
-            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kMovingRefPrefix)
-                || !partAccess()->keeperRefs(dr.r->ns, Cas::kMovingRefPrefix).empty();
+            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kMovingRefPrefix);
         case DirShape::PartDir:
             /// Exists iff its ref is present.
             return partAccess()->existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);
@@ -2374,29 +2372,41 @@ private:
 
 /// ==== Keeper part record (`cas_part_files`) ====
 
-bool ContentAddressedMetadataStorage::isKeeperRecordFile(std::string_view path, size_t size) const
+std::optional<String> ContentAddressedMetadataStorage::encodeKeeperPartRecord(
+    const String & part_path, const std::vector<CasKeeperBlobFile> & checksummed_files) const
 {
-    return Cas::partFileIsInline(path, size);
-}
-
-std::optional<String> ContentAddressedMetadataStorage::encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const
-{
-    const auto pool = store();
-    /// The reader turns every `checksums.txt` entry the record does not carry into a blob keyed by the
-    /// MergeTree checksum, which is the `ch128` digest and no other algorithm's.
-    if (pool->writeAlgo() != Cas::BlobHashAlgo::CityHash128)
+    auto p = Cas::parsePartFilePath(part_path);
+    auto r = p ? route(*p) : std::nullopt;
+    if (!r || r->ref.empty() || !r->file.empty())
         return std::nullopt;
+    const auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    if (!view)
+        return std::nullopt;
+
+    std::unordered_map<std::string_view, const CasKeeperBlobFile *> checksummed;
+    for (const auto & f : checksummed_files)
+        checksummed.emplace(f.path, &f);
+
+    /// The record is the manifest's Inline entries; every Blob must be what the reader derives.
     Cas::PartFiles part_files;
-    part_files.pool_id = pool->poolMeta().pool_id;
-    part_files.entries.reserve(files.size());
-    for (const auto & f : files)
+    part_files.pool_id = store()->poolMeta().pool_id;
+    size_t covered = 0;
+    for (const auto & e : view->manifest()->entries)
     {
-        Cas::ManifestEntry e;
-        e.path = f.path;
-        e.placement = Cas::EntryPlacement::Inline;
-        e.inline_bytes = f.bytes;
-        part_files.entries.push_back(std::move(e));
+        const auto it = checksummed.find(e.path);
+        if (e.placement == Cas::EntryPlacement::Inline)
+        {
+            part_files.entries.push_back(e);
+            covered += it != checksummed.end();
+            continue;
+        }
+        if (it == checksummed.end() || e.blob_size != it->second->size
+            || !(e.ref == Cas::BlobRef{Cas::BlobHashAlgo::CityHash128, Cas::BlobDigest::fromU128(it->second->hash)}))
+            return std::nullopt;
+        ++covered;
     }
+    if (covered != checksummed.size())
+        return std::nullopt;   /// a checksummed file the manifest does not have
     return Cas::encodePartFiles(part_files);
 }
 
@@ -2452,12 +2462,11 @@ bool ContentAddressedMetadataStorage::holdKeeperPart(
         e.blob_size = f.size;
         manifest->entries.push_back(std::move(e));
     }
-    std::sort(manifest->entries.begin(), manifest->entries.end(),
-              [](const Cas::ManifestEntry & a, const Cas::ManifestEntry & b) { return a.path < b.path; });
-    for (size_t i = 1; i < manifest->entries.size(); ++i)
-        if (manifest->entries[i].path == manifest->entries[i - 1].path)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "Keeper part record for '{}' names file '{}' twice", part_path, manifest->entries[i].path);
+    std::vector<Cas::ManifestEntry> sorted;
+    sorted.reserve(manifest->entries.size());
+    for (const auto * e : Cas::sortedUniqueEntries(manifest->entries, "Keeper part record"))
+        sorted.push_back(*e);
+    manifest->entries = std::move(sorted);
 
     partAccess()->holdKeeperPart(r->refKey(), std::move(manifest));
     return true;

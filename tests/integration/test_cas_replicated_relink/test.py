@@ -85,8 +85,9 @@ def start_cluster():
     try:
         cluster.start()
         # Parts committed with a Keeper record (`cas_part_files`, TEC-849) are attached from it and never
-        # reach relink. This module tests relink itself, which still serves parts committed without a
-        # record, so both replicas commit the way a build without records did.
+        # reach relink. This module tests relink itself, which serves every part without a record (another
+        # pool or hash algorithm, a file outside checksums.txt, a fetch into detached/ or from another
+        # table), so both replicas commit without records.
         for name in ("node1", "node2"):
             cluster.instances[name].query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
         yield cluster

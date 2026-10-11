@@ -81,21 +81,6 @@ String bannerFor(std::string_view path, uint64_t n)
     return std::move(w).take();
 }
 
-/// Canonical path order plus duplicate-path rejection, shared by every codec that writes entry records.
-std::vector<const ManifestEntry *> sortedUniqueEntries(const std::vector<ManifestEntry> & entries, std::string_view what)
-{
-    std::vector<const ManifestEntry *> sorted;
-    sorted.reserve(entries.size());
-    for (const auto & e : entries)
-        sorted.push_back(&e);
-    std::sort(sorted.begin(), sorted.end(),
-              [](const ManifestEntry * a, const ManifestEntry * b) { return a->path < b->path; });
-    for (size_t i = 1; i < sorted.size(); ++i)
-        if (sorted[i]->path == sorted[i - 1]->path)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: duplicate path '{}'", what, sorted[i]->path);
-    return sorted;
-}
-
 /// Entry records, trailer, then the payload zone: one banner + raw bytes + '\n' per Inline entry, in
 /// path order. Blob entries carry no payload-zone bytes (their bytes live in a separately addressed
 /// CAS blob).
@@ -247,6 +232,20 @@ std::vector<ManifestEntry> readEntriesAndPayload(ReadBuffer & in, uint64_t line_
     return entries;
 }
 
+}
+
+std::vector<const ManifestEntry *> sortedUniqueEntries(const std::vector<ManifestEntry> & entries, std::string_view what)
+{
+    std::vector<const ManifestEntry *> sorted;
+    sorted.reserve(entries.size());
+    for (const auto & e : entries)
+        sorted.push_back(&e);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ManifestEntry * a, const ManifestEntry * b) { return a->path < b->path; });
+    for (size_t i = 1; i < sorted.size(); ++i)
+        if (sorted[i]->path == sorted[i - 1]->path)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: duplicate path '{}'", what, sorted[i]->path);
+    return sorted;
 }
 
 std::string_view entryPlacementToWireWord(EntryPlacement placement)

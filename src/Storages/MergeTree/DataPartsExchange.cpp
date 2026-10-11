@@ -683,10 +683,16 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// Validation of the input that may come from malicious replica.
     auto part_info = MergeTreePartInfo::fromPartName(part_name, data.format_version);
 
-    /// A part whose metadata the source replica keeps in Keeper is attached from that record and the
-    /// shared pool: nothing is asked of the source and nothing is written to the object store.
-    if (auto from_keeper = attachPartFromKeeperRecord(part_name, zookeeper_name, replica_path, tmp_prefix, to_detached, disk))
-        return std::make_pair(std::move(from_keeper), std::move(temporary_directory_lock));
+    /// A part of this table whose metadata is in Keeper is attached from its record and the shared pool:
+    /// nothing is asked of the source and nothing is written to the object store. Only into the active
+    /// set and only from this table's own replicas: the commit checks `<own zookeeper_path>/cas_parts/<part>`,
+    /// which a fetch into `detached/` (re-keyed by ATTACH) or from another table does not name.
+    if (!to_detached && zookeeper_name == data.getZooKeeperName()
+        && fs::path(replica_path).parent_path().parent_path() == fs::path(data.getZooKeeperPath()))
+    {
+        if (auto from_keeper = attachPartFromKeeperRecord(part_name, tmp_prefix, disk))
+            return std::make_pair(std::move(from_keeper), std::move(temporary_directory_lock));
+    }
 
     String endpoint_id = getEndpointId(
             (*data_settings)[MergeTreeSetting::enable_the_endpoint_id_with_zookeeper_name_prefix] ?
@@ -1679,47 +1685,32 @@ MergeTreeData::MutableDataPartPtr Fetcher::loadContentAddressedFetchedPart(
 }
 
 MergeTreeData::MutableDataPartPtr Fetcher::attachPartFromKeeperRecord(
-    const String & part_name,
-    const String & zookeeper_name,
-    const String & replica_path,
-    const String & tmp_prefix,
-    bool to_detached,
-    DiskPtr disk)
+    const String & part_name, const String & tmp_prefix, DiskPtr disk)
 {
-    Disks candidates;
-    if (disk)
-        candidates.push_back(disk);
-    else
-        for (const auto & data_disk : data.getDisks())
-            if (tryGetContentAddressedExchange(data_disk) && !data_disk->isReadOnly())
-                candidates.push_back(data_disk);
+    const Disks candidates = disk ? Disks{disk} : casRecordDisks(data.getDisks());
     if (candidates.empty())
         return nullptr;
 
     String record;
-    const auto zookeeper = data.getContext()->getDefaultOrAuxiliaryZooKeeper(zookeeper_name);
-    /// The record is the table's single copy: `<zookeeper_path>/cas_parts/<part>`, beside `<zookeeper_path>/replicas/<r>`.
-    const fs::path records_path = fs::path(replica_path).parent_path().parent_path() / CAS_PART_RECORDS_ZNODE;
-    if (!zookeeper->tryGet(records_path / part_name, record))
+    const String records_path = casPartRecordsPath(data.getZooKeeperPath());
+    if (!data.getZooKeeper()->tryGet(fs::path(records_path) / part_name, record))
         return nullptr;
 
-    /// Staged under the tmp-fetch dir of the target parent, exactly where the byte fetch and the relink put
-    /// a part, so the caller's finalization (`renameTempPartAndReplace` / `renameTo(detached/<part>)`)
-    /// re-keys it as it does any fetched part.
+    /// Staged under the tmp-fetch dir, exactly where the byte fetch and the relink put a part, so
+    /// `renameTempPartAndReplace` re-keys it as it does any fetched part.
     const String part_dir = tmp_prefix + part_name;
-    const String part_relative_path
-        = data.getRelativeDataPath() + String(to_detached ? MergeTreeData::DETACHED_DIR_NAME : "");
-    const DiskPtr held_on = holdPartFromCasRecord(candidates, fs::path(part_relative_path) / part_dir, record);
+    const String part_relative_path = data.getRelativeDataPath();
+    const DiskPtr held_on = holdPartFromCasRecord(candidates, data.getDisks(), fs::path(part_relative_path) / part_dir, record);
     if (!held_on)
     {
-        LOG_INFO(log, "Part {} has a Keeper record in {}, but no disk of this table's storage policy holds it from "
-            "there; fetching it from the replica instead", part_name, records_path.string());
+        LOG_INFO(log, "Part {} has a Keeper record in {}, but it cannot be held from there; fetching it from the "
+            "replica instead", part_name, records_path);
         return nullptr;
     }
 
     auto new_data_part = loadContentAddressedFetchedPart(part_name, held_on, part_relative_path, part_dir);
     LOG_DEBUG(log, "Attached part {} onto disk {} from its Keeper record in {} ({} bytes; nothing fetched from the replica)",
-        part_name, held_on->getName(), records_path.string(), record.size());
+        part_name, held_on->getName(), records_path, record.size());
     return new_data_part;
 }
 

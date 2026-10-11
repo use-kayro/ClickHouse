@@ -190,18 +190,12 @@ private:
         const ConnectionTimeouts & timeouts,
         const ReadSettings & read_settings);
 
-    /// CAS replication from Keeper: when the part has a Keeper record in the source table's
+    /// CAS replication from Keeper: when the part has a Keeper record in this table's
     /// `<zookeeper_path>/cas_parts` (see `CasKeeperPartRecord.h`), make a disk of this table's policy hold the
     /// part from that record and the shared pool, staged under the tmp-fetch dir exactly like the other
-    /// fetch paths. `nullptr` when the part has no record or no candidate disk is on its pool; the caller
-    /// then fetches the part from the replica as before.
-    MergeTreeData::MutableDataPartPtr attachPartFromKeeperRecord(
-        const String & part_name,
-        const String & zookeeper_name,
-        const String & replica_path,
-        const String & tmp_prefix,
-        bool to_detached,
-        DiskPtr disk);
+    /// fetch paths. `nullptr` when the part has no record or it cannot be held; the caller then fetches the
+    /// part from the replica as before.
+    MergeTreeData::MutableDataPartPtr attachPartFromKeeperRecord(const String & part_name, const String & tmp_prefix, DiskPtr disk);
 
     /// The temporary part a fetch returns, loaded from what the content-addressed `disk` holds at
     /// `part_relative_path/part_dir` (after a relink or a Keeper attach).
