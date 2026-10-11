@@ -68,10 +68,29 @@ bool partFileMustStayBlob(std::string_view file_name)
 {
     if (file_name == "primary.idx")
         return true;
+    /// Column statistics (`statistics.packed`, and the older per-column `statistics_<col>.stats`) are the
+    /// one small-file class that grows large: inline they would dominate the part record a replica reads
+    /// from Keeper (`cas_part_files`), so they are content-addressed like column data.
+    const size_t slash = file_name.rfind('/');
+    if (file_name.substr(slash == std::string_view::npos ? 0 : slash + 1).starts_with("statistics"))
+        return true;
     for (std::string_view suffix : {".bin", ".mrk", ".mrk2", ".mrk3", ".cmrk", ".cmrk2", ".cmrk3"})
         if (hasSuffix(file_name, suffix))
             return true;
     return false;
+}
+
+namespace
+{
+/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
+/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
+/// large eager file.
+constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
+}
+
+bool partFileIsInline(std::string_view file_name, size_t size)
+{
+    return !partFileMustStayBlob(file_name) && size <= INLINE_CAP;
 }
 
 }
@@ -94,10 +113,6 @@ namespace
         "content-addressed write path.", op);
 }
 
-/// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
-/// knob (could become a disk setting later). Keeps the tree object bounded against an unexpectedly
-/// large eager file.
-constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
 
 }
 
@@ -364,6 +379,12 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     {
         if (auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh))
         {
+            /// Refused before anything is staged: a part held from its Keeper record has no ref in the
+            /// pool to repoint, and nothing would persist the change.
+            if (metadata_storage.partAccess()->isKeeperPart({ns, ref}))
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot rewrite files of part {}/{}: its metadata is held from Keeper, and a changed "
+                    "Keeper-held part has nowhere to persist", ns.string(), ref);
             if (st.build)
             {
                 /// EDGE-BEFORE-OBSERVE is still load-
@@ -955,7 +976,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// under EVERY algo, including sha256.
             const auto hash_algo = metadata_storage.store()->writeAlgo();
             const Cas::BlobRef ref = Cas::poolContentHash(hash_algo, bytes);
-            if (bytes.size() <= INLINE_CAP)
+            if (Cas::partFileIsInline(route.file, bytes.size()))
             {
                 auto & st = stagingFor(route);
                 /// An inline (no-blob) entry still requires a PartWriteTxn. `publishStaging` stages the
@@ -1284,6 +1305,8 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             try
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
+                    metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
+                for (const auto & ref : metadata_storage.partAccess()->keeperRefs(from_ns, ""))
                     metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
                 /// Asymmetric by necessity: the SOURCE is read, so it resolves readably and contributes
                 /// nothing when it has no life; the DESTINATION is written, so it resolves the minting way

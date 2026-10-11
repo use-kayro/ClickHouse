@@ -241,7 +241,8 @@ static struct InitFiu
     REGULAR(cas_relink_receiver_force_mechanism_failure) \
     PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm) \
     REGULAR(cas_relink_sender_omit_pool_cookie) \
-    REGULAR(cas_relink_receiver_drop_forced_disk)
+    REGULAR(cas_relink_receiver_drop_forced_disk) \
+    REGULAR(cas_part_record_omit)
 
 namespace FailPoints
 {

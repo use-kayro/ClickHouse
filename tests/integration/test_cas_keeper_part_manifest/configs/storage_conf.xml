@@ -1,0 +1,31 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_shared>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <!-- One pool shared by the writer and the reader (RustFS: the CAS mount probe requires
+                     conditional PUT/DELETE, which MinIO does not enforce). -->
+                <endpoint>http://rustfs1:11121/test/keeper_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <!-- GC off: a part the reader holds from Keeper is not in any ref table in the pool, so the
+                     pool's GC cannot see that the reader still reads its blobs. Deriving GC from Keeper is
+                     step 2 of the plan; this test proves step 1 only. -->
+                <cas_gc_enabled>0</cas_gc_enabled>
+            </disk_cas_shared>
+        </disks>
+        <policies>
+            <cas_shared>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_shared</disk>
+                    </main>
+                </volumes>
+            </cas_shared>
+        </policies>
+    </storage_configuration>
+</clickhouse>

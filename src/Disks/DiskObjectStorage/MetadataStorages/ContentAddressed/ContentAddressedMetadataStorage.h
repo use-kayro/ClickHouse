@@ -378,6 +378,15 @@ public:
         const String & part_path, const String & manifest_bytes,
         std::unique_ptr<ICaPreparedRelink> & out) override;
 
+    /// Keeper part record (`cas_part_files`): see `IContentAddressedExchange`.
+    bool isKeeperRecordFile(std::string_view path, size_t size) const override;
+    std::optional<String> encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const override;
+    CasKeeperPartRecord decodeKeeperPartRecord(std::string_view record) const override;
+    bool holdKeeperPart(const String & part_path,
+                        const std::vector<CasKeeperInlineFile> & inline_files,
+                        const std::vector<CasKeeperBlobFile> & blob_files) override;
+    bool isHeldFromKeeper(const String & part_path) const override;
+
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
     /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when no pool is
@@ -516,6 +525,7 @@ public:
         MovingContainer,
         PartDir,
         ProjectionDir,
+        PartInner,
         TableSubdir,
         GenericIntermediate,
     };

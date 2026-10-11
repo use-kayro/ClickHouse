@@ -314,6 +314,21 @@ public:
     /// Drops all refs in a namespace and removes every retained view belonging to that namespace.
     void dropNamespace(const Cas::RootNamespace & ns);
 
+    /// ==== Keeper-held parts ====
+    /// A part whose metadata came from Keeper (the replica's `cas_part_files` record) instead of from this
+    /// server's ref table. It is held here, in memory, for the lifetime of the disk and is never written to
+    /// the object store. `getView`, `resolve`/`existsRef` and the ref-moving primitives (`republishRef`,
+    /// `dropRef*`, `dropNamespace`) consult it before the ref table, so a rename or a removal of such a
+    /// part re-keys or forgets it in memory with no object-store request. A standalone write into such a
+    /// part is refused by the transaction (`isKeeperPart`): nothing persists a changed Keeper-held part.
+
+    /// Holds `manifest` (Inline entries + Blob entries derived from `checksums.txt`) under `key`,
+    /// replacing whatever was held there.
+    void holdKeeperPart(const PartRefKey & key, std::shared_ptr<const Cas::PartManifest> manifest);
+    /// The Keeper-held ref names of `ns` that start with `prefix`.
+    std::vector<String> keeperRefs(const Cas::RootNamespace & ns, std::string_view prefix) const;
+    bool isKeeperPart(const PartRefKey & key) const;
+
     /// ==== diagnostics ====
     enum class LastDecision : uint8_t
     { Hit, Miss, OversizedBypass, StrictBypass, ForceFreshRead, Invalidated };
@@ -353,6 +368,18 @@ private:
     /// share ONE readManifestShared. NEVER held across I/O — the map only hands out futures.
     mutable std::mutex inflight_mutex;
     mutable std::unordered_map<String, std::shared_future<std::shared_ptr<const PartFolderView>>> inflight;
+
+    /// Keeper-held parts: namespace -> ref -> view (with the hold time standing in for the publish time).
+    struct KeeperPart
+    {
+        std::shared_ptr<const PartFolderView> view;
+        uint64_t held_at_ms = 0;
+    };
+    mutable std::mutex keeper_mutex;
+    std::map<String, std::map<String, KeeperPart>> keeper_parts;
+    std::optional<KeeperPart> keeperPart(const PartRefKey & key) const;
+    /// Forgets a Keeper-held part; returns whether `key` was one.
+    bool forgetKeeperPart(const PartRefKey & key);
 
     /// Reads a manifest and constructs a view. Cold `CachedForLoad` builds are single-flight per key;
     /// fresh modes perform their own read.

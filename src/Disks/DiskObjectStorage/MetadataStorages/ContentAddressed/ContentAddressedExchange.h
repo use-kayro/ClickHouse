@@ -1,10 +1,12 @@
 #pragma once
 
 #include <base/types.h>
+#include <base/extended_types.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace DB
 {
@@ -133,6 +135,30 @@ public:
     virtual void abort() noexcept = 0;
 };
 
+/// One file of a part as the Keeper part record (`cas_part_files`) carries it: a file whose bytes live
+/// only inside a manifest, never as a blob of their own.
+struct CasKeeperInlineFile
+{
+    String path;   /// relative to the part directory, `<proj>.proj/<file>` for a projection file
+    String bytes;
+};
+
+/// One blob-backed file of a part, as the reader derives it from the part's `checksums.txt`: the
+/// MergeTree per-file CityHash128 IS the `ch128` blob digest, so no blob key travels in the record.
+struct CasKeeperBlobFile
+{
+    String path;
+    UInt64 size = 0;
+    UInt128 hash{};   /// `(file_hash.high64 << 64) | file_hash.low64`
+};
+
+/// A decoded Keeper part record: the pool its blobs live in and the inline files.
+struct CasKeeperPartRecord
+{
+    String pool_uuid;   /// same rendering as `IContentAddressedExchange::getPoolUUID`
+    std::vector<CasKeeperInlineFile> files;
+};
+
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
 /// the exchange obtains the interface by casting the disk's `IMetadataStorage` to this interface
@@ -226,6 +252,39 @@ public:
         const String & part_path,
         const String & manifest_bytes,
         std::unique_ptr<ICaPreparedRelink> & out) = 0;
+
+    /// ==== Keeper part record (`cas_part_files`) ====
+    /// The metadata of a part can live in Keeper, one copy per part at the table level: the part's Inline
+    /// files plus the pool, and nothing for the blob-backed files, which the reader derives from the
+    /// inline `checksums.txt`. A replica that has the record materializes the part from it and the
+    /// shared pool, with no request to the source replica and no write or LIST to the object store.
+
+    /// Writer: whether a part file of `size` bytes is one the record carries (the write path's own
+    /// placement rule, `Cas::partFileIsInline`).
+    virtual bool isKeeperRecordFile(std::string_view path, size_t size) const = 0;
+
+    /// Writer: encodes the record for a part whose record files are `files`. `nullopt` when the blobs of
+    /// this pool are not keyed by the MergeTree checksum (a write algorithm other than `ch128`): the record
+    /// could not be read back into blob keys, so the part travels by the ordinary fetch instead.
+    virtual std::optional<String> encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const = 0;
+
+    /// Reader: decodes a record; throws `CORRUPTED_DATA` on a malformed one.
+    virtual CasKeeperPartRecord decodeKeeperPartRecord(std::string_view record) const = 0;
+
+    /// Reader: makes the part directory at the disk-relative `part_path` hold exactly `inline_files` and
+    /// `blob_files`, in memory and for the lifetime of this disk. No object-store request: reads of its
+    /// files are served from the inline bytes and from the shared-pool blobs by digest; a rename or a
+    /// removal of the directory re-keys or forgets it in memory. The part is NOT in this server's ref
+    /// table in the object store, so the pool's GC does not see it (step 2 of the Keeper-metadata plan).
+    /// Returns false, changing nothing, when this server's ref table already holds the part: the ref
+    /// table stays in charge of it.
+    virtual bool holdKeeperPart(const String & part_path,
+                                const std::vector<CasKeeperInlineFile> & inline_files,
+                                const std::vector<CasKeeperBlobFile> & blob_files) = 0;
+
+    /// Whether the part directory at `part_path` is held from its Keeper record (`holdKeeperPart`) rather
+    /// than from this server's ref table.
+    virtual bool isHeldFromKeeper(const String & part_path) const = 0;
 
     /// ==== `DiskObjectStorage::prepareRead` hooks ====
     /// The two CA-only reads `DiskObjectStorage::prepareRead` needs before it composes the standard

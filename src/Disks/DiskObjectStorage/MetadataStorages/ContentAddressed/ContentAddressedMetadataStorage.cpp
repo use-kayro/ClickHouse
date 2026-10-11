@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
@@ -1475,6 +1476,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const
     for (const auto & [ref, _] : store()->listRefs(ns))
         if (ref.starts_with(Cas::kDetachedRefPrefix))
             refs.push_back(ref);
+    for (auto & ref : partAccess()->keeperRefs(ns, Cas::kDetachedRefPrefix))
+        refs.push_back(std::move(ref));
     return refs;
 }
 
@@ -1484,6 +1487,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
     for (const auto & [ref, _] : store()->listRefs(ns))
         if (ref.starts_with(Cas::kMovingRefPrefix))
             refs.push_back(ref);
+    for (auto & ref : partAccess()->keeperRefs(ns, Cas::kMovingRefPrefix))
+        refs.push_back(std::move(ref));
     return refs;
 }
 
@@ -1604,7 +1609,19 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
                 return dr;
             }
         }
-        /// No sub-shape matched: fall through, identical to today's post-`if (p)` continuation.
+        /// Any other path inside a part (`<part>/<file>`, `<part>/<sub>/`): the part's manifest is its
+        /// complete, immutable listing, so the path is a directory iff some entry lies under `<file>/`.
+        /// Classification does no I/O; a path whose part has no view yet (an uncommitted `tmp_*` part)
+        /// is answered as a table-level subdirectory, as before, through `tf`.
+        if (r && !r->ref.empty())
+        {
+            dr.shape = DirShape::PartInner;
+            dr.projection_prefix = r->file + "/";
+            dr.tf = Cas::parseTableFilePath(path);
+            dr.p = std::move(p);
+            dr.r = std::move(r);
+            return dr;
+        }
     }
 
     /// A table-level SUBDIRECTORY (deduplication_logs/...).
@@ -1685,10 +1702,12 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return store()->namespaceStillLogicallyPresent(liveNamespace(*dr.uuid));
         case DirShape::DetachedContainer:
             /// Exists iff it has at least one reference.
-            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kDetachedRefPrefix);
+            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kDetachedRefPrefix)
+                || !partAccess()->keeperRefs(dr.r->ns, Cas::kDetachedRefPrefix).empty();
         case DirShape::MovingContainer:
             /// Exists iff it has at least one staging ref (MOVE-to-CA fix, mirrors DetachedContainer).
-            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kMovingRefPrefix);
+            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kMovingRefPrefix)
+                || !partAccess()->keeperRefs(dr.r->ns, Cas::kMovingRefPrefix).empty();
         case DirShape::PartDir:
             /// Exists iff its ref is present.
             return partAccess()->existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);
@@ -1697,6 +1716,14 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// At least one tree entry (or mutable file) under its prefix.
             auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view && view->hasDirectory(*dr.projection_prefix);
+        }
+        case DirShape::PartInner:
+        {
+            if (auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad))
+                return view->hasDirectory(*dr.projection_prefix);
+            if (!dr.tf)
+                return false;
+            [[fallthrough]];
         }
         case DirShape::TableSubdir:
         {
@@ -1847,6 +1874,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             std::unordered_set<std::string> result;
             for (const auto & [ref, _] : store()->listRefs(ns))
                 addFirstComponent(result, ref);
+            for (const auto & ref : partAccess()->keeperRefs(ns, ""))
+                addFirstComponent(result, ref);
             /// A dropped table lists empty for its namespace files too (its refs are already gone
             /// via the ref state); only surface verbatim file names while the table is not removed.
             if (const auto life = readableNamespaceFilesLife(ns))
@@ -1891,6 +1920,14 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// Inner names with the <proj>.proj/ prefix stripped.
             auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view ? view->listChildren(*dr.projection_prefix) : std::vector<std::string>{};
+        }
+        case DirShape::PartInner:
+        {
+            if (auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad))
+                return view->listChildren(*dr.projection_prefix);
+            if (!dr.tf)
+                return {};
+            [[fallthrough]];
         }
         case DirShape::TableSubdir:
         {
@@ -2333,6 +2370,104 @@ private:
     String ref_name;
 };
 
+}
+
+/// ==== Keeper part record (`cas_part_files`) ====
+
+bool ContentAddressedMetadataStorage::isKeeperRecordFile(std::string_view path, size_t size) const
+{
+    return Cas::partFileIsInline(path, size);
+}
+
+std::optional<String> ContentAddressedMetadataStorage::encodeKeeperPartRecord(const std::vector<CasKeeperInlineFile> & files) const
+{
+    const auto pool = store();
+    /// The reader turns every `checksums.txt` entry the record does not carry into a blob keyed by the
+    /// MergeTree checksum, which is the `ch128` digest and no other algorithm's.
+    if (pool->writeAlgo() != Cas::BlobHashAlgo::CityHash128)
+        return std::nullopt;
+    Cas::PartFiles part_files;
+    part_files.pool_id = pool->poolMeta().pool_id;
+    part_files.entries.reserve(files.size());
+    for (const auto & f : files)
+    {
+        Cas::ManifestEntry e;
+        e.path = f.path;
+        e.placement = Cas::EntryPlacement::Inline;
+        e.inline_bytes = f.bytes;
+        part_files.entries.push_back(std::move(e));
+    }
+    return Cas::encodePartFiles(part_files);
+}
+
+CasKeeperPartRecord ContentAddressedMetadataStorage::decodeKeeperPartRecord(std::string_view record) const
+{
+    Cas::PartFiles part_files = Cas::decodePartFiles(record);
+    CasKeeperPartRecord out;
+    out.pool_uuid = Cas::u128ToHex(part_files.pool_id);
+    out.files.reserve(part_files.entries.size());
+    for (auto & e : part_files.entries)
+        out.files.push_back({std::move(e.path), std::move(e.inline_bytes)});
+    return out;
+}
+
+bool ContentAddressedMetadataStorage::holdKeeperPart(
+    const String & part_path,
+    const std::vector<CasKeeperInlineFile> & inline_files,
+    const std::vector<CasKeeperBlobFile> & blob_files)
+{
+    /// Write class: it changes what this disk serves for `part_path`, though only in memory.
+    checkOpAdmitted(CasOpClass::Write);
+
+    /// The same routing every read of the part uses; a non-part-directory target is a caller error.
+    auto p = Cas::parsePartFilePath(part_path);
+    auto r = p ? route(*p) : std::nullopt;
+    if (!p || !r || !p->backup_name.empty() || r->ref.empty() || !r->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Keeper part target '{}' does not address a content-addressed part directory of a live table", part_path);
+
+    /// A part this server's ref table already holds stays there: the ref table is what this server's own
+    /// writes, removals and the pool's GC act on, so a Keeper-held copy must never shadow it.
+    if (store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true))
+        return false;
+
+    auto manifest = std::make_shared<Cas::PartManifest>();
+    manifest->root_namespace_id = r->ns;
+    manifest->entries.reserve(inline_files.size() + blob_files.size());
+    for (const auto & f : inline_files)
+    {
+        Cas::ManifestEntry e;
+        e.path = f.path;
+        e.placement = Cas::EntryPlacement::Inline;
+        e.ref = Cas::poolContentHash(Cas::BlobHashAlgo::CityHash128, f.bytes);
+        e.inline_bytes = f.bytes;
+        manifest->entries.push_back(std::move(e));
+    }
+    for (const auto & f : blob_files)
+    {
+        Cas::ManifestEntry e;
+        e.path = f.path;
+        e.placement = Cas::EntryPlacement::Blob;
+        e.ref = Cas::BlobRef{Cas::BlobHashAlgo::CityHash128, Cas::BlobDigest::fromU128(f.hash)};
+        e.blob_size = f.size;
+        manifest->entries.push_back(std::move(e));
+    }
+    std::sort(manifest->entries.begin(), manifest->entries.end(),
+              [](const Cas::ManifestEntry & a, const Cas::ManifestEntry & b) { return a.path < b.path; });
+    for (size_t i = 1; i < manifest->entries.size(); ++i)
+        if (manifest->entries[i].path == manifest->entries[i - 1].path)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "Keeper part record for '{}' names file '{}' twice", part_path, manifest->entries[i].path);
+
+    partAccess()->holdKeeperPart(r->refKey(), std::move(manifest));
+    return true;
+}
+
+bool ContentAddressedMetadataStorage::isHeldFromKeeper(const String & part_path) const
+{
+    auto p = Cas::parsePartFilePath(part_path);
+    auto r = p ? route(*p) : std::nullopt;
+    return r && !r->ref.empty() && r->file.empty() && partAccess()->isKeeperPart(r->refKey());
 }
 
 /// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary

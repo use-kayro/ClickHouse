@@ -59,6 +59,9 @@ def start_cluster():
             )
             node.replace_in_config(CONFIG_IN_CONTAINER, "__SERVER_ROOT_ID__", name)
             node.restart_clickhouse()
+            # This test is about relink, which serves parts committed without a Keeper record
+            # (`cas_part_files`, TEC-849); a part with a record never reaches it.
+            node.query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
         yield cluster
     finally:
         cluster.shutdown()
