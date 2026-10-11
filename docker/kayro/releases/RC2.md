@@ -75,7 +75,7 @@ O primeiro intento no reader compartilhado parou antes de qualquer restart: o se
 
 | Nó | Desde | Até |
 |---|---|---|
-| Writer | 07/10 01:40:20Z | 11/10 22:33:00Z (RC3) |
+| Writer | 07/10 01:40:20Z | 11/10 22:33:08Z (RC3) |
 | Reader-mdb | 07/10 01:35:56Z | 11/10 20:45Z (RC3) |
 | Reader compartilhado | 07/10 01:24:12Z | 11/10 21:55Z (RC3) |
 

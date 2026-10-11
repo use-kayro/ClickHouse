@@ -14,7 +14,7 @@ O GC do CAS deixa de pedir ao S3 chaves que não existem. O líder do GC fazia c
 | SHA-256 do binário | não registrado na evidência copiada |
 | Linear | TEC-843 (patch), TEC-844 (canário e rollout), TEC-842 (builder) |
 | Tag git / release | nenhuma |
-| Upstream | PR na Altinity **não aberto**. Precisa de rebase em `antalya-26.6`, que mudou `Gc/CasGc.cpp` e `Gc/CasGcReadAhead.h` depois da tag (`c4ed6fc881` 01/10, `bbdbb2c7a0` 07/10). Corpo pronto em `tec-843-fork-upstream-pr-body.md` (máquina do operador). Espera o resultado do canário |
+| Upstream | **DRAFT** https://github.com/Altinity/ClickHouse/pull/2542: o patch rebaseado sobre `antalya-26.6`, que mudou `Gc/CasGc.cpp` e `Gc/CasGcReadAhead.h` depois da tag (`c4ed6fc881` 01/10, `bbdbb2c7a0` 07/10) e renomeou `read_pool` → `io_pool` e a setting para `cas_gc_io_concurrency`. Ainda não compilado nessa base: o CI da Altinity é o primeiro build |
 
 ## O problema
 
@@ -108,7 +108,7 @@ Regra de aceite (decisão do dono, 11/10 ~20:00Z): por evidência, não por rel�
 |---|---|---|
 | Reader-mdb `i-0bc5ccb44d4141059` | 20:45:05Z → 20:45:13Z; container às 20:45:10Z | **Aceito às 21:46Z.** CAS `reader-mdb` live na época 15 (era 14); loader 196 OK, 0 falhas; mdb 54 tabelas, 0 readonly, atraso 0. Rajada de LIST: 160.347 em 10 min (27.682 throttled). Lease do writer intacto (época 33). `NoSuchKey` 186 (20:45–21:00) e 108 (21:00–21:45), só Debug. Nenhuma classe de erro nova. Backups: `kayro-clickhouse.service.pre-image-20261011T204506017766Z`, `server.xml.pre-image-20261011T204506018408Z` |
 | Reader compartilhado `i-02369cef982eb67d2` | 21:55:05Z → 21:55:28Z; container às 21:55:11Z | Health OK às 22:06Z: CAS `reader` live na época 13; loader 1.223 OK, 0 falhas; 16 bancos, 0 readonly, atraso 0. A primeira consulta a `system.replicas` ficou bloqueada ~582 s durante o start. Nenhuma classe de erro nova. Leases do writer (época 33) e do reader-mdb intactos. Backups: `…pre-image-20261011T215505839721Z` e `…20261011T215505841755Z`. Saudável no RC3 na verificação final das 22:43Z (critério de encerramento do rollout) |
-| Writer `i-02e3809e0b416b25e` | 22:33:00Z, um restart só; a guarda de INSERT liberou na hora | `system.settings` com `wait_for_async_insert=1` e `async_insert_busy_timeout_max_ms=200`: a sobra do perfil `kayro_batch` (kayro-infra #225, TEC-847) saiu. Replicação às 22:43Z: 17 bancos, 0 readonly, atraso 0, fila 0. O refresh da Gazzoni recebeu 2× `NOT_A_LEADER` (529) às 22:34Z e passou no retry |
+| Writer `i-02e3809e0b416b25e` | restart 22:33:08Z; container no ar 22:33:15Z; saudável 22:33:58Z. Um restart só; a guarda de INSERT liberou na hora | `system.settings` com `wait_for_async_insert=1` e `async_insert_busy_timeout_max_ms=200`: a sobra do perfil `kayro_batch` (kayro-infra #225, TEC-847) saiu. Replicação às 22:43Z: 17 bancos, 0 readonly, atraso 0, fila 0. O refresh da Gazzoni recebeu 2× `NOT_A_LEADER` (529) às 22:34Z e passou no retry |
 
 **Rollout encerrado às 22:43Z de 11/10:** os três nós saudáveis no RC3 e o fix medido no líder do GC (abaixo).
 
@@ -145,6 +145,7 @@ Linha de base do reader-mdb no RC2 com concorrência 1, como líder (19:56Z): GE
 
 ## Depois do rollout
 
-- kayro-infra #229 mergeado (`cas_gc_read_concurrency` fora de todos os papéis). O #234 (imagem padrão do módulo → digest do RC3, `cas_gc_read_concurrency` fora da lista `tunable` do `configure-filesystem-cache.py`) estava sendo mergeado quando isto foi escrito.
+- kayro-infra #229 mergeado (`cas_gc_read_concurrency` fora de todos os papéis).
+- kayro-infra #234 mergeado (`6efa15f`, 11/10 ~22:5xZ): a imagem padrão do módulo passa a ser o digest do RC3 e `cas_gc_read_concurrency` sai da lista `tunable` do `configure-filesystem-cache.py`. Plano completo de kayro-prod às 22:54Z: "No changes".
 - Este código morre no passo 3 da milestone 6 (ver [ROADMAP](ROADMAP.md)), junto com o read-ahead e o sweep que ele corrige. Até lá é a mitigação.
 - Não resolvido no RC3: sem `_snap`, a visão de proteção ainda refaz cada namespace desde o início a cada página (a maior parte dos ~956 mil GETs bem-sucedidos por dia), e a tempestade de LIST no restart (TEC-845).
