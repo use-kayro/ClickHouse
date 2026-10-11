@@ -1,5 +1,7 @@
 # Kayro CAS recovery candidate
 
+Every image built from this fork, with its commit, digest, gate and where it runs, is recorded in [`releases/`](releases/README.md).
+
 Based on Altinity tag `v26.6.4.20001.altinityantalya`, source
 `2073b1f88dec885444fac97edb8179ad1753c1ad`. Only asynchronous table construction
 retries the typed transient CAS mount-state exception. Fencing, terminal failures,
