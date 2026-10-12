@@ -8,7 +8,7 @@ A metadata de uma parte num disco CAS passa a existir também no Keeper, num reg
 
 | Campo | Valor |
 |---|---|
-| PR | https://github.com/use-kayro/ClickHouse/pull/2, aberto, não mergeado |
+| PR | https://github.com/use-kayro/ClickHouse/pull/2, mergeado em 12/10 como `b71585e` |
 | Branch | `kayro/keeper-part-manifest` |
 | Head | `283ca09658a4c0e405106342362c0c3b864ed4b8` (11/10 22:17Z), sobre o RC3 (`9700e6e`) |
 | Commit com portão verde | `1df4e77c7357a2bd25475fa574a3713d1b74e5a5`, sobre o RC2 (`294ea1e`), **sem** o RC3 |
