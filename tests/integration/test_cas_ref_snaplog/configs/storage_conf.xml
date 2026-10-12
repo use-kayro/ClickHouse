@@ -3,7 +3,7 @@
         <disks>
             <!-- Content-addressed disk over RustFS. RustFS (not MinIO) enforces the conditional-PUT
                  (If-None-Match) semantics the snapshot+log writer linearization relies on. Background
-                 GC on a tight cadence so a DROP is folded, cleaned, and reclaimed within the test. -->
+                 GC on a tight cadence so a dropped partition is reclaimed within the test. -->
             <disk_ca>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
@@ -17,8 +17,8 @@
                 <cas_gc_enabled>1</cas_gc_enabled>
                 <cas_gc_interval_sec>1</cas_gc_interval_sec>
             </disk_ca>
-            <!-- Read-only window over the SAME pool for the read-only consumers (fsck, cas-gc-dryrun).
-                 Those commands refuse a writable pool; a read-only disk takes no mount lease, so it can
+            <!-- Read-only window over the SAME pool for `cas-fsck`.
+                 That command refuses a writable pool; a read-only disk takes no mount lease, so it can
                  inspect the pool the server writes without contention. -->
             <disk_ca_ro>
                 <type>object_storage</type>
