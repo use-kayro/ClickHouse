@@ -8,9 +8,9 @@ O GC do pool deixa de listar o S3 e de reler os ref logs para saber o que está 
 | Merge | `59caa364606b5745e84641e387e706668b82a205` em `kayro/26.6-cas-load-recovery`, 12/10 01:14:54Z |
 | Head do código | `023e6c46293f3507d8651950877ba21c7dfd5fad` |
 | Base | passo 1 (PR #2, merge `b71585e`), sobre o RC3 |
-| Imagem | `TODO` |
+| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, de `023e6c4`, push 12/10 02:52Z |
 | Linear | TEC-850 |
-| Em produção | nenhum nó (deploy pendente) |
+| Em produção | Deploy iniciado 12/10 ~03:00Z, writer → reader-mdb → reader. |
 
 Commits:
 - `7c6c4c8` teste `test_cas_reader_pin`;
@@ -23,7 +23,13 @@ Commits:
 
 **Writer primeiro, depois um reader por vez. Um reader só recebe esta imagem depois que o writer já roda com ela.**
 
-Os readers no RC3 ainda rodam o GC antigo e podem tomar o lease dele enquanto o writer não faz mais heartbeat. Por isso os dois readers sobem um logo depois do outro, sem intervalo longo entre eles.
+Os readers no RC3 ainda rodam o GC antigo e podem tomar o lease dele enquanto o writer não faz mais heartbeat. Medido no laboratório: um reader RC3 toma o lease do GC antigo 1 a 2 `cas_gc_interval_sec` depois que o writer para de fazer heartbeat (10 a 20 min em produção, com 600 s). Por isso os três restarts formam uma sequência só, em menos de 10 min.
+
+**A combinação proibida:** o GC antigo (qualquer nó RC3, ou o writer no passo 1) rodando ao lado de um reader que anexou partes pelo registro. O GC antigo não enxerga essas partes e apaga os blobs delas.
+
+**Rollback, também em sequência:** primeiro os readers voltam ao RC3 (`sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`), depois o writer volta ao passo 1 (`sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`). O writer nunca volta antes dos readers.
+
+Deploy iniciado 12/10 ~03:00Z, writer → reader-mdb → reader.
 
 Antes do deploy, ver as pré-condições abaixo (em especial: nenhuma tabela detached no writer).
 
@@ -134,10 +140,14 @@ Builder `tec850`, RelWithDebInfo sem LTO, `ENABLE_TESTS=ON`. Árvore idêntica �
 
 **Linha de base no binário do #2** (só o passo 1, GC antigo): `test_cas_reader_pin[drop]` **falhou**. O GC antigo apagou 12 blobs que as partes do reader, anexadas pelo registro, serviam no meio da query. É a lacuna que este passo fecha.
 
-**O que este portão não cobre:** o build ThinLTO de release, a paridade de features e a imagem no ECR. Isso entra na imagem de release (digest `TODO`).
+**O que este portão não cobre:** o build ThinLTO de release, a paridade de features e a imagem no ECR. Isso entrou na imagem de release (abaixo).
 
 ## Imagem de release
 
-Digest: `TODO`.
+`474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, construída de `023e6c4` em 12/10 e enviada ao ECR às 02:52Z.
 
-Imagens que cada nó roda antes deste passo: writer no passo 1 (`sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`), readers no RC3 (`sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`). Procedimento de rollback depois que o writer rodar o GC novo: não registrado.
+- Link ThinLTO: 79 min a 3.000 IOPS, limitado pelo swap (precisou de 96 GB num host de 61 GB).
+- `compare-features.py`: idêntico ao build do passo 1.
+- Harness fault/RLS: passou.
+
+Imagens que cada nó roda antes deste passo: writer no passo 1 (`sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`), readers no RC3 (`sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`). Rollback: a sequência da seção "Regra de deploy" (readers primeiro, writer por último).
