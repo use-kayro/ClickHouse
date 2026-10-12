@@ -8,7 +8,7 @@
                 <http_keep_alive_timeout>30</http_keep_alive_timeout>
                 <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
                 <!-- A single shared bucket path. BOTH servers load this same config, so they mount
-                     the SAME pool (the bucket is the single source of truth; no Keeper). -->
+                     the SAME pool. -->
                 <!-- RustFS (not MinIO): the CA mount capability probe requires enforced conditional-DELETE
                      semantics (CasProbe step 6); MinIO OSS silently honors a mismatched-token DELETE and the
                      fail-closed probe aborts server startup (PR#2073 CI triage). -->
@@ -17,10 +17,8 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Two servers mounting one pool: this acknowledgement is mandatory; without it the
                      second mounter refuses to attach (see PoolMeta ownership check). -->
-                <!-- Background reachability GC enabled on BOTH servers, running aggressively so a
-                     sweep happens during the test. The grace window must be short enough to reclaim
-                     within the test, but the sweep must NOT reclaim a blob the OTHER server's live
-                     part still references. -->
+                <!-- GC on, a round per second: only the writer's rounds delete, and they must never
+                     reclaim a blob a live part on either replica still references. -->
                 <cas_gc_enabled>1</cas_gc_enabled>
                 <cas_gc_interval_sec>1</cas_gc_interval_sec>
             </disk_cas_shared>
