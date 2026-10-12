@@ -459,7 +459,6 @@ object is addressed by the hash of its content rather than by a randomly generat
 identical content written by different parts (or different tables) is stored once and shared. A
 background garbage collector reclaims objects once no part references them anymore; see
 [`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run),
-[`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild),
 [`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member),
 and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
 [`system.cas_mounts`](/operations/system-tables/cas_mounts), and
@@ -487,7 +486,6 @@ reason explained under
     <cas_blob_hash>cityhash128</cas_blob_hash>
     <cas_gc_enabled>true</cas_gc_enabled>
     <cas_gc_interval_sec>60</cas_gc_interval_sec>
-    <cas_gc_shards>1</cas_gc_shards>
     <cas_part_folder_cache_bytes>67108864</cas_part_folder_cache_bytes>
 </s3_cas>
 ```
@@ -527,13 +525,9 @@ disk-level and server-level settings surface.
   fails closed instead of silently turning the pool mixed-algorithm.
 - `cas_gc_enabled` — `true` by default. Enables the background garbage collector for this disk.
 - `cas_gc_interval_sec` — `60` by default; must be `>= 1`. Interval between background GC rounds.
-- `cas_gc_shards` — `1` by default; must be `>= 1`. Number of blob-hash-prefix shards the GC reducer
-  splits work across. This is a creation-time-only setting: on reopen the pool's persisted GC state is
-  authoritative.
 - Every physical blob materialization starts with `HEAD`. A present non-condemned blob is adopted;
   an absent or condemned blob is published unconditionally and its freshness metadata is reconciled
   to `Clean`. A genuine fresh miss issues no metadata GET before publication.
-- `cas_gc_snapshot_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
 - `gcs_max_conditional_put_bytes` — `1` GiB by default. Bounds every conditional non-blob `PUT` on
   generation-token backends, where the precondition must survive one request. This includes
   create-if-absent metadata/control artifacts and conditional replacements. Blob bodies do not
@@ -550,9 +544,6 @@ disk-level and server-level settings surface.
 - `cas_gc_meta_pool_size` — `16` by default. Bounded thread-pool size for the GC's per-hash freshness-meta
   writes (condemn/spare/delete), so a mass `DROP` condemning millions of blobs does not run fully
   sequentially.
-- `cas_gc_read_concurrency` — `16` by default. Bounded thread-pool size for the GC fold's read-ahead of
-  checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s. The fold's decisions stay on the
-  round thread in their original order; only the fetches overlap. `1` disables read-ahead.
 - `skip_access_check` — `false` by default. Skips the disk's `CAS` capability probe ("start now,
   fix later"). The server-level `skip_access_check` flag skips the generic disk access check;
   this disk key governs the `CAS` capability probe.

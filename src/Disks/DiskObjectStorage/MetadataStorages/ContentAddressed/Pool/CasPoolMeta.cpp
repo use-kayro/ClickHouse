@@ -104,13 +104,11 @@ PoolMeta admitOrValidate(CasOperation & op, const String & key, BlobHashAlgo con
 }
 
 PoolMeta PoolMeta::createOrValidate(
-    CasOperation & op, const Layout & layout, uint64_t blob_header_len, uint64_t gc_shards,
+    CasOperation & op, const Layout & layout, uint64_t blob_header_len,
     BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
-    if (gc_shards == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS pool meta: gc_shards must be >= 1");
     /// `blobHashAlgoName` rejects an out-of-range `BlobHashAlgo` with `LOGICAL_ERROR`: a programming
     /// error that aborts debug and sanitizer builds, not an input-validation fence.
     blobHashAlgoName(blob_hash_algo);
@@ -151,7 +149,6 @@ PoolMeta PoolMeta::createOrValidate(
     PoolMeta pm;
     pm.pool_id = mintPoolId();
     pm.blob_header_len = blob_header_len;
-    pm.gc_shards = gc_shards;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(blob_hash_algo)};
 

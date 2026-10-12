@@ -1,6 +1,4 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
@@ -87,8 +85,7 @@ String encodeRefCatalog(const RefCatalog & catalog)
     CasJsonWriter out(256);
 
     /// EVERY line this encoder emits is measured against the LINE cap, on the bytes actually emitted
-    /// -- escaping, framing and all -- mirroring `encodeFoldSeal`'s `checkLineBytes` EXACTLY,
-    /// including its error code: `LIMIT_EXCEEDED`, not `LOGICAL_ERROR`. A line that does not fit is
+    /// -- escaping, framing and all -- with `LIMIT_EXCEEDED`, not `LOGICAL_ERROR`. A line that does not fit is
     /// not a large line, it is an UNREADABLE one: `readLine` refuses it, so the whole object is lost.
     /// This is a capacity refusal on otherwise well-formed input (an admitted namespace name or
     /// server_root_id near their own byte bounds, worst-case escaped, can reach ~4.7 KiB on its own --
@@ -97,7 +94,7 @@ String encodeRefCatalog(const RefCatalog & catalog)
     /// nothing is durable yet.
     const auto checkLineBytes = [&](uint64_t bytes, std::string_view what)
     {
-        if (!fitsLineCap(bytes, line_cap))
+        if (bytes > line_cap)
             throw Exception(ErrorCodes::LIMIT_EXCEEDED,
                 "CAS ref catalog: the {} line encodes to {} bytes, over the {}-byte line cap; a longer "
                 "line cannot be read back, so the catalog is refused before it is written",
@@ -295,117 +292,17 @@ RefCatalog decodeRefCatalog(std::string_view data)
 void checkCatalogObjectBytes(uint64_t encoded_bytes, const RootNamespace & ns)
 {
     const uint64_t cap = traitsFor(FormatId::RefCatalog).object_cap;
-    if (!fitsObjectCap(encoded_bytes, /*entries_reservation*/0, cap))
+    if (encoded_bytes > cap)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
             "CAS ref catalog: admitting '{}' would grow the catalog to {} bytes, over the {}-byte "
             "object cap (predicate 1: encoded_catalog_bytes <= catalog_object_cap) -- refused before "
             "the write", ns.string(), encoded_bytes, cap);
 }
 
-uint64_t foldSealFixedBytes()
-{
-    static const uint64_t bytes = []
-    {
-        CasFoldSeal seal;
-        seal.generation = std::numeric_limits<uint64_t>::max();
-        seal.parent_generation = std::numeric_limits<uint64_t>::max();
-        const uint64_t empty_bytes = encodeFoldSeal(seal).size();
-        /// The empty trailer is `{"n":0}`. A real seal may carry a 20-digit record count.
-        return addByteBudget(empty_bytes, std::numeric_limits<uint64_t>::digits10);
-    }();
-    return bytes;
-}
-
-uint64_t worstCaseEntryFoldReservationBytes()
-{
-    /// Measured through the REAL fold-seal encoder, never a hand-kept formula, so a later change to
-    /// the fold seal's wire shape is felt here automatically instead of silently drifting.
-    static const uint64_t bytes = []() -> uint64_t
-    {
-        constexpr uint64_t kU64Max = std::numeric_limits<uint64_t>::max();
-        constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
-
-        CasFoldSeal seal;
-        /// One catalog entry admits exactly one ref-life row. Charge its widest legal form: a held
-        /// coverage record plus terminal cleanup evidence, all numeric fields at maximum width.
-        seal.ref_lives[std::numeric_limits<UInt128>::max()] = RefLifeFoldState{
-            .coverage = RefCoverage{
-                .classification = CoverageClass::Clamped,
-                .last_folded_ref_id = RefTxnId{kU64Max, kU64Max},
-                .hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,
-                                 .offending_position = RefTxnId{kU64Max, kU64Max},
-                                 .retry_count = kU32Max,
-                                 .next_retry_round = kU64Max}},
-            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{kU64Max, kU64Max}}};
-
-        return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
-    }();
-    return bytes;
-}
-
-uint64_t widestBlobTargetRunReservationBytes(const Layout & layout, uint64_t gc_shards)
-{
-    if (gc_shards == 0)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS ref catalog: gc_shards must be nonzero when reserving blob-target rows");
-
-    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
-    CasFoldSeal seal;
-    seal.blob_target_runs.push_back(RunRef{
-        .key = layout.blobTargetRunKey(max, max, gc_shards - 1, 0),
-        .checksum = std::numeric_limits<UInt128>::max(),
-        .shard = gc_shards - 1,
-        .key_generation = max});
-    return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
-}
-
-uint64_t widestCondemnedSummaryReservationBytes(uint64_t gc_shards)
-{
-    if (gc_shards == 0)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS ref catalog: gc_shards must be nonzero when reserving condemned-summary rows");
-
-    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
-    CasFoldSeal seal;
-    seal.condemned_summary.emplace(gc_shards - 1, CondemnedSummary{
-        .condemned_total = max,
-        .pending_total = max,
-        .oldest_nonpending_condemn_round = max});
-    return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
-}
-
-void checkFoldSealReservation(
-    uint64_t entry_count, uint64_t gc_shards, const Layout & layout, const RootNamespace & ns)
-{
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    /// Saturating, like `fitsObjectCap`'s own addition one step later: an unsaturated product can
-    /// wrap to a remainder far smaller than the true reservation, which would answer "fits" for an
-    /// `entry_count` that plainly does not.
-    const uint64_t ref_lives = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
-    /// `validateFoldSealStructure` permits at most one canonical seq-0 `blob_run` per shard, so charging
-    /// one widest row for every shard covers the full legal run domain without per-entry arithmetic.
-    const uint64_t blob_target_runs = mulByteBudget(
-        gc_shards, widestBlobTargetRunReservationBytes(layout, gc_shards));
-    const uint64_t condemned_summaries = mulByteBudget(
-        gc_shards, widestCondemnedSummaryReservationBytes(gc_shards));
-    const uint64_t reservation = addByteBudget(
-        ref_lives, addByteBudget(blob_target_runs, condemned_summaries));
-    if (!fitsObjectCap(fixed, reservation, cap))
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-            "CAS ref catalog: admitting '{}' would need a fold seal reserving fixed={} + ref_lives={} "
-            "+ blob_target_runs={} + condemned_summaries={} bytes (entries={}, gc_shards={}), over "
-            "the {}-byte fold-seal object cap (predicate 2) -- refused before the write",
-            ns.string(), fixed, ref_lives, blob_target_runs, condemned_summaries, entry_count, gc_shards, cap);
-}
-
-String checkCatalogAdmission(
-    const RefCatalog & candidate, uint64_t gc_shards, const Layout & layout,
-    const RootNamespace & admitting_ns)
+String checkCatalogAdmission(const RefCatalog & candidate, const RootNamespace & admitting_ns)
 {
     const String encoded = encodeRefCatalog(candidate);   /// grammar-checked; LOGICAL_ERROR on our own bug
-    checkCatalogObjectBytes(encoded.size(), admitting_ns);           /// predicate (1)
-    checkFoldSealReservation(candidate.entries.size(), gc_shards, layout, admitting_ns); /// predicate (2)
+    checkCatalogObjectBytes(encoded.size(), admitting_ns);
     return encoded;
 }
 

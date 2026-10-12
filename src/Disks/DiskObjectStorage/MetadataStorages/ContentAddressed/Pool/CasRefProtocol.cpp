@@ -111,9 +111,7 @@ std::function<void(int64_t)> g_recovery_replay_memory_probe;
 
 /// The four legal `owner_transition` shapes, decided purely from the (old_binding, new_binding)
 /// optionals and their `RefOwnerKind`s -- no state read. `RefTableState::applyOwnerTransition` (the
-/// writer/replay state machine) and `manifestEdgesOfTxn` (the GC fold's edge extractor) both switch
-/// over this single classification instead of each carrying their own shape predicates, so a shape
-/// neither consumer recognizes cannot silently acquire divergent meaning in one of them.
+/// writer/replay state machine) switches over it.
 enum class OwnerTransitionShape : uint8_t
 {
     AddPrecommit,      /// no old_binding, new_binding.kind == Precommit
@@ -735,189 +733,6 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
     return encodedRemovalBudgetSize(scratch) <= removal_budget;
 }
 
-std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)
-{
-    std::vector<RefManifestEdge> edges;
-    edges.reserve(txn.ops.size());   /// every recognized op contributes at most one edge
-    const RootNamespace ns{txn.ns};
-
-    for (uint32_t op_ordinal = 0; op_ordinal < txn.ops.size(); ++op_ordinal)
-    {
-        const RefOp & op = txn.ops[op_ordinal];
-        if (op.kind != RefOpKind::OwnerTransition)
-            continue;
-
-        /// Shape legality is decided once, by the shared classifier -- the same one
-        /// `RefTableState::applyOwnerTransition` dispatches on -- so an unrecognized shape throws here
-        /// instead of silently acquiring accidental edge meaning (e.g. an old+new pair naming different
-        /// manifests, which the state machine never admits, used to read as a tolerated "replace").
-        switch (classifyOwnerTransitionShape(op))
-        {
-            case OwnerTransitionShape::AddPrecommit:
-                edges.push_back(RefManifestEdge{
-                    ManifestId{ns, op.new_binding->manifest_ref}, +1, op.new_binding->kind, op_ordinal, 1});
-                continue;
-            case OwnerTransitionShape::RemovePrecommit:
-            case OwnerTransitionShape::RemoveCommitted:
-                edges.push_back(RefManifestEdge{
-                    ManifestId{ns, op.old_binding->manifest_ref}, -1, op.old_binding->kind, op_ordinal, 0});
-                continue;
-            case OwnerTransitionShape::Promote:
-                /// Same-manifest owner move: the manifest keeps an owner the whole time, so there is no
-                /// net edge.
-                continue;
-        }
-        /// Reachable only if a future `OwnerTransitionShape` enumerator is added without a matching
-        /// `case` -- `-Wswitch`/`-Werror` catches that at compile time; this throw is the runtime
-        /// backstop for builds without it.
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "manifestEdgesOfTxn: unhandled owner_transition shape");
-    }
-
-    return edges;
-}
-
-std::optional<RefTxnId> removalTxnId(const RefLogTxn & txn)
-{
-    for (const RefOp & op : txn.ops)
-        if (op.kind == RefOpKind::RemoveNamespace)
-            return txn.txn_id;
-    return std::nullopt;
-}
-
-std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
-    const Layout & layout, const std::vector<String> & listed_keys)
-{
-    const String base = layout.casRefsPrefix();
-    std::map<NamespaceLifePhysicalId, RefTableListing> out;
-
-    for (const String & key : listed_keys)
-    {
-        if (!key.starts_with(base))
-            continue;
-
-        const auto parsed = layout.parseRefObjectKey(key);
-        if (!parsed)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "groupRefKeys: key '{}' under the ref prefix is not a valid ref object -- aborting ref folding", key);
-
-        RefTableListing & table = out[parsed->life_id];
-        switch (parsed->kind)
-        {
-            case RefObjectKind::Log:
-                table.logs.push_back(parsed->txn_id);
-                break;
-            case RefObjectKind::Snap:
-                table.snapshots.push_back(parsed->txn_id);
-                break;
-        }
-    }
-
-    for (auto & [life_id, table] : out)
-    {
-        std::sort(table.logs.begin(), table.logs.end());
-        std::sort(table.snapshots.begin(), table.snapshots.end());
-    }
-
-    return out;
-}
-
-RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              std::optional<RefTxnId> checkpoint,
-                              std::optional<RefTxnId> retained_log_proof)
-{
-    RefCleanupPlan plan;
-
-    /// A physical `_snap` listed after its PUT but before the `_ckpt` CAS is not a recovery base.
-    /// The caller supplies `checkpoint` only after `readCheckpointSnapshotBase` has exact-read the
-    /// same-id non-seal `_log` and `_snap`. With no such validated triple cleanup has no coverage
-    /// authority and deliberately leaks every listed object.
-    if (!checkpoint)
-        return plan;
-
-    for (const RefTxnId & log_id : listing.logs)
-    {
-        if (durable_cursor < log_id)       /// L > cursor: its edge delta is not yet durable
-            continue;
-        if (*checkpoint <= log_id)         /// the exact witness and its successors remain
-            continue;
-        if (retained_log_proof == log_id)  /// a later-epoch base still needs its predecessor seal
-            continue;
-        plan.deletable_logs.push_back(log_id);
-    }
-
-    /// The checkpoint's same-id snapshot is the recovery base, so only strictly older listed snapshots
-    /// are deletion candidates.
-    for (const RefTxnId & snapshot_id : listing.snapshots)
-        if (snapshot_id < *checkpoint)
-            plan.deletable_snapshots.push_back(snapshot_id);
-
-    return plan;
-}
-
-EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, const RootNamespace & ns,
-                                    const RefTxnId & from_seal, std::optional<bool> seal_proven,
-                                    const RefTxnId & witness, const NamespaceLifeId & life)
-{
-    EpochCrossResult result;
-    if (from_seal == RefTxnId{})
-    {
-        result.outcome = EpochCrossOutcome::NothingConsumed;
-        return result;
-    }
-    if (seal_proven && !*seal_proven)
-    {
-        result.outcome = EpochCrossOutcome::NotASeal;
-        return result;
-    }
-
-    /// `life`: REQUIRED, not resolved here -- an internal fallback resolve was tried once already
-    /// (in the former GC fold) and once more here (fsck's own independent walk defaulted to `nullopt` and
-    /// re-resolved), and both times a caller that had already committed to one `life` for the rest of
-    /// its walk could silently diverge from this function's OWN resolution if the namespace is dropped
-    /// and recreated between the two reads. `CasFsck.cpp`'s stream walk resolves `life` once, at the
-    /// top of its own function, and must pass that SAME value here rather than let this function
-    /// re-derive it a second time.
-    uint64_t target_epoch = witness.writer_epoch;
-    while (target_epoch > from_seal.writer_epoch)
-    {
-        const RefTxnId start{target_epoch, 1};
-        result.probed = start;
-        const auto body = op.read(layout.refLogKey(life, start), Retry::standard());
-        if (!body)
-        {
-            ++result.absent_probes;
-            result.outcome = EpochCrossOutcome::StartAbsent;
-            return result;
-        }
-        ++result.body_gets;
-        RefLogTxn head;
-        try
-        {
-            head = decodeRefLogTxn(openObject(FormatId::RefLog, body->bytes), ns.string(), start);
-        }
-        catch (const Exception & e)
-        {
-            result.outcome = EpochCrossOutcome::StartInvalid;
-            result.detail = e.message();
-            return result;
-        }
-        if (!head.prev_epoch_seal || *head.prev_epoch_seal < from_seal)
-        {
-            result.outcome = EpochCrossOutcome::ChainDoesNotReach;
-            return result;
-        }
-        if (*head.prev_epoch_seal == from_seal)
-        {
-            result.outcome = EpochCrossOutcome::Proved;
-            result.start = start;
-            return result;
-        }
-        target_epoch = head.prev_epoch_seal->writer_epoch;
-    }
-    result.outcome = EpochCrossOutcome::ChainDoesNotReach;
-    return result;
-}
-
 std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
     const RefTxnId & current, bool is_epoch_seal, const RefTxnId & committed_through)
 {
@@ -1041,7 +856,7 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader, const std::set<RefTxnId> & listed_logs)
+    const std::optional<RefCkpt> & ckpt)
 {
     /// The frozen catalog row and `_ckpt` supplied by the caller determine every recovery boundary;
     /// this function must not re-read either mutable object, or enumerate the stream, because that
@@ -1070,11 +885,7 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
         RefTxnId id = *grounding.walk_from;
         while (id <= *grounding.committed_through)
         {
-            const String key = layout.refLogKey(life, id);
-            if (reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
-                hintRefLogsWithinEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
-                                       *grounding.committed_through, listed_logs);
-            const auto got = reader ? reader->take(key) : op.read(key, Retry::standard());
+            const auto got = op.read(layout.refLogKey(life, id), Retry::standard());
             if (!got)
             {
                 /// `NamespaceLifeId` is opaque and unique to one logical life. A later birth has a

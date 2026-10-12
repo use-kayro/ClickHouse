@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskLocal.h>
 #include <Common/ErrorCodes.h>
 #include <filesystem>
@@ -2806,8 +2805,8 @@ TEST(CASWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 /// BEFORE any blob work and touches nothing.
 ///
 /// These tests drive the REAL writer sequence (stageManifest -> precommitAdd -> putBlob -> promote) against
-/// a raw in-memory Pool (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
-/// gc/state + the per-hash freshness meta the way a real GC condemn does (see `seedCondemnBlobToken` below).
+/// a raw in-memory Pool (no background GC → deterministic), and condemn the blob by condemning its per-hash
+/// freshness meta the way a real GC condemn does (see `seedCondemnBlobToken` below).
 
 namespace DB::ErrorCodes
 {
@@ -2825,39 +2824,13 @@ DB::Cas::PoolPtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & 
         out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
-/// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set (the durable GC ledger
-/// shape — `RetiredEntry`, exact-token delete) AND condemning the per-hash freshness
-/// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
-/// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
-void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
-                          [[maybe_unused]] const DB::Cas::Etag & token, [[maybe_unused]] uint64_t size)
+/// Condemn the blob by condemning its per-hash freshness meta, which is what the writer's condemned
+/// decision point-reads. Leaves the object itself in place (condemn, NOT delete).
+void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash)
 {
-    using namespace DB::Cas;
-    Backend & b = *store.poolBackendPtr();
-    const Layout & layout = store.layout();
-    DB::Cas::tests::OperationForTest op(b);
-
-    GcState state;
-    const auto head = (*op).head(layout.gcStateKey(), Retry::standard());
-    if (head.has_value())
-    {
-        const auto got = (*op).read(layout.gcStateKey(), Retry::standard());
-        state = decodeGcState(got->bytes);
-    }
-    state.round += 1;
-
-    /// Retired-in-snapshot: there is no separate retired-list object to seed — condemned state rides the
-    /// GC snapshot runs, which this writer-side edge-protection test does not exercise. The writer's
-    /// condemned decision point-reads the per-hash freshness meta (condemned below), so bumping the round
-    /// and condemning the meta is enough.
-    if (head.has_value())
-        (void)(*op).replace(layout.gcStateKey(), encodeGcState(state), head->etag, Retry::standard());
-    else
-        (void)(*op).create(layout.gcStateKey(), encodeGcState(state), Retry::standard());
-
-    /// The writer's fresh upload (putBlob) already wrote a Clean meta for `hash` (Task 3), so this is a
-    /// plain Clean -> Condemned CAS — exactly what GC's real condemn path does.
-    DB::Cas::tests::condemnMeta(b, layout, hash, state.round);
+    /// The writer's fresh upload (putBlob) already wrote a Clean meta for `hash`, so this is a plain
+    /// Clean -> Condemned CAS -- what GC's condemn path does.
+    DB::Cas::tests::condemnMeta(*store.poolBackendPtr(), store.layout(), hash, /*condemn_round=*/ 1);
 }
 
 }
@@ -2888,7 +2861,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     const String blob_key = store->layout().blobKey(idOf(P));
     const Meta h1 = headMetaOf(store, blob_key);
     const Etag t0 = h1.etag;
-    seedCondemnBlobToken(*store, u128Of(P), t0, h1.size);
+    seedCondemnBlobToken(*store, u128Of(P));
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
@@ -2947,7 +2920,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     const Meta h1 = headMetaOf(store, blob_key);
     /// Condemn the leaf so that, were the blob gate reached, promote would republish it — proving the abort
     /// happens strictly BEFORE any blob work.
-    seedCondemnBlobToken(*store, u128Of(P), h1.etag, h1.size);
+    seedCondemnBlobToken(*store, u128Of(P));
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);

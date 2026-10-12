@@ -32,17 +32,6 @@ bool headExists(Backend & backend, const String & key)
     return (*op).head(key, Retry::standard()).has_value();
 }
 
-/// The §6 deletion premise (`manifestDeletionPremise`) is a SECOND precondition on every deletion below,
-/// alongside the watermark eligibility these tests are about: a manifest of an epoch-`E` build is
-/// deletable only once the namespace's sealed fold cursor sits in an epoch strictly above `E`. Tests
-/// whose subject is the eligibility or ownership rule therefore have to establish it, or they would
-/// assert a deletion the premise (not the rule under test) prevented. Tests whose subject is RETENTION
-/// deliberately do NOT call this — see `CASSweepDeletionPremise` for the premise's own coverage.
-void seedConsumedSealCursor(InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns)
-{
-    seedFoldCursorForTest(backend, layout, ns, RefTxnId{kWriterEpoch + 1, 1});
-}
-
 /// The catalog cut and `_ckpt` are recovery's sole authority. A fixture that expects a catalog-named
 /// life to be swept must establish the same empty, fully readable recovery state a real completed
 /// creation would have, rather than relying on the retired sentinel fallback.
@@ -62,9 +51,9 @@ void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout
         .last_epoch_seal = std::nullopt}), Retry::standard())));
 }
 
-/// Replaces the catalog row immediately before its second read after arming. The legacy orphan path
-/// reads a catalog cut for coverage, then resolves the name again inside recovery; the second read can
-/// splice a successor life into the old coverage decision. An authority-threaded path has no second
+/// Replaces the catalog row immediately before its second read after arming. A path that read a
+/// catalog cut and then resolved the name again inside recovery would let the second read splice a
+/// successor life into the first decision. An authority-threaded path has no second
 /// catalog read, so this seam must remain dormant.
 class CatalogChangingOnSecondReadBackend : public InMemoryBackend
 {
@@ -116,14 +105,15 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);   // 6 > 5 => eligible
-    seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
+    std::vector<String> warnings;
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store), warnings);
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -170,11 +160,10 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     const String candidate_key = layout.manifestKey(ManifestId{ns, candidate});
     writeManifestRaw(*backend, layout, ns, candidate, {blobEntryFor("a", DB::UInt128(1))});
     setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active_build_sequence=*/6);
-    seedConsumedSealCursor(*backend, layout, ns);
 
     std::vector<String> warnings;
     EXPECT_EQ(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
-                             listServerRoots(*store), &warnings), 0u);
+                             listServerRoots(*store), warnings), 0u);
     EXPECT_TRUE(headExists(*backend, candidate_key));
     ASSERT_FALSE(warnings.empty());
 }
@@ -190,59 +179,10 @@ TEST(CASOrphanManifestSweep, OwnedBodyIsSkipped)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // now owned
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
+    std::vector<String> warnings;
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store), warnings);
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
-}
-
-/// GC-WEDGE regression (2026-07-10): a COMMITTED ref that has been DROPPED but whose removal `-1` is NOT
-/// yet sealed (transition_version above the sealed fold cursor, which is 0 for this fresh pool) must
-/// SURVIVE the sweep — the GC fold still needs the body to emit the `-1` (delete-after-sealed-decrements).
-/// A promoted build retires its build_seq, so the prefix is watermark-eligible; before the fix the sweep
-/// deleted the body in the dropRef→fold window → the removal-fold then clamped FOREVER on the missing
-/// committed body → pool-wide GC stop. The pending-removal protection now covers COMMITTED (not only
-/// PRECOMMIT) removals.
-///
-/// SINCE THE §6 PREMISE, this shape is held by TWO independent facts: the tail-removal protection this
-/// test is named for, and the premise's rule (1) — the fixture seals no fold cursor, so epoch
-/// `kWriterEpoch`'s closing seal is not consumed either. They cannot be separated HERE: the removal log
-/// sits in a lower epoch than the build, so any cursor high enough to satisfy rule (1) would also sit
-/// above the log and stop the tail scan from reading it at all. The case where the tail-removal
-/// protection is the ONLY thing standing — a removal in a LATER epoch, which is the direction removals
-/// actually cross — is `CASSweepDeletionPremise.AnUnconsumedTailRemovalRetainsItsTarget`.
-TEST(CASOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(5, 0xAB);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);   // committed owner
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);   // dropped: pending committed removal, -1 unsealed
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // 6 > 5 => prefix eligible
-
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
-    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
-        << "a dropped-but-unsealed committed manifest body must survive the sweep (delete-after-sealed-"
-           "decrements) — else the removal-fold clamps forever on the missing body (GC-WEDGE-2026-07-10)";
-}
-
-/// The sweep emits NO blob deltas: the in-degree generation is unchanged.
-TEST(CASOrphanManifestSweep, EmitsNoBlobDeltas)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(5, 0xAB);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
-    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
-    // The sweep must not advance the in-degree generation: capture it AFTER the fixture's own seal.
-    const uint64_t gen_before = currentGenerationOf(*backend, store->layout());
-
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
-    EXPECT_EQ(currentGenerationOf(*backend, store->layout()), gen_before);
-    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
 /// A NON-eligible prefix (no watermark fact) deletes NOTHING (#9: frozen-seq is not authority).
@@ -254,7 +194,8 @@ TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     // No setWatermarkMinActive — no durable fact => not eligible.
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
+    std::vector<String> warnings;
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store), warnings);
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -270,21 +211,21 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     const ManifestRef r = ref(5, 0xB0);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
 
     CasOperation op = store->openRequests().admit();
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     ASSERT_FALSE(readCkpt(op, store->layout(), NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)));
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
+    std::vector<String> warnings;
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store), warnings);
 
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "without the exact _ckpt required by a Live catalog row, the sweep must retain rather than "
            "derive an empty owner set";
 }
 
-/// The catalog row used to obtain coverage and the life used to recover ownership must be ONE frozen
-/// authority cut. A later catalog row for the same name may not make the old life's committed manifest
+/// The catalog row and the life used to recover ownership must be ONE frozen authority cut. A later catalog row for the same name may not make the old life's committed manifest
 /// look orphaned and therefore deletable.
 TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
 {
@@ -299,13 +240,14 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     ASSERT_EQ(publishCommittedTransition(*backend, store->layout(), ns, "live", std::nullopt, r), 1u);
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
-    seedConsumedSealCursor(*backend, store->layout(), ns);
 
     CatalogEntry successor = predecessor;
     successor.incarnation = DB::UInt128(0xBEEF);
     backend->arm(store->layout(), predecessor, successor);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
+    std::vector<String> warnings;
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store), warnings);
 
     EXPECT_FALSE(backend->didSwitch())
         << "the sweep must not resolve a second catalog cut after it starts using the frozen entry";

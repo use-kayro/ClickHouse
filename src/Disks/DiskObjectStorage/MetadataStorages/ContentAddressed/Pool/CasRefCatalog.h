@@ -1,7 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -93,7 +92,7 @@ public:
         CasOperation & op, const Layout & layout,
         const std::function<RefCatalog(const RefCatalog &)> & mutate);
 
-    /// Admits exactly ONE new namespace into the catalog under INV-3's two-predicate gate, inserting
+    /// Admits exactly ONE new namespace into the catalog under INV-3's admission gate, inserting
     /// `entry` at its canonical (ns-sorted) position and running the SAME bounded `casUpdate` retry
     /// loop. Takes the entry to insert rather than an arbitrary mutation, by design: an admission
     /// entry point that accepted a free-form candidate could be handed a REMOVAL by a future caller
@@ -103,7 +102,7 @@ public:
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
     /// `checkCatalogAdmission`.
     static RefCatalog casAdmitEntry(
-        CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry);
+        CasOperation & op, const Layout & layout, const CatalogEntry & entry);
 
     enum class BeginRemovingOutcome : uint8_t
     {
@@ -116,62 +115,12 @@ public:
     /// Exact `Live -> Removing` transition. The immutable observed row is compared by full value on
     /// every catalog retry, and `op`'s admission is checked after every fresh read and before its
     /// write. A row already `Removing` under the same namespace/life resolves an ambiguous or
-    /// concurrent transition positively; no caller may change its recorded start round afterward.
+    /// concurrent transition positively. The row's `removal_started_round` is written as 0: the field
+    /// stays in the format, and nothing reads it.
     static BeginRemovingOutcome beginRemoving(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        uint64_t removal_started_round);
+        CasOperation & op, const Layout & layout, const CatalogEntry & observed);
 
-    /// Outcome of the only fold-authorized catalog deletion. A refusal never writes the catalog.
-    enum class CompletedRemovingDeleteOutcome : uint8_t
-    {
-        Deleted,
-        ProofRefused,
-        EntryChanged,
-        FencedOut,
-    };
-
-    struct CompletedRemovingDeleteResult
-    {
-        CompletedRemovingDeleteOutcome outcome;
-        /// Present only when a mandatory fresh catalog read proves that the exact observed life is no
-        /// longer cataloged, whether this actor's erase committed or another actor removed/replaced it.
-        std::optional<NamespaceLifeId> invalidated_life;
-        /// The catalog cut this call ends on. After an attempted erase it is the mandatory resolution
-        /// read's snapshot, which the GC drain feeds directly into its next deterministic selection.
-        /// On `FencedOut` it is instead the cut the call was GIVEN: an operation whose admission is
-        /// gone cannot issue the resolution read, so the erase's own effect is left unreported. Proof
-        /// refusal performs no read at all and leaves this absent.
-        std::optional<Snapshot> catalog_snapshot;
-
-        bool operator==(CompletedRemovingDeleteOutcome expected) const { return outcome == expected; }
-    };
-
-    /// Exact-CAS-deletes `observed` only when it is a complete `Removing` row and the authoritative
-    /// adopted parent carries cleanup evidence, but no hold, in the row keyed by the same opaque life
-    /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
-    /// reduce the proof to a caller-computed boolean. `op`'s admission is checked after every fresh
-    /// catalog read and before every attempted erase.
-    ///
-    /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
-    /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
-    /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
-    /// before the first erase must not authorise the rest. Mandatory: a caller whose liveness needs no
-    /// refresh passes a no-op and says so, instead of erasing unrefreshed because the argument was
-    /// easy to omit.
-    static CompletedRemovingDeleteResult deleteCompletedRemoving(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const CasFoldSeal & authoritative_parent,
-        const std::function<void()> & refresh_authority);
-
-    /// Same exact deletion, using the caller's complete selected catalog snapshot and its incarnation
-    /// for the one erase attempt. Its mandatory resolution snapshot is returned in the result so a
-    /// catalog-only drain can select the next row without an intervening read.
-    static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
-        CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
-        const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
-        const std::function<void()> & refresh_authority);
-
-    /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
+    /// Outcome of exact stalled-creation cancellation.
     enum class StalledCreatingCancelOutcome : uint8_t
     {
         Cancelled,
@@ -181,7 +130,7 @@ public:
     };
 
     /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
-    /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    /// terminal. This performs no `_ckpt` or other physical cleanup.
     static StalledCreatingCancelOutcome cancelStalledCreating(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
@@ -244,7 +193,7 @@ public:
     /// `Live` is adopted, `Removing` is refused there, a still-`Creating` entry resumes through
     /// `reconcileStaleCreator` + `completeCreation`).
     static NamespaceCreationOutcome createNamespace(
-        CasOperation & op, const Layout & layout, uint64_t gc_shards,
+        CasOperation & op, const Layout & layout,
         const RootNamespace & ns, const CreatorFence & creator,
         const Retry & policy = Retry::standard());
 

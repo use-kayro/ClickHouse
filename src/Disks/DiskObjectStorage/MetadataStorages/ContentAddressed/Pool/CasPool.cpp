@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -189,11 +188,8 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// flight is then refused at its next request instead of running to completion under a disk that
     /// is being torn down. The ref ledger and the farewell live on the other two planes, so
     /// teardown's own I/O never meets this fence. A write already proven durable is admitted ONCE
-    /// MORE (`postCommit`), so an armed teardown can turn a landed `gc/state` into a give-up rather
-    /// than a commit. That is safe and not merely tolerable: the round is one-pass, so the next round
-    /// reads the state this one committed and re-derives the rest, exactly as after a crash at that
-    /// instant -- and every step of the tail the give-up skipped is admitted on THIS plane, so it
-    /// would have been refused anyway. What it costs is the round number on the round's own row.
+    /// MORE (`postCommit`), so an armed teardown can turn a landed write into a give-up rather than a
+    /// commit; the next round re-derives its work, exactly as after a crash at that instant.
     , gc_requests(pool_backend, Fence{
           [] { return uint64_t{0}; },
           [this](uint64_t, uint64_t) { return teardownBegun() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
@@ -535,9 +531,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// closed instead (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
+        meta_op, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/!config.read_only);
-    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -954,9 +949,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// minting a fresh identity here (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
+        meta_op, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/false);
-    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -1130,7 +1124,6 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// right severity, not a release fail-close.
     const ThreadName tn = getThreadName();
     chassert(tn != ThreadName::CAS_REMOUNT && tn != ThreadName::CAS_GC_SCHEDULER
-             && tn != ThreadName::CAS_GC_HEARTBEAT
              && "SYSTEM CAS FORGET must not run on a CAS pool thread (self-join deadlock)");
 
     /// Idempotent: an already-terminal `Vanished` pool (a second FORGET, or a pool that naturally vanished
@@ -1158,8 +1151,8 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// `TransientNotLive`, so store-class access already fails loud during the teardown window below.
     mount_runtime.tripMountLost();
 
-    /// (3+4) Stop the GC scheduler (clears its leadership and JOINS its worker + heartbeat threads) BEFORE
-    /// the Pool-side teardown, so no round writes `gc/state` under a disk we are decommissioning. Injected
+    /// (3+4) Stop the GC scheduler (clears its leadership and JOINS its worker thread) BEFORE the
+    /// Pool-side teardown, so no round writes under a disk we are decommissioning. Injected
     /// because the scheduler is owned above the Pool (a no-op in unit / read-only / clickhouse-disks
     /// contexts that run none). Runs OUTSIDE `remount_mutex` (spec §3 join discipline).
     if (stop_and_join_gc)
@@ -1833,18 +1826,6 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
         {
         }
     }
-}
-
-uint64_t Pool::currentGcRound() const
-{
-    /// Read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
-    /// GC advance only makes the returned round larger, which is strictly more conservative for the
-    /// `precommitAdd` self-floor). Returns 0 when absent (pool never GC'd — no round to floor to).
-    CasOperation op = gc_requests.admit();
-    const auto state_bytes = op.read(pool_layout.gcStateKey(), Retry::standard());
-    if (!state_bytes)
-        return 0;
-    return decodeGcState(state_bytes->bytes).round;
 }
 
 void Pool::removeNamespaceFile(const NamespaceLifeId & life, const String & name)

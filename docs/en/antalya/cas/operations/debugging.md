@@ -49,23 +49,25 @@ reference.
 
 ### Why GC is not reclaiming {#why-not-reclaiming}
 
-Two questions, in order: is this node's scheduler leading, and did its recent rounds actually fold?
+Two questions, in order: does this node's GC run as the writer, and what did its recent rounds do?
 
 ```sql
 SELECT server_root_id, is_leader, state, last_success_age_seconds, pending_reclaim
 FROM system.cas_mounts WHERE disk = 'cas';
 
-SELECT event_time, outcome, candidates_marked, entries_condemned, entries_graduated,
-       entries_redeleted, anomalies
+SELECT event_time, outcome, writer, objects_condemned, objects_deleted, objects_replaced,
+       objects_spared
 FROM system.cas_gc_log
 WHERE event_type = 'Finish' AND disk_name = 'cas'
 ORDER BY event_time DESC LIMIT 10;
 ```
 
-A `0`/`false` `is_leader` means this node never reclaims for this disk — check the peer that holds
-leadership instead. A steady `entries_condemned` with `entries_graduated` stuck at `0` means objects
-are being found but never crossing the safety floor (recall the grace period is measured in full
-rounds, not acks — see [condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).
+A `0`/`false` `is_leader` means this node's rounds do not run as the writer (it does not write every
+table on the disk), so it never deletes — check the writer instead. A steady `objects_condemned` with
+`objects_deleted` at `0` means the condemned blobs' records are not removed yet: a record is removed
+only `old_parts_lifetime` after its part left every replica, and a blob is deleted only once every
+build that existed at its condemnation has retired (see
+[condemnation and deletion](/antalya/cas/architecture/garbage-collection#condemn-delete)).
 A specific blob's own story — was it ever condemned, spared, or is it not being seen at all — is the
 per-object query in the previous section, filtered to `object_kind = 'blob'`.
 
@@ -73,7 +75,7 @@ per-object query in the previous section, filtered to `object_kind = 'blob'`.
 
 Every round writes a `Start` and a `Finish` row to
 [`system.cas_gc_log`](/operations/system-tables/cas_gc_log), correlated by `round_id` (not `round`,
-which is `0` on `Start` and absent on a round that never led). One `Phase` row per phase reached
+which is `0` on `Start` and on a round that did not run as the writer). One `Phase` row per phase reached
 carries that phase's own `phase_duration_microseconds`, `ProfileEvents` delta, and `phase_metrics` —
 group by `round_id` to reconstruct one round in order:
 
@@ -170,14 +172,14 @@ authoritative read, so it needs no quiesce:
 SYSTEM CAS FSCK cas;
 ```
 
-Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `awaiting_gc`,
-`unaccounted`, `stale_edge`, `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`,
+Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `unaccounted`,
+`chain_broken`, `unchecked`, `lifeless_keys`,
 `namespace_janitor_pending` (+`_bytes`/`_lives`), `ref_records_walked`, `physical_bytes`,
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
-means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
-moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
-GC source-edge run that failed its checksum, respectively. This summary-only form has no
+means data loss — `unreachable` counts every present object no live ref references (`unaccounted`
+the blobs among them); not a problem on their own. `pending_gc` is `0`. `chain_broken` and
+`lifeless_keys` are the other hard findings: a hole in a ref-log stream and a key no writer could
+have produced, respectively. This summary-only form has no
 per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
 
@@ -191,10 +193,8 @@ available:
 SYSTEM CAS GC RUN cas;
 ```
 
-One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
-`objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
-`entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`,
-`pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
+One row per disk it ran on: `disk`, `writer`, `round`, `objects_condemned`, `objects_deleted`,
+`objects_absent`, `objects_replaced`, `objects_spared`, `fence_outs`. Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
 regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
 
@@ -210,7 +210,7 @@ SYSTEM CAS GC START cas;
 ```
 
 `STOP` is idempotent and stops-in-place (the same scheduler instance resumes on `START`, keeping its
-`gc_id` and lease-observation history); it works even on a not-live disk. It does not stop a manual
+in-memory condemnations); it works even on a not-live disk. It does not stop a manual
 `SYSTEM CAS GC RUN`. See the [operational surface](/antalya/cas/architecture/garbage-collection#operational-surface)
 table for the full command list.
 
@@ -232,23 +232,19 @@ own local view of one disk.
 ## Offline tools {#offline-tools}
 
 When the server cannot answer — it is down, or the access needs to be read-only forensic against the
-bucket directly, disaster recovery of `gc/state`, or a raw object decode — `clickhouse-disks` runs
-these against the pool's backend without a live server. All five require the disk to be opened with
+bucket directly, or a raw object decode — `clickhouse-disks` runs these against the pool's backend
+without a live server. Both require the disk to be opened with
 `<readonly>true</readonly>` in the `clickhouse-disks` config; they must never claim a live server's
 mount.
 
 | Command | Use it for |
 |---|---|
-| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
-| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
-| `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
-| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats |
+| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `unaccounted`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
+| `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`) straight to JSON |
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-fsck --detail
-clickhouse-disks -C config.xml --disk cas cas-gc-dryrun
 clickhouse-disks -C config.xml --disk cas cas-inspect '<raw-object-key>'
-clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
 `cas-drop-member` — the offline twin of `SYSTEM CAS DROP POOL MEMBER` — is covered on the

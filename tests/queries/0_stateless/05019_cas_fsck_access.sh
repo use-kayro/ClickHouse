@@ -5,7 +5,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-# Access control for `SYSTEM CAS FSCK` (mirrors 05011_cas_gc_rebuild_access.sh):
+# Access control for `SYSTEM CAS FSCK` (mirrors 05011_cas_gc_run_access.sh):
 #  1) A zero-grant user is denied before the disk is even resolved -- naming a disk that does not
 #     exist still yields ACCESS_DENIED, not UNKNOWN_DISK.
 #  2) Granting "SYSTEM CAS FSCK" permits the verb; it then fails later, on the

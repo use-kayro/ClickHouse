@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -289,42 +287,10 @@ TEST(CASPersistedEtag, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
         EXPECT_EQ(back.dialect, recorded.dialect);
         EXPECT_EQ(back.value, recorded.value);
     }
-
-    /// 2. The `cas_run` condemned row's NDJSON form.
-    {
-        const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(9))};
-        DB::WriteBufferFromOwnString out;
-        SourceEdgeRunWriter writer(out);
-        writer.append(SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Condemned,
-                                       .delete_pending = true, .token = recorded, .size = 64,
-                                       .condemn_round = 3, .marker_confirmed = true});
-        writer.finish();
-        out.finalize();
-        const String bytes = out.str();
-        DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
-        SourceEdgeRunReader reader(in);
-        SourceEdgeRecord back;
-        ASSERT_TRUE(reader.next(back));
-        EXPECT_EQ(back.token.dialect, recorded.dialect);
-        EXPECT_EQ(back.token.value, recorded.value);
-        EXPECT_FALSE(reader.next(back));
-    }
-
-    /// 3. The condemned row's packed byte form, whose dialect rides one byte rather than a word.
-    {
-        const CondemnedRow row{.delete_pending = false, .token = recorded, .size = 5,
-                               .condemn_round = 11, .marker_confirmed = true};
-        EXPECT_EQ(decodeCondemnedRow(encodeCondemnedRow(row)), row);
-    }
 }
 
-/// Both directions of the dialect vocabulary fail closed, so neither encoding can carry a value the
-/// other cannot name.
-TEST(CASPersistedEtag, UnknownDialectWordAndByteAreBothRefused)
+/// The dialect vocabulary fails closed on a word it cannot name.
+TEST(CASPersistedEtag, UnknownDialectWordIsRefused)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromString("etags", "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectByteFromWord("etags", "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(0, "t"); });
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(4, "t"); });
-    EXPECT_EQ(dialectWordFromByte(dialectByteFromWord("generation", "t"), "t"), "generation");
 }

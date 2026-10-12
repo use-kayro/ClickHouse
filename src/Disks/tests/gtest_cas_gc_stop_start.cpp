@@ -234,7 +234,7 @@ TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
 
 /// (C1, rev.8 §9 item 8) `IdentityLost` is now a fail-loud TERMINAL state, so the scheduler must self-exit
 /// there exactly as it does on `Vanished` — a scheduler ticking against a half-erased pool is a pure zombie
-/// (eternal `CORRUPTED_DATA` retries against the vanished `gc/state`). Prove BOTH loops self-exit and that no
+/// (eternal retries against a vanished pool). Prove the loop self-exits and that no
 /// further round-log rows appear, and that leadership is cleared.
 TEST(CASGCStopStart, SchedulerSelfExitsOnIdentityLost)
 {

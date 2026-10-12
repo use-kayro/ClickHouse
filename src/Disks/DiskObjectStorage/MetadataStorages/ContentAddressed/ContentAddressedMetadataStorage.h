@@ -237,7 +237,7 @@ public:
     bool isContentAddressed() const override { return true; }
 
 
-    /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
+    /// Fail-close gate shared by every mutating entry point (transactions, GC round,
     /// pool-member decommission): an observe-only (`<readonly>`) disk must reject them all.
     void checkNotReadOnly(std::string_view what) const;
 
@@ -298,8 +298,8 @@ public:
     /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk` this is
     /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`
     /// keeps reading its (now stopped) state truthfully and a later `gcStart` re-enters the SAME instance
-    /// with its `gc_id` + lease-observation history preserved. `stop()`
-    /// joins the worker+heartbeat threads and clears the in-process leadership hint. Idempotent (a second
+    /// with its in-memory `KeeperGc` state preserved. `stop()`
+    /// joins the worker thread and clears the in-process leadership hint. Idempotent (a second
     /// STOP is a no-op); a no-op success when no scheduler exists (GC disabled / read-only / not started).
     /// Works on a not-live/Vanished disk too -- stopping GC on a sick disk is legitimate operator action, so
     /// this does NOT consult `checkOpAdmitted`. Serialized by `lifecycle_mutex` and `gc_scheduler_mutex`.
@@ -307,8 +307,7 @@ public:
 
     /// `SYSTEM CAS GC START` handler (Task 11, spec §6): restarts the background GC scheduler
     /// stopped by `gcStop`, re-entering the SAME instance (its `start()` is re-enterable after a join).
-    /// Leadership is NOT auto-restored -- the scheduler re-acquires the durable `gc/state` lease through the
-    /// next round's normal acquisition. Idempotent (a no-op on a running scheduler). Unlike `gcStop`, it goes
+    /// Idempotent (a no-op on a running scheduler). Unlike `gcStop`, it goes
     /// through the uniform GC gate (`checkOpAdmitted(Admin)`): it refuses on a transient / `IdentityLost` /
     /// `Vanished` pool with the typed error (668 / [D5]) and on a not-mounted disk -- restarting GC on a
     /// decommissioned/uncertain pool is meaningless and would only spin failing rounds. Serialized by
@@ -612,7 +611,6 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const std::chrono::milliseconds mount_lease_ttl;
     const std::chrono::milliseconds mount_renew_period;
     /// See `PoolConfig::unsafe_remount_no_delay` -- the operator's explicit acceptance of an

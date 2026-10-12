@@ -35,14 +35,14 @@ TEST(CASNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
     CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation catalog_op = catalog_requests.admit();
 
-    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, CatalogEntry{
         .ns = creating,
         .state = NsState::Creating,
         .incarnation = UInt128{31},
         .creator = CreatorFence{.server_root_id = "foreign", .writer_epoch = 7, .fence_generation = 1}});
-    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, CatalogEntry{
         .ns = live, .state = NsState::Live, .incarnation = UInt128{32}});
-    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, CatalogEntry{
         .ns = removing, .state = NsState::Live, .incarnation = UInt128{33}});
     CasRefCatalog::casUpdate(catalog_op, layout, [&](const RefCatalog & current)
     {

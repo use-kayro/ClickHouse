@@ -15,9 +15,9 @@ handshake, fetch by relink, layered directly on the ordinary interserver part-fe
 page covers the handshake, the gates that decide whether it fires, what actually makes it safe
 against a concurrent `GC` round, and how detach/attach/drop reduce to the same primitives. The
 writer owns table semantics and part publication (see the
-[part-lifecycle page](/antalya/cas/architecture/part-lifecycle)); `GC` owns ref-log folding and
-physical cleanup (see the [garbage-collection page](/antalya/cas/architecture/garbage-collection))
-— ordinary replication traffic never reads `gc/state` or waits on a `GC` round.
+[part-lifecycle page](/antalya/cas/architecture/part-lifecycle)); `GC` owns blob deletion (see the
+[garbage-collection page](/antalya/cas/architecture/garbage-collection)) — ordinary replication
+traffic never waits on a `GC` round.
 
 ## The handshake {#handshake}
 
@@ -117,12 +117,8 @@ The receiver's `+1` — its precommit binding — is durable **before** the send
 and any removal of the sender's own binding is appended strictly after that `+1` is in the ref
 log. That ordering, steps T1 then T2 then T3, is the whole seal.
 
-This does **not** establish that every subsequent `GC` fold *sees* that `+1` under every listing
-behavior: a configuration with one incomplete listing page can, in principle, let a fold miss a
-freshly published edge. A confirmed relink therefore proves only "the source still holds exactly
-this manifest right now", not "no future fold can ever miss this edge" — `ca-fsck`'s
-reachable-but-absent scan is the backstop for that gap, not the relink protocol itself. Relink
-also races `GC` in the ordinary sense any writer does: between the sender encoding its offer and
+A confirmed relink proves "the source still holds exactly this manifest right now"; `GC` protects
+the blobs through the receiver's own Keeper part record once its part commits. Relink also races `GC` in the ordinary sense any writer does: between the sender encoding its offer and
 the receiver's promote, `GC` on the shared pool may condemn a blob that was live only through the
 sender's own ref. The [writer-versus-GC race](/antalya/cas/architecture/blob-protocol#writer-gc-race)
 on the blob-protocol page is what makes that interleaving safe — revival is re-upload only, and the
@@ -151,4 +147,4 @@ identical entries just drops the source, an idempotent re-drive; one with differ
 throws.
 
 Manifests are therefore per-ref and never moved: a detach creates a new manifest for
-`detached/<part>` and retires the old one, and the blobs' net in-degree is unchanged.
+`detached/<part>` and retires the old one, and no blob changes.

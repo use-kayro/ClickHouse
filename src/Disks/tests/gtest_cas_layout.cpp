@@ -27,7 +27,6 @@ TEST(CASLayout, KeyShapes)
     const BlobRef ref = prefixedRef(BlobHashAlgo::CityHash128);
     const String hex = codecFor(BlobHashAlgo::CityHash128).toHex(ref.digest);
     EXPECT_EQ(l.blobKey(ref), "p/blobs/ch128/" + hex.substr(0, 2) + "/" + hex);
-    EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
 
@@ -141,21 +140,8 @@ TEST(CASLayout, RootNamespaceValidation)
 TEST(CASLayout, GenerationAndRootsKeys)
 {
     Layout l("p");
-    /// rev. 15: gc/snap is gone; generations carry write-once seals + blob-target / cleanup runs.
-    /// rev. 16: every per-round artifact is attempt-scoped under gc/gen/<gen>/attempt/<attempt>/.
-    EXPECT_EQ(l.foldSealKey(12, 0), "p/gc/gen/12/attempt/0/fold_seal");
-    EXPECT_EQ(l.blobTargetRunKey(12, 0, 0, 0), "p/gc/gen/12/attempt/0/blob_target/0/0");
     EXPECT_EQ(l.namespaceRootPrefix(), "p/cas/ns/");
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
-}
-
-TEST(CASLayout, AttemptScopedGenKeys)
-{
-    DB::Cas::Layout layout("p");
-    EXPECT_EQ(layout.foldSealKey(4, 42), "p/gc/gen/4/attempt/42/fold_seal");
-    EXPECT_EQ(layout.blobTargetRunKey(4, 42, 3, 0), "p/gc/gen/4/attempt/42/blob_target/3/0");
-    EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
-    EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
 }
 
 TEST(CASLayout, RegistryDeletedGcDiscoveryViaList)
@@ -310,8 +296,7 @@ TEST(CASLayout, ParseRefObjectKeyRejections)
     /// Missing namespace segment entirely.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/ns/stream/_log/" + renderRefTxnId(id)).has_value());
     /// The `_ckpt` (spec INV-4) has no kind directory and no transaction id, so the id-bearing parser
-    /// must not claim it. Every sweep over the ref prefix has to consult `parseRefCkptKey` as well --
-    /// `groupRefKeys` treats a key neither parser recognizes as corruption that aborts ref folding.
+    /// must not claim it. Every sweep over the ref prefix has to consult `parseRefCkptKey` as well.
     EXPECT_FALSE(l.parseRefObjectKey(l.refCkptKey(ns_id)).has_value());
 }
 

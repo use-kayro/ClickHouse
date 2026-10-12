@@ -2378,9 +2378,9 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
 
 /// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
 /// keyword (YAGNI -- the offline `clickhouse-disks cas-fsck --detail` applet already covers per-object
-/// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
-/// 2026-07-29, and is no longer one where findings are concerned -- see the rule stated at
-/// `stale_edge` below. `CommandFsck.cpp`'s `formatFsckSummary` line carries the same fields.
+/// listing). Field order/names mirror `Cas::FsckReport`, and every hard finding is a column -- see the
+/// rule stated below. `formatFsckSummary` (`CasFsck.cpp`) prints the same counters as one line, under
+/// some shorter names (`janitor_pending`) and plus `dedup_ratio` and the partial flag.
 ColumnsDescription contentAddressedFsckColumns()
 {
     return ColumnsDescription{NamesAndTypesList{
@@ -2389,28 +2389,15 @@ ColumnsDescription contentAddressedFsckColumns()
         {"dangling", std::make_shared<DataTypeUInt64>()},
         {"unreachable", std::make_shared<DataTypeUInt64>()},
         {"pending_gc", std::make_shared<DataTypeUInt64>()},
-        {"awaiting_gc", std::make_shared<DataTypeUInt64>()},
         {"unaccounted", std::make_shared<DataTypeUInt64>()},
         /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
-        /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
-        /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
-        /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs` were invisible from SQL while
-        /// `clickhouse-disks cas-fsck` surfaced them; then
-        /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too. Every time, the rule
-        /// was written in prose, and every time the prose did not hold.
+        /// consumer ever gets, so a hard finding the row omits is a finding no query can see.
+        /// `kFsckHardFindings` (`CasFsck.h`) is the list `clean` is computed from, and the `static_assert`
+        /// beside it breaks the build in THIS translation unit when a term is added. Read that assert's
+        /// message before bumping its count -- it names this site as one of the three that owes an
+        /// update, and says that two of the three have no test that can fail on their behalf. WHICH two
+        /// is in the comment above the assert, not in the message; this site is one of them.
         ///
-        /// So it no longer lives only in prose: `kFsckHardFindings` (`CasFsck.h`) is the list `clean` is
-        /// computed from, and the `static_assert` beside it breaks the build in THIS translation unit when
-        /// a term is added. Read that assert's message before bumping its count -- it names this site as
-        /// one of the three that owes an update, and says that two of the three have no test that can fail
-        /// on their behalf. WHICH two is in the comment above the assert, not in the message; this site is
-        /// one of them.
-        ///
-        /// `stale_edge` is nonzero only in `detail` mode and this row is built from a summary scan, so it
-        /// reads 0 here always — present because "absent" and "zero" are different facts to a consumer,
-        /// and a column that appears the day the scan gains detail is a schema change nobody asked for.
-        {"stale_edge", std::make_shared<DataTypeUInt64>()},
-        {"corrupted_runs", std::make_shared<DataTypeUInt64>()},
         /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
         /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
         /// could not prove either way, so a zero here is what makes the other zeros mean something.
@@ -2440,10 +2427,7 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.dangling);
     res_columns[i++]->insert(rep.unreachable);
     res_columns[i++]->insert(rep.pending_gc);
-    res_columns[i++]->insert(rep.awaiting_gc);
     res_columns[i++]->insert(rep.unaccounted);
-    res_columns[i++]->insert(rep.stale_edge);
-    res_columns[i++]->insert(rep.corrupted_runs);
     res_columns[i++]->insert(rep.chain_broken);
     res_columns[i++]->insert(rep.unchecked);
     res_columns[i++]->insert(rep.lifeless_keys);
@@ -2556,8 +2540,8 @@ void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
     /// SYSTEM CAS GC STOP (spec §6): stop ONLY the background GC scheduler on this disk. The
     /// disk stays fully usable -- reads and writes are unaffected; this is granular operator control of GC
     /// alone (e.g. to pause reclamation during an incident), not a lifecycle transition. STOP-IN-PLACE: the
-    /// scheduler object is retained so a later GC START restarts the SAME instance (its gc_id and lease
-    /// observation history preserved). Idempotent; works even on a not-live/Vanished disk (stopping GC on a
+    /// scheduler object is retained so a later GC START restarts the SAME instance (its in-memory
+    /// `KeeperGc` state preserved). Idempotent; works even on a not-live/Vanished disk (stopping GC on a
     /// sick disk is legitimate). The disk is REQUIRED -- there is no fan-out form.
     if (disk_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS GC STOP requires an explicit disk name");
@@ -2578,8 +2562,7 @@ void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
 void InterpreterSystemQuery::contentAddressedGcStart(const String & disk_name)
 {
     /// SYSTEM CAS GC START (spec §6): restart the background GC scheduler stopped by GC STOP.
-    /// It re-enters the SAME scheduler instance; leadership is NOT auto-restored -- the scheduler re-acquires
-    /// the durable `gc/state` lease through the next round's normal acquisition. Idempotent (a no-op on a
+    /// It re-enters the SAME scheduler instance. Idempotent (a no-op on a
     /// running scheduler). Refuses on a decommissioned/uncertain pool (typed error) -- restarting GC there
     /// would only spin failing rounds. The disk is REQUIRED -- there is no fan-out form.
     if (disk_name.empty())

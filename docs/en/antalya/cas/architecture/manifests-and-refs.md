@@ -15,8 +15,8 @@ that make a CAS pool's state machine: manifests never change, refs are the only 
 moves. This page covers what a manifest contains, how a manifest becomes reachable or becomes an
 orphan, how a ref mutation is published durably, and how a mounted server recovers a ref table
 after a crash or a fresh mount. The write/promote sequence that drives these primitives is on the
-[part-lifecycle page](/antalya/cas/architecture/part-lifecycle); how `GC` folds ref history into
-blob liveness is on the [garbage-collection page](/antalya/cas/architecture/garbage-collection).
+[part-lifecycle page](/antalya/cas/architecture/part-lifecycle); how `GC` derives blob liveness from
+Keeper part records is on the [garbage-collection page](/antalya/cas/architecture/garbage-collection).
 
 ## Part manifests {#part-manifests}
 
@@ -60,10 +60,10 @@ the **same** blobs and moves the ref in one ref-log record — a repoint, covere
 ```mermaid
 stateDiagram-v2
     [*] --> Staged: stageManifest, body PUT write-once
-    Staged --> PrecommitOwned: precommitAdd, ref-log OwnerTransition, plus-one edges on fold
-    PrecommitOwned --> Committed: promote, Precommit to Committed, no edge, net zero
-    Committed --> OwnerRemoved: drop or repoint or namespace removal, minus-one edges
-    OwnerRemoved --> [*]: GC deletes the body after the decrements are sealed
+    Staged --> PrecommitOwned: precommitAdd, ref-log OwnerTransition
+    PrecommitOwned --> Committed: promote, Precommit to Committed
+    Committed --> OwnerRemoved: drop or repoint or namespace removal
+    OwnerRemoved --> [*]: the decommission sweep, for a retired build of a removed member
 
     Staged --> OrphanA: writer died before precommitAdd
     OrphanA --> [*]: writer best-effort delete, else the orphan sweep
@@ -74,92 +74,47 @@ stateDiagram-v2
 
 Two disjoint failure classes matter here:
 
-- **Pre-precommit orphan.** The body exists but no ref-log record ever named it. It contributes no
-  edges and nobody protects it — this is exactly what the orphan sweep below reclaims.
+- **Pre-precommit orphan.** The body exists but no ref-log record ever named it. Nobody protects
+  it — this is what the orphan sweep below reclaims.
 - **Dangling precommit.** The transaction died between `precommitAdd` and `promote`. Nothing wakes
   it up on its own: a `PartWriteTxn` is never persisted. The binding must be removed by a ref-log
   transaction — either the live writer's own `abandon`, or a fenced successor's stale-precommit
   sweep, which removes precommits whose `manifest_ref.writer_epoch < live_epoch`
-  (`Pool/CasRefLedger.cpp`). Only after that minus-one folds does `GC` delete the body, on the
-  ordinary owner-removal path.
+  (`Pool/CasRefLedger.cpp`). The body is then unowned like any other removed manifest.
 
 The writer's own best-effort cleanup deliberately **skips** the precommit target once a precommit
-was even attempted — including an uncertain outcome — because deleting a body that turns out to be
-a live precommit would clamp `GC`'s fold barrier forever.
+was even attempted — including an uncertain outcome — because the body may turn out to be a live
+precommit.
+
+`GC` does not delete manifest bodies: an owner-removed body stays until the decommission drain below
+reaches it, and on a member that is never decommissioned it stays (known gap).
 
 ### The orphan-manifest sweep {#orphan-sweep}
 
-The cursor-paced, budgeted sweep has two stages (`Gc/CasOrphanManifestSweep.cpp`). During fold
-planning, it freezes candidates with exact `GET`s, opens and decodes their bodies, and derives the
-state changes needed to make deletion safe. Only after the round `CAS` adopts those changes does
-phase 18 perform physical deletion. Eligibility comes **exclusively** from the durable watermark
-in the mount lease — there is no age threshold and no time-based grace period anywhere in this
-protocol. No mount lease for the `server_root_id` means no deletion authority means nothing is
-swept for that root.
+`sweepNamespace` (`Gc/CasOrphanManifestSweep.cpp`) runs only in the decommission drain of
+`SYSTEM CAS DROP POOL MEMBER`, one namespace and one build prefix at a time. Eligibility comes
+**exclusively** from the durable watermark in the mount lease — there is no age threshold and no
+time-based grace period. No mount lease for the `server_root_id` means no deletion authority means
+nothing is swept for that root.
 
 ```mermaid
 flowchart TD
-    A["LIST one page of cas/manifests/<br/>freeze candidates with exact GET"] --> B{"build-prefix eligible?<br/>durable watermark fact only"}
+    A["one namespace, one build prefix"] --> B{"build-prefix eligible?<br/>durable watermark fact only"}
     B -->|"epoch less than lease epoch"| ELIG["eligible, old-epoch debris"]
     B -->|"same epoch, min_active_build_sequence clears build_seq"| ELIG
     B -->|"no lease, or epoch ahead, or build may be live"| SKIP["skip"]
-    ELIG --> C["protection view: committed manifests<br/>plus live precommits<br/>plus manifests with an unfolded minus-one"]
-    C -->|"key protected"| SKIP2["skip"]
-    C -->|"not protected"| D{"open and decode<br/>frozen body"}
-    D -->|"cannot open or decode"| U["retain; skipped++ and undecodable++<br/>log exact key; advance decision cursor<br/>continue to later candidates"]
-    D -->|decoded| I{"body ref and namespace<br/>match key?"}
-    I -->|no| BAD["CORRUPTED_DATA<br/>fail-closed round error"]
-    I -->|yes| R["derive exact blob-source<br/>retirement records"]
-    R --> F["round CAS adopts retirements<br/>and advanced cursor"]
-    F --> X["phase 18: deleteExact<br/>key and frozen token"]
-    X -->|Deleted| E["emit ManifestDelete audit event"]
-    X -->|NotFound| NF["spared"]
-    X -->|"token ABA"| ABA["retain replacement;<br/>CORRUPTED_DATA round error"]
+    ELIG --> C["protection view: committed manifests<br/>plus live precommits"]
+    C -->|"view cannot be built"| W["skip the namespace, warn"]
+    C --> L["LIST the build prefix"]
+    L -->|"key protected"| SKIP2["skip"]
+    L -->|"not protected"| X["HEAD, then deleteExact on that token"]
+    X -->|"thrown"| W2["warn, continue"]
 ```
 
-The protection view is built from the **same complete replay** that writer recovery uses, and a
-namespace whose view fails to build is added to an errored set with **all** of its deletions
-skipped — an empty owner set is never substituted for a failed one. A body that cannot be opened
-or decoded is likewise retained: it increments both `skipped` and `undecodable`, advances the page
-decision cursor, logs the exact key, and does not prevent later candidates from being examined. It
-is not repaired or deleted, and remains visible to `ca-fsck` as an unreachable object. A decoded
-body whose ref or namespace does not match its key instead fails the round with `CORRUPTED_DATA`.
-
-For every legal nomination, the sweep derives exact source-retirement records for the body's blob
-entries. The fold places those retirements in the new generation, and the round `CAS` adopts both
-that generation and the advanced sweep cursor before any manifest body is deleted. This is the
-same adopt-before-delete safety ordering as owner removal; here the retirements come directly from
-the frozen body rather than from a ref-log minus-one. Phase 18 then calls `deleteExact` with the
-frozen token. Every outcome emits a `ManifestDelete` audit event: `Deleted` records a physical
-deletion, `NotFound` is spared, and a token ABA retains the replacement and fails the round with
-`CORRUPTED_DATA`.
-
-Operators can find rounds that retained undecodable bodies through
-`system.cas_gc_log` and the `phase_metrics['undecodable']` count on `Phase` rows for
-`orphan_sweep`:
-
-```sql
-SELECT event_time, round_id,
-       phase_metrics['skipped'] AS skipped,
-       phase_metrics['undecodable'] AS undecodable
-FROM system.cas_gc_log
-WHERE event_type = 'Phase'
-  AND phase = 'orphan_sweep'
-  AND phase_metrics['undecodable'] > 0
-ORDER BY event_time DESC;
-```
-
-## Source edges: how a manifest makes blobs live {#source-edges}
-
-Blob liveness is a **set of source edges**, not a counter (`Gc/CasBlobInDegree.h`) — which is what
-makes `GC`'s fold idempotent. An edge id is `sourceEdgeId(ManifestId, path)`, a deterministic hash
-over the namespace, epoch, build sequence, ordinal and path — an edge *identity*, deliberately not
-a content hash and not reconstructable.
-
-Edges are never written at manifest-write time. They materialize only when `GC` folds a ref-log
-transaction that changes ownership: add-precommit means `+1` per blob entry; either removal means
-`-1`; **promote means no edge at all**, because the manifest never loses an owner, so it is net
-zero. Inline entries produce no edges — they have no separate object to reclaim.
+The protection view is built from the **same complete replay** that writer recovery uses, from the
+caller's one frozen catalog cut; a namespace whose view fails to build (a missing `_ckpt`, a corrupt
+snapshot) is skipped with a warning — an empty owner set is never substituted for a failed one.
+`Gone` and `Mismatch` delete outcomes (another writer reclaimed the key) are spared silently.
 
 ## The ref table {#ref-table}
 
@@ -196,8 +151,7 @@ as `CORRUPTED_DATA`.
 
 The op vocabulary is deliberately tiny: `NamespaceBirth`, `OwnerTransition{old?, new?}`,
 `SetPublishedAt`, `RemoveNamespace`. There are exactly four legal `OwnerTransition` shapes — add
-precommit, remove precommit, remove committed, and promote — enumerated identically by the state
-machine and by `GC`'s edge extractor, so the two readers of the format cannot drift.
+precommit, remove precommit, remove committed, and promote — enumerated by the state machine.
 
 Logs are pure conditional creates on write-once keys. There is no append-to-object and no
 `CAS`-swapped mutable pointer anywhere in the ref lane. The writer never deletes ref objects; only
@@ -285,8 +239,5 @@ of the negative, only `Yes` is fence-gated.
 ## Namespace removal {#namespace-removal}
 
 Namespace removal has no physical-empty handshake. The writer changes the catalog row from `Live`
-to `Removing`, appends the exact removals plus `RemoveNamespace`, and deletes nothing itself. The
-`GC` fold attaches cleanup evidence to that life row; a later invocation's pre-fold drain exact-CAS
--deletes the matching `Removing` catalog row before any successor plan publishes. A perpetual
-namespace janitor and the orphan-manifest sweep reclaim physical debris independently — a same-name
-birth waits only for the catalog row to disappear, never for physical emptiness.
+to `Removing`, appends the exact removals plus `RemoveNamespace`, and deletes nothing itself.
+Nothing drains the `Removing` row, so a same-name birth waits forever (known gap).

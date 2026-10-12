@@ -79,9 +79,6 @@ struct PoolConfig
     /// the cache and every catalog write reads first. 16 MiB: the catalog is under 1 MiB, and the
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
-    /// Blob target shards for GC. Default 1 (a single shard, i.e. no fan-out). Creation-time only;
-    /// the pool is authoritative on reopen. This is the BLOB-HASH-prefix reducer axis.
-    uint64_t gc_shards = 1;
     /// Bounded pool size for the per-hash freshness
     /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
     /// take hours sequential). Every job internally catches its own exceptions (never wedges the round;
@@ -237,7 +234,6 @@ struct PoolConfig
     {
         return RefLedgerConfig{
             .server_root_id = server_root_id,
-            .gc_shards = gc_shards,
             .snapshot_log_count_threshold = snapshot_log_count_threshold,
             .snapshot_log_bytes_threshold = snapshot_log_bytes_threshold,
             .snapshot_publish_backoff_initial_ms = snapshot_publish_backoff_initial_ms,
@@ -536,9 +532,9 @@ public:
     void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RefPublishedAtUpdate &)> mutator);   /// one set_published_at txn
     /// The catalog transition to `Removing` happens first, then one ref-log transaction naming every
-    /// owner's exact removal followed by `remove_namespace`. Performs no physical deletion: GC records
-    /// folded terminal evidence and later removes the exact catalog row, while the perpetual janitor
-    /// reclaims dead-life stream, checkpoint, and namespace-file bytes independently.
+    /// owner's exact removal followed by `remove_namespace`. Performs no physical deletion, and nothing
+    /// later removes the `Removing` catalog row or the dead life's stream, checkpoint and namespace-file
+    /// bytes (known gap).
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
     /// Decommission-only exact-life overload; never re-resolves by namespace name.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
@@ -771,11 +767,6 @@ public:
     /// Cheap predicate so query-frequency hooks can skip constructing the CasEvent (+ its detail map)
     /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
-
-    /// Read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
-    /// never GC'd). Best-effort: its one remaining caller is `tryRemountOnce`'s MountRemount audit
-    /// event, which reports round 0 on any read failure rather than let the error escalate.
-    uint64_t currentGcRound() const;
 
 private:
 

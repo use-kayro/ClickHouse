@@ -2,7 +2,6 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -389,19 +388,6 @@ TEST(CASObservability, CaInspectDecodesMountLeaseToJson)
     EXPECT_NE(json.find("\"writer_epoch\":5"), String::npos);
     EXPECT_NE(json.find("\"write_attempt_id\":\"00112233445566778899aabbccddeeff\""), String::npos);
     EXPECT_NE(json.find("host1"), String::npos);
-}
-
-TEST(CASObservability, CaInspectDecodesGcStateToJson)
-{
-    Layout layout("p");
-    GcState state;
-    state.round = 42;
-    state.gc_shards = 4;
-
-    const String key = layout.gcStateKey();
-    const String json = caInspectToJson(layout, key, encodeGcState(state));
-    EXPECT_NE(json.find("\"round\":42"), String::npos);
-    EXPECT_NE(json.find("\"gc_shards\":4"), String::npos);
 }
 
 /// `ObjectKind`/`ProvenanceOp` render as their full wire words, not the enumerator spelling. Loops

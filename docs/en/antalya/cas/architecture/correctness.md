@@ -27,16 +27,14 @@ The full model index (source `.tla` files and proof-run records) lives at
 | `CaBlobPublishCore.tla` | Split `HEAD` from unconditional publication while preserving logical content, fresh incarnation identity, monotonic `publication_attempted`, fence safety, and readiness only after metadata reconciliation | Eleven sabotage configurations cover condemned adoption, stale exact delete, ambiguous copy/PUT landing, envelope reuse after a later miss, missing precommit/meta reconciliation, fence loss, and wrong-content publication; three witnesses prove the safe paths are reachable |
 | `CaIncarnationCore.tla` | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN` — the safety spine for the whole GC core | `sab_unconddelete`: replacing the exact-token delete with an unconditional one lets a stale delete kill a replacement incarnation |
 | `CaBuildRootPrecommit.tla` | `INV_NO_DANGLE_COMMITTED` — a committed manifest never references an absent blob | Reproduces the dangling-manifest hazard exactly: `WriteBlob → AdoptBlob → BuildDie → GcDelete → Commit` with no presence re-check publishes a manifest over a deleted blob |
-| `CaGcLeaseCore.tla` | `NoFalseSteal` — no leader steals leadership from a live, mid-round incumbent | Without the advisory heartbeat, a frozen `seq` during a round looks identical to a dead leader, and a second leader steals from the alive one |
 | `CaCasMountCore.tla` | Reclaim exclusivity for an expired mount | `sab_wallclockreclaim`: trusting the foreign mount body's wall-clock timestamp (instead of observing a stable token on the reclaimer's own monotonic clock) breaks exclusivity |
-| `CaB140DangleMerge.tla` | `INV_NO_LOSS` across a GC lease handoff | Trim-before-durable: a fold cursor trimmed from in-memory state (not the durable snapshot) skips a live edge across a lease handoff, and the referenced blob is deleted while still live |
-| `CaGcRootLocalPartManifestCore.tla` | `INV_NO_DANGLE` over the root-local part-manifest fold | `sab_lazyfenceunsafe`: reusing a stale parent fence position instead of a fresh all-shard fence dangles a live object |
-| `CaGcShardIncarnationCore.tla` | `INV_NO_DANGLING` — safety of registry-free namespace discovery | `sab_pathkeyedcursor`: dropping the per-shard incarnation from the fold cursor reintroduces an ABA hazard on delete-then-recreate at the same path |
-| `CaGcAckFloorZombie.tla` | `INV_NO_DANGLE` under two fully-interleaved GC leaders | `sab_eagerdelete`: a leader deleting its own fresh (not-yet-pending) graduations — the pre-amendment single-phase behavior — dangles when a deposed leader's pass overlaps a live one |
-| `CaGcRoundDeferCore.tla` | `NoOverDelete` — a deferred round may skip a rebuild only when nothing destructive is pending | `sab_graduate_on_stale`: dropping the "an unfolded delta covers this blob" guard lets a deferred round delete a blob its own unread history still protects |
 | `CaEdgeBeforeObserve.tla` | The writer/`GC` publish order is safe to simplify | `sab_late_edge`: allowing adoption before the precommit closure is durable (the pre-fix order) dangles |
 | `CaGcCondemnMarkerGate.tla` | Graduation requires confirmed durable `Condemned` evidence | Swallowing a failed asynchronous condemn-marker write let a writer adopt a token a later graduation was about to delete |
 | `CaRefTableSnapshotLogCore.tla` | Dense, per-life ref ids with an in-band `_ckpt` recovery frontier | `sab_scanistruth`: trusting a listing as the source of truth for "acked" reproduces the real production incident where a `LIST` omitted two already-durable, already-acknowledged ref entries |
+
+The models of the S3-listing GC round — its lease, fold, shards, ack floor and round deferral —
+were retired with it; their files under `docs/superpowers/models/` are history, not a description
+of the current GC.
 
 ## Soak and chaos: the empirical oracle {#soak-and-chaos}
 
@@ -48,7 +46,7 @@ replicas against one shared pool under a seeded workload and a seeded fault inje
 idealized model necessarily abstracts away: the dangling-manifest hazard and the condemned-body replacement orphan were
 both first observed live in `system.cas_log` during soak runs, before either got a focused model. Each
 quiesced soak checkpoint cross-checks `SQL` results against a model oracle and runs
-`clickhouse-disks ca-fsck` plus `ca-gc-dryrun`, asserting `dangling=0`.
+`clickhouse-disks ca-fsck`, asserting `dangling=0`.
 
 The relationship runs in both directions: the historical resurrect-reupload orphan (`utils/ca-soak` scenario
 S30, root-caused via `system.cas_log`) got a focused `TLA+` reproduction that proved the fix and

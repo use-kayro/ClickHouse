@@ -10,60 +10,8 @@
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-/// ===================== CLEANUP RANGES ARE COMPUTED, NOT ENUMERATED =====================
-///
-/// `planRefCleanup` is pure, so the boundary arithmetic is pinned directly rather than inferred from a
-/// round's side effects. Its sole coverage authority is the checkpoint-named base; a listed snapshot
-/// is merely a physical observation until the same-id triple has been validated.
-
-TEST(CASGCFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCursor)
-{
-    RefTableListing listing;
-    listing.logs = {{1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}};
-    listing.snapshots = {{1, 5}};
-
-    /// No checkpoint means no recovery base at all. A snapshot PUT that has not reached the `_ckpt`
-    /// CAS must retain every listed object.
-    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 4});
-    EXPECT_TRUE(without.deletable_logs.empty());
-    EXPECT_TRUE(without.deletable_snapshots.empty());
-
-    /// A checkpoint BELOW the cursor tightens it to {1,2}. Its exact `_log` witness must survive,
-    /// so cleanup may remove only the strictly older entry.
-    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 2});
-    EXPECT_EQ(with.deletable_logs, (std::vector<RefTxnId>{{1, 1}}))
-        << "the checkpoint witness and everything above it must survive";
-
-    /// Once validation has established a later checkpoint base, its earlier covered history is
-    /// reclaimable even if the hot fold cursor has not yet reached that base.
-    const RefCleanupPlan ahead = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 9});
-    EXPECT_EQ(ahead.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}, {1, 3}, {1, 4}}));
-    EXPECT_EQ(ahead.deletable_snapshots, (std::vector<RefTxnId>{{1, 5}}));
-}
-
-TEST(CASGCFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStrictlyOlderOnesGo)
-{
-    RefTableListing listing;
-    listing.logs = {{1, 1}, {1, 2}, {1, 3}};
-    listing.snapshots = {{1, 1}, {1, 2}, {1, 3}};
-
-    /// A LIST-only newest snapshot is never a cleanup boundary.
-    const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 3});
-    EXPECT_TRUE(without.deletable_snapshots.empty());
-
-    /// With the checkpoint AT {1,2}, only {1,1} is strictly below it. The snapshot the checkpoint names
-    /// is the one a recovering reader samples, so it must survive its own cleanup.
-    const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 3}, RefTxnId{1, 2});
-    EXPECT_EQ(with.deletable_snapshots, (std::vector<RefTxnId>{{1, 1}}));
-
-    /// The oldest checkpoint deletes nothing at all.
-    const RefCleanupPlan oldest = planRefCleanup(listing, RefTxnId{1, 3}, RefTxnId{1, 1});
-    EXPECT_TRUE(oldest.deletable_snapshots.empty());
-}
-
-/// Cleanup shares recovery's validator rather than inferring its own authority from a LIST. The
-/// missing-base case is the no-checkpoint range above; the three physical triple failures below must
-/// each reject exactly the checkpoint-named candidate.
+/// Recovery's checkpoint-base validator: the three physical triple failures below must each reject
+/// exactly the checkpoint-named candidate.
 TEST(CASGCFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnapshotAndSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -136,12 +84,7 @@ TEST(CASGCFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCa
         {
         }
 
-        RefTableListing listing;
-        listing.logs = {{1, 1}, seal_id, base_id};
-        listing.snapshots = {{1, 1}, base_id};
-        const RefCleanupPlan plan = planRefCleanup(listing, base_id, validated_base);
-        EXPECT_TRUE(plan.deletable_logs.empty());
-        EXPECT_TRUE(plan.deletable_snapshots.empty());
+        EXPECT_FALSE(validated_base.has_value());
     };
 
     expect_no_deletion_authority(RootNamespace{"00/cleanup-base-missing-backlink@cas@"}, std::nullopt);

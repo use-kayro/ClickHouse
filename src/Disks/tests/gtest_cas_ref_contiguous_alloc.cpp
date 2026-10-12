@@ -299,24 +299,6 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch + 1, 1}));
 }
 
-TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    const Layout layout("p");
-    CasRequests requests(backend, Fence::open());
-    CasOperation op = requests.admit();
-    const PoolMeta created = PoolMeta::createOrValidate(
-        op, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
-        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
-    EXPECT_EQ(created.gc_shards, 4u);
-
-    const PoolMeta reopened = PoolMeta::createOrValidate(
-        op, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
-        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/false);
-    EXPECT_EQ(reopened.gc_shards, 4u);
-    EXPECT_EQ(decodePoolMeta(op.read(layout.poolMetaKey(), Retry::standard())->bytes).gc_shards, 4u);
-}
-
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
 /// A known-durable install failure must replay before the next id is derived. Replay installs the
 /// stranded transaction, so the next append derives its real contiguous successor.

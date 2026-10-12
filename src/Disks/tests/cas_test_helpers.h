@@ -10,13 +10,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -409,11 +405,6 @@ inline DB::Cas::BlobRef writeBlobRaw(
     return id;
 }
 
-/// Forward declaration: `appendOwnerEvent` (below) calls `registerNamespaceRaw`, which after Task 4
-/// is a no-op (LIST-based discovery needs no explicit registration) defined further down.
-inline void registerNamespaceRaw(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns);
-
 /// Write a part-manifest body object directly via the manifest codec, exactly as PartWriteTxn::stageManifest
 /// emits it. Returns the ManifestId. Used by GC fold/retire/fsck tests to stage owner targets.
 inline DB::Cas::ManifestId writeManifestRaw(
@@ -597,116 +588,6 @@ inline void deleteManifestBody(
         (*op).remove(key, h->etag, DB::Cas::Retry::standard());
 }
 
-/// Formerly wrote the namespace into `gc/registry`. Real write helpers now admit the authoritative
-/// catalog row themselves, so this legacy fixture hook has no independent registration work.
-inline void registerNamespaceRaw(
-    DB::Cas::Backend & /*backend*/, const DB::Cas::Layout & /*layout*/, const DB::Cas::RootNamespace & /*ns*/)
-{
-    /// No-op: Task 4 deleted the registry; `cas/ref_catalog` is now the discovery authority.
-}
-
-/// Encode a CAGS document carrying only {round} — everything else defaulted. Callers that only care
-/// about this field (e.g. `injectRetire`) use this shorthand.
-inline String encodeMinimalGcState(uint64_t round)
-{
-    DB::Cas::GcState state;
-    state.round = round;
-    return DB::Cas::encodeGcState(state);
-}
-
-/// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
-/// GC ledger's condemned state at an arbitrary round. The entries are written into the adopted seal's
-/// shard run as `RunMarker::Condemned` sentinel rows at the zero source id -- the shape a real round
-/// leaves, since there is no separate retired-list object. Also sets {round} on gc/state. An entry's
-/// `condemn_round` defaults to `round` when left 0. An empty `entries` set just advances {round}.
-///
-/// The rows are written from the caller's entries VERBATIM rather than folded out of synthetic deltas.
-/// A fold mints each row's incarnation from a live HEAD of the blob, which can express neither of the
-/// two shapes this fixture exists to build: an entry condemning an incarnation NO object carries (a
-/// phantom, for the tests that check a condemnation aimed elsewhere spares the live object), and an
-/// entry for a blob whose body is already gone.
-inline void injectRetire(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    uint64_t round, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
-{
-    OperationForTest operation(backend);
-    DB::Cas::GcState gc_state;
-    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (existing_state)
-        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
-    gc_state.round = round;
-
-    if (!entries.empty())
-    {
-        const uint64_t generation = 1;
-        const uint64_t attempt = 1;
-
-        /// The writer's contract: records arrive in non-decreasing `(ref, source_id)` order, and a
-        /// sentinel row is the only row a blob may have at the zero source id.
-        std::sort(entries.begin(), entries.end(),
-                  [](const DB::Cas::RetiredEntry & a, const DB::Cas::RetiredEntry & b) { return a.ref < b.ref; });
-
-        String run_bytes;
-        /// `UINT64_MAX` is the summary's own "no non-pending entry" value, and round 0 is a real round,
-        /// so a zero initializer here would claim the oldest possible condemnation instead of none.
-        uint64_t oldest_nonpending = UINT64_MAX;
-        uint64_t pending_total = 0;
-        {
-            DB::WriteBufferFromString out(run_bytes);
-            DB::Cas::SourceEdgeRunWriter writer(out);
-            for (const DB::Cas::RetiredEntry & e : entries)
-            {
-                const uint64_t condemn_round = e.condemn_round ? e.condemn_round : round;
-                if (e.delete_pending)
-                    ++pending_total;
-                else
-                    oldest_nonpending = std::min(oldest_nonpending, condemn_round);
-                writer.append(DB::Cas::SourceEdgeRecord{
-                    .ref = e.ref,
-                    .source_id = DB::UInt128{0},
-                    .marker = DB::Cas::RunMarker::Condemned,
-                    .delete_pending = e.delete_pending,
-                    .token = e.token,
-                    .size = e.size,
-                    .condemn_round = condemn_round,
-                    .marker_confirmed = e.marker_confirmed});
-            }
-            writer.finish();
-            out.finalize();
-        }
-
-        const String run_key = layout.blobTargetRunKey(generation, attempt, shard, 0);
-        DB::Cas::orThrow((*operation).create(run_key, run_bytes, DB::Cas::Retry::standard()),
-                         "seed the condemned run at " + run_key);
-
-        DB::Cas::CasFoldSeal seal;
-        seal.generation = generation;
-        seal.blob_target_runs.push_back(DB::Cas::RunRef{.key = run_key,
-                                                       .checksum = DB::Cas::sourceEdgeRunChecksum(run_bytes),
-                                                       .shard = shard,
-                                                       .key_generation = generation});
-        /// Totality over gc_shards so a later real round's graduation/carry reads it zero-I/O.
-        const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
-        for (uint64_t s = 0; s < gc_shards; ++s)
-            seal.condemned_summary[s] = DB::Cas::CondemnedSummary{};
-        DB::Cas::CondemnedSummary cs;
-        cs.condemned_total = entries.size();
-        cs.pending_total = pending_total;
-        cs.oldest_nonpending_condemn_round = oldest_nonpending;
-        seal.condemned_summary[shard] = cs;
-        (*operation).create(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal), DB::Cas::Retry::standard());
-
-        gc_state.snap_generation = generation;
-        gc_state.snap_attempt = attempt;
-    }
-
-    const String state = DB::Cas::encodeGcState(gc_state);
-    if (!existing_state)
-        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
-    else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
-}
-
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
@@ -779,12 +660,12 @@ DB::Cas::PoolPtr openPoolForTest(std::shared_ptr<BackendT> backend)
 /// new-pool initializer. The default `blob_header_len`/`blob_hash_algo` match `PoolConfig`'s defaults,
 /// so a later `Pool::open` with a default config validates cleanly.
 inline void seedPoolMetaForRestart(
-    DB::Cas::Backend & backend, const String & pool_prefix = "p", uint64_t gc_shards = 1)
+    DB::Cas::Backend & backend, const String & pool_prefix = "p")
 {
     const DB::Cas::Layout layout(pool_prefix);
     OperationForTest operation(backend);
     DB::Cas::PoolMeta::createOrValidate(
-        *operation, layout, /*blob_header_len=*/256, gc_shards,
+        *operation, layout, /*blob_header_len=*/256,
         DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     if (!(*operation).read(layout.refCatalogKey(), DB::Cas::Retry::standard()))
         DB::Cas::CasRefCatalog::initializeEmptyForNewPool(*operation, layout);
@@ -862,86 +743,6 @@ inline std::optional<DB::Cas::LoadedMeta> loadMetaForTest(DB::Cas::Backend & bac
     return DB::Cas::loadMeta(*operation, layout, legacyMetaTestRef(hash));
 }
 
-/// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.
-inline uint64_t currentGenerationOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
-{
-    OperationForTest op(backend);
-    const auto got = (*op).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (!got)
-        return 0;
-    return DB::Cas::decodeGcState(got->bytes).snap_generation;
-}
-
-/// The adopted attempt (snap_attempt pointer in gc/state), or 0 when absent.
-inline uint64_t currentAttemptOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
-{
-    OperationForTest op(backend);
-    const auto got = (*op).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (!got)
-        return 0;
-    return DB::Cas::decodeGcState(got->bytes).snap_attempt;
-}
-
-/// The current seal's `blob_target_runs` filtered to `shard` (2026-07-02 T0: consumers resolve runs
-/// through seal refs, not by key construction). Scans downward from the current generation for the most
-/// recent existing fold seal; absent => empty.
-inline std::vector<DB::Cas::RunRef> runsForShard(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
-{
-    const uint64_t gen = currentGenerationOf(backend, layout);
-    const uint64_t attempt = currentAttemptOf(backend, layout);
-    OperationForTest op(backend);
-    for (uint64_t g = gen; ; --g)
-    {
-        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), DB::Cas::Retry::standard()))
-        {
-            const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
-            std::vector<DB::Cas::RunRef> out;
-            for (const DB::Cas::RunRef & r : seal.blob_target_runs)
-                if (r.shard == shard)
-                    out.push_back(r);
-            return out;
-        }
-        if (g == 0)
-            return {};
-    }
-}
-
-/// Stream the sealed in-degree run segments `runs` and count the active source edges (`RunMarker::Edge`
-/// rows) for `ref`. Test-side replacement for the deleted per-blob point query `inDegreeInGeneration`
-/// (codecs-v3 phase 5: a `cas_run` is a sequential NDJSON stream with no random access, so a blob's
-/// in-degree is recomputed by a full stream-and-count rather than a seek). A condemned / zero-marker
-/// row is not an active edge, so it contributes 0 — matching the old point query's semantics.
-inline int64_t inDegreeInRuns(
-    DB::Cas::Backend & backend, const std::vector<DB::Cas::RunRef> & runs, const DB::Cas::BlobRef & ref)
-{
-    OperationForTest operation(backend);
-    int64_t degree = 0;
-    for (const DB::Cas::RunRef & run : runs)
-    {
-        auto r = DB::Cas::openSourceEdgeRun(*operation, run.key);
-        String k;
-        String p;
-        while (r.next(k, p))
-        {
-            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Edge)
-                continue;
-            DB::Cas::BlobRef row_ref;
-            DB::UInt128 source_id{};
-            DB::Cas::SourceEdgeKeyCodec::parse(k, row_ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-            if (row_ref == ref)
-                ++degree;
-        }
-    }
-    return degree;
-}
-
-/// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
-inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
-{
-    return inDegreeInRuns(backend, runsForShard(backend, layout, /*shard*/0), legacyMetaTestRef(hash));
-}
-
 /// The single named entry point for the nonproduction CA shapes this test tree constructs directly,
 /// rather than through the production birth/write paths. Every raw fixture below is one of three
 /// deliberate divergences from what production can ever produce, gathered here under one name so a
@@ -971,89 +772,6 @@ namespace fixture
             fixture_incarnation = 1;
         return DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, fixture_incarnation);
     }
-}
-
-/// Seed the ADOPTED fold seal's catalog-life coverage row for `ns` and point `gc/state` at it, bypassing a
-/// real round. This is the durable fact the sweep's §6 deletion premise reads
-/// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
-/// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
-/// `hold`, when set, makes the row classification `Clamped` — the strict grammar `encodeFoldSeal`
-/// enforces in both directions, so a hold and a non-clamped classification cannot be seeded together.
-///
-/// SHARP EDGE, HANDLED HERE SO NO CALLER HAS TO KNOW IT: a fold seal must carry a `condemned_summary`
-/// entry for EVERY shard in `0..gc_shards-1`. A later real round adopts this object as its PARENT and
-/// throws `CORRUPTED_DATA` — "parent fold seal (generation G, attempt A) lacks a condemned_summary
-/// entry for gc-shard N — the seal is not total over gc_shards" — on a seal that is missing one. The
-/// symptom is nowhere near the cause: the round fails at fold time, or (if it fails before taking the
-/// lease) merely reports `acquired_lease == false`, so a test that seeds a partial seal looks like a
-/// leadership problem. This helper fills the map from `gc/state`'s own `gc_shards`, so seeding a
-/// coverage row is safe to combine with real rounds.
-///
-/// One thing it does NOT do: create `gc/state` in a state a first-ever `Gc` round can take the lease
-/// over. `acquireOrRenewLease` only creates-and-owns when `gc/state` is ABSENT, so seeding before the
-/// first round makes that round back off. Seed AFTER the first round (passing that round's
-/// `currentGenerationOf`/`currentAttemptOf`) when a test drives real rounds.
-inline void seedFoldCursorForTest(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
-    DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
-    uint64_t generation = 1, uint64_t attempt = 1)
-{
-    OperationForTest operation(backend);
-    DB::Cas::NamespaceLifeId life = fixture::fixtureLife(ns);
-    const DB::Cas::CasRefCatalog::Snapshot catalog_cut = DB::Cas::CasRefCatalog::read(*operation, layout);
-    const auto catalog_it = std::find_if(
-        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
-        [&](const DB::Cas::CatalogEntry & entry) { return entry.ns.string() == ns.string(); });
-    if (catalog_it == catalog_cut.catalog.entries.end())
-    {
-        DB::Cas::CatalogEntry entry;
-        entry.ns = ns;
-        entry.state = DB::Cas::NsState::Live;
-        entry.incarnation = fixture::fixtureLife(ns).incarnation;
-        DB::Cas::CasRefCatalog::casAdmitEntry(*operation, layout, 1, entry);
-        life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, entry.incarnation);
-    }
-    else
-    {
-        life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, catalog_it->incarnation);
-    }
-
-    const String seal_key = layout.foldSealKey(generation, attempt);
-    DB::Cas::CasFoldSeal seal;
-    const auto existing = (*operation).read(seal_key, DB::Cas::Retry::standard());
-    if (existing)
-        seal = DB::Cas::decodeFoldSeal(existing->bytes);
-    seal.generation = generation;
-
-    DB::Cas::RefCoverage cov;
-    cov.classification = hold ? DB::Cas::CoverageClass::Clamped : DB::Cas::CoverageClass::Folded;
-    cov.last_folded_ref_id = cursor;
-    cov.hold = hold;
-    seal.ref_lives[life.incarnation].coverage = cov;
-
-    DB::Cas::GcState gc_state;
-    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
-    if (existing_state)
-        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
-
-    /// Totality over `gc_shards` — see the doc comment's SHARP EDGE note for what throws without it.
-    const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
-    for (uint64_t s = 0; s < gc_shards; ++s)
-        seal.condemned_summary.emplace(s, DB::Cas::CondemnedSummary{});
-
-    const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
-    if (existing)
-        (*operation).replace(seal_key, seal_bytes, existing->etag, DB::Cas::Retry::standard());
-    else
-        (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
-
-    gc_state.snap_generation = generation;
-    gc_state.snap_attempt = attempt;
-    const String state = DB::Cas::encodeGcState(gc_state);
-    if (!existing_state)
-        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
-    else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
 /// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
@@ -1134,7 +852,7 @@ inline void casAdmitEntry(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     entry.ns = ns;
     entry.state = NsState::Live;
     entry.incarnation = fixture::fixtureLife(ns).incarnation;
-    CasRefCatalog::casAdmitEntry(*operation, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(*operation, layout, entry);
 }
 
 namespace fixture

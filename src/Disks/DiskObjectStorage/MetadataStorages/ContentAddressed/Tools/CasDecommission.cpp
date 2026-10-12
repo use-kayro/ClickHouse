@@ -287,7 +287,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
             report.manifest_debris_removed += sweepNamespace(
                 *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, server_roots,
-                &report.warnings);
+                report.warnings);
     }
 
     /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses
@@ -320,9 +320,9 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             });
         if (victim_owned_count > 0)
             report.warnings.push_back(
-                "pool member decommission underway: " + std::to_string(victim_owned_count)
-                + " namespace(s) are still owned by this member; upcoming GC rounds perform the final "
-                  "cleanup — re-run this command afterwards to retire the slot");
+                "pool member decommission incomplete: " + std::to_string(victim_owned_count)
+                + " namespace(s) of this member keep their `Removing` catalog row, which nothing drains "
+                  "(known gap), so the slot is kept");
     }
 
     /// Retire the slot strictly last and only after a clean drain. Copy the layout before

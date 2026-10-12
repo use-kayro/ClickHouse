@@ -22,7 +22,6 @@ namespace PoolMetaWire
 {
     constexpr WireKey pool_id{"pool_id"};
     constexpr WireKey blob_header_len{"blob_header_len"};
-    constexpr WireKey gc_shards{"gc_shards"};
     constexpr WireKey min_reader_generation{"min_reader_generation"};
     constexpr WireKey algos_used{"algos_used"};
 }
@@ -79,7 +78,6 @@ String encodePoolMeta(const PoolMeta & pm)
     bool first = true;
     writeHex128Field(out, PoolMetaWire::pool_id, pm.pool_id, first);
     writeNumberField(out, PoolMetaWire::blob_header_len, pm.blob_header_len, first);
-    writeNumberField(out, PoolMetaWire::gc_shards, pm.gc_shards, first);
     writeNumberField(out, PoolMetaWire::min_reader_generation, pm.min_reader_generation, first);
     /// Sized by the whole algo vocabulary and safe to index by `algos_used`: the validation above
     /// admits only known algo bytes in strictly increasing order, so the vector cannot be longer
@@ -114,7 +112,6 @@ PoolMeta decodePoolMeta(std::string_view data)
 
     PoolMeta pm;
     bool saw_pid = false;
-    bool saw_gc_shards = false;
     String key;
     while (r.nextKey(key))
     {
@@ -125,11 +122,6 @@ PoolMeta decodePoolMeta(std::string_view data)
         }
         else if (key == PoolMetaWire::blob_header_len)
             pm.blob_header_len = r.readU64Number();
-        else if (key == PoolMetaWire::gc_shards)
-        {
-            pm.gc_shards = r.readU64Number();
-            saw_gc_shards = true;
-        }
         else if (key == PoolMetaWire::min_reader_generation)
             pm.min_reader_generation = r.readU64Number();
         else if (key == PoolMetaWire::algos_used)
@@ -142,8 +134,6 @@ PoolMeta decodePoolMeta(std::string_view data)
     }
     if (!saw_pid)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pool_id");
-    if (!saw_gc_shards || pm.gc_shards == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gc_shards");
     if (!body_in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: junk after body object");
     if (!in.eof())

@@ -26,10 +26,8 @@ namespace DB::Cas
 
 /// Bulk-append writer for canonical CAS JSON text. Replaces WriteBuffer in every CAS encode
 /// path: appends are inline stores into an owned String (no per-call finalized/canceled
-/// lifecycle, no per-byte writes, no heap allocations per record). Two usage modes:
-/// whole-object assembly (bounded formats; `take` at the end) and line-scratch (RecordStream:
-/// assemble one line, bulk-write it to the surrounding WriteBuffer, `clear` — memory stays
-/// bounded by the largest line). The JSON escaping semantics of `stringValue` are statically
+/// lifecycle, no per-byte writes, no heap allocations per record); `take` hands over the assembled
+/// object. The JSON escaping semantics of `stringValue` are statically
 /// fixed to the CAS canon (forward slashes NOT escaped); process-wide FormatSettings cannot
 /// influence CAS bytes.
 class CasJsonWriter
@@ -122,11 +120,6 @@ public:
     std::string_view view() const
     {
         return buf;
-    }
-
-    void clear()
-    {
-        buf.clear();
     }
 
     String take() &&

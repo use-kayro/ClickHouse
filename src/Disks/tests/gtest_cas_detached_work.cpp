@@ -160,7 +160,6 @@ public:
               layout,
               RefLedgerConfig{
                   .server_root_id = "test",
-                  .gc_shards = 1,
                   .snapshot_log_count_threshold = 0,
                   .snapshot_log_bytes_threshold = 1ULL << 40,
                   .snapshot_publish_backoff_initial_ms = 0,

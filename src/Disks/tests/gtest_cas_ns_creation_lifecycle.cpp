@@ -126,7 +126,7 @@ TEST(CASNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
     const CreatorFence creator = creatorFence("srv1", /*writer_epoch=*/5);
 
     const auto outcome = CasRefCatalog::createNamespace(
-        op, layout, 1, ns, creator);
+        op, layout, ns, creator);
     EXPECT_EQ(outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
@@ -160,10 +160,10 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsLiveEntryReportsSuper
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
-    ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, ns, creator),
                CasRefCatalog::NamespaceCreationOutcome::Live);
 
-    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2)),
+    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, ns, creatorFence("srv2", 2)),
               CasRefCatalog::NamespaceCreationOutcome::Superseded);
 
     /// The refused call left the winner's `Live` entry exactly as it was.
@@ -182,13 +182,12 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsRemovingEntryReportsS
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
-    ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, ns, creator),
                CasRefCatalog::NamespaceCreationOutcome::Live);
-    ASSERT_EQ(CasRefCatalog::beginRemoving(op, layout, *findEntryForTest(CasRefCatalog::read(op, layout).catalog, ns),
-                                          /*removal_started_round=*/1),
+    ASSERT_EQ(CasRefCatalog::beginRemoving(op, layout, *findEntryForTest(CasRefCatalog::read(op, layout).catalog, ns)),
               CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
-    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2)),
+    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, ns, creatorFence("srv2", 2)),
               CasRefCatalog::NamespaceCreationOutcome::Superseded);
 
     /// The refused call left the concurrent drop's `Removing` entry exactly as it was.
@@ -239,7 +238,7 @@ TEST(CASNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
     /// thread.
     backend->withdraw_after_ckpt_write = true;
     CasOperation creating_op = requests.admit([&backend] { return backend->admitted; });
-    const auto outcome = CasRefCatalog::createNamespace(creating_op, layout, 1, ns, creator);
+    const auto outcome = CasRefCatalog::createNamespace(creating_op, layout, ns, creator);
     EXPECT_EQ(outcome, CasRefCatalog::NamespaceCreationOutcome::FencedOut);
     backend->withdraw_after_ckpt_write = false;
     backend->admitted = true;
@@ -275,7 +274,7 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsStillCreatingEntryRep
     /// observes when a sibling thread's `casAdmitEntry` has landed but its `completeCreation` has not.
     backend->withdraw_after_ckpt_write = true;
     CasOperation winner_op = requests.admit([&backend] { return backend->admitted; });
-    const auto winner_outcome = CasRefCatalog::createNamespace(winner_op, layout, 1, ns, winner);
+    const auto winner_outcome = CasRefCatalog::createNamespace(winner_op, layout, ns, winner);
     ASSERT_EQ(winner_outcome, CasRefCatalog::NamespaceCreationOutcome::FencedOut);
     backend->withdraw_after_ckpt_write = false;
     backend->admitted = true;
@@ -286,7 +285,7 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsStillCreatingEntryRep
     /// exercising exactly the case `resolveNamespaceLife`'s "own fence -> completeCreation" branch is
     /// built to resume, never a `LOGICAL_ERROR` abort.
     const auto loser_outcome = CasRefCatalog::createNamespace(
-        op, layout, 1, ns, winner);
+        op, layout, ns, winner);
     EXPECT_EQ(loser_outcome, CasRefCatalog::NamespaceCreationOutcome::Superseded);
 
     /// Nothing about the winner's own still-`Creating` entry was disturbed by the loser's refused call.
@@ -326,12 +325,12 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsFullCreateBetweenPreC
     CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest([&]
     {
         const auto winner_outcome = CasRefCatalog::createNamespace(
-            op, layout, 1, ns, winner);
+            op, layout, ns, winner);
         ASSERT_EQ(winner_outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
     });
 
     const auto loser_outcome = CasRefCatalog::createNamespace(
-        op, layout, 1, ns, loser);
+        op, layout, ns, loser);
     EXPECT_EQ(loser_outcome, CasRefCatalog::NamespaceCreationOutcome::Superseded);
 
     /// Exactly one row for `ns`, owned by the winner, at `Live` -- the loser's refused admission left
@@ -364,7 +363,7 @@ TEST(CASNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
 
     /// Write 1 only -- models "crash after write 1": no _ckpt yet, entry still Creating.
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
 
     /// A REAL concurrent write, smuggled in just before step 3's own catalog read -- the first one
     /// `completeCreation` performs, since step 2 touches only the `_ckpt`. `decide` therefore receives
@@ -413,7 +412,7 @@ TEST(CASNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
     const CreatorFence thief = creatorFence("srv2", 9);
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
 
     /// The same steal as the test above and in the same window, but this one ALSO withdraws admission
     /// there. Because the hook runs BEFORE the read, the single `decide` invocation that follows sees a
@@ -465,7 +464,7 @@ TEST(CASNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStill
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
                               .creator = creatorFence("srv1", 5)};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
 
     const auto outcome = CasRefCatalog::reconcileStaleCreator(
         op, layout, entry, creatorFence("srv2", 9), fixedTerminality(false));
@@ -487,7 +486,7 @@ TEST(CASNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
     const CreatorFence original_creator = creatorFence("srv1", 5);
     const CreatorFence new_creator = creatorFence("srv2", 9);
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);   /// "crash after write 1" -- no _ckpt yet
+    CasRefCatalog::casAdmitEntry(op, layout, entry);   /// "crash after write 1" -- no _ckpt yet
 
     ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(op, layout, entry, new_creator, fixedTerminality(true)),
                CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
@@ -525,7 +524,7 @@ TEST(CASNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
                               .creator = creatorFence("srv1", 5)};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
 
     const CreatorFence first_reconciler = creatorFence("srv2", 9);
     const CreatorFence second_reconciler = creatorFence("srv3", 11);

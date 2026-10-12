@@ -1,12 +1,10 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
 #include "cas_test_helpers.h"
@@ -19,11 +17,6 @@ namespace
 ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 {
     return ManifestRef{epoch, seq, ordinal};
-}
-
-BlobRef bh(uint64_t n)
-{
-    return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))};
 }
 
 }
@@ -137,38 +130,6 @@ TEST(CASInspect, RendersRefOwnerKindWireWords)
     EXPECT_NE(json.find(R"("new_binding":{"kind":"precommit")"), String::npos) << json;
 }
 
-/// A recorded incarnation's dialect renders as its full wire word; the blob-target-run test below
-/// covers `emulated`, so this pins the other two (`etag`/`generation`) via a second condemned-row-only run.
-TEST(CASInspect, RendersTokenTypeWireWordsEtagAndGeneration)
-{
-    const Layout layout("p");
-
-    SourceEdgeRecord etag_rec;
-    etag_rec.ref = bh(1);
-    etag_rec.source_id = UInt128{0};
-    etag_rec.marker = RunMarker::Condemned;
-    etag_rec.token = PersistedEtag{"etag", "v-etag"};
-
-    SourceEdgeRecord gen_rec;
-    gen_rec.ref = bh(1);
-    gen_rec.source_id = UInt128{1};
-    gen_rec.marker = RunMarker::Condemned;
-    gen_rec.token = PersistedEtag{"generation", "v-gen"};
-
-    DB::WriteBufferFromOwnString out;
-    SourceEdgeRunWriter writer(out);
-    writer.append(etag_rec);
-    writer.append(gen_rec);
-    writer.finish();
-    out.finalize();
-    const String bytes = out.str();
-
-    const String key = layout.blobTargetRunKey(/*generation*/3, /*attempt*/0, /*shard*/0, /*seq*/0);
-    const String json = caInspectToJson(layout, key, bytes);
-    EXPECT_NE(json.find(R"("type":"etag")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("type":"generation")"), String::npos) << json;
-}
-
 TEST(CASInspect, RendersCommittedRowWithNoPayloadSizeKey)
 {
     const Layout layout("p");
@@ -192,57 +153,6 @@ TEST(CASInspect, RendersCommittedRowWithNoPayloadSizeKey)
     EXPECT_EQ(json.find("lifecycle"), String::npos) << json;
     EXPECT_EQ(json.find("remove_txn_id"), String::npos) << json;
     EXPECT_NE(json.find(R"("published_at_ms":42)"), String::npos) << json;
-}
-
-/// A blob-target source-edge run segment (`Layout::blobTargetRunKey`) is the ground truth for every
-/// in-degree question; `cas-inspect` decodes it with the typed `SourceEdgeRunView` reader (not by hand)
-/// and must distinguish an active edge from a condemned sentinel row, decoding the latter's fields.
-TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
-{
-    const Layout layout("p");
-
-    /// `SourceEdgeRunWriter::append` requires non-decreasing `(ref, source_id)` order; the condemned
-    /// sentinel sorts first for its blob (source_id 0), and `bh(1) < bh(2)`, so appending in this
-    /// order already satisfies it.
-    SourceEdgeRecord condemned_rec;
-    condemned_rec.ref = bh(1);
-    condemned_rec.source_id = UInt128{0};
-    condemned_rec.marker = RunMarker::Condemned;
-    condemned_rec.delete_pending = true;
-    condemned_rec.token = PersistedEtag{"emulated", "etag-1"};
-    condemned_rec.size = 123;
-    condemned_rec.condemn_round = 7;
-    condemned_rec.marker_confirmed = true;
-
-    SourceEdgeRecord edge_rec;
-    edge_rec.ref = bh(2);
-    edge_rec.source_id = UInt128(9);
-    edge_rec.marker = RunMarker::Edge;
-
-    DB::WriteBufferFromOwnString out;
-    SourceEdgeRunWriter writer(out);
-    writer.append(condemned_rec);
-    writer.append(edge_rec);
-    writer.finish();
-    out.finalize();
-    const String bytes = out.str();
-
-    const String key = layout.blobTargetRunKey(/*generation*/2, /*attempt*/0, /*shard*/0, /*seq*/0);
-
-    const String json = caInspectToJson(layout, key, bytes);
-    EXPECT_NE(json.find(R"("object":"blob_target_run")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("generation":2)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("kind":"edge")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("kind":"condemned")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("delete_pending":true)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("condemn_round":7)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("value":"etag-1")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("type":"emulated")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("rows":2)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("distinct_blobs":2)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("edges":1)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("condemned":1)"), String::npos) << json;
-    EXPECT_NE(json.find(R"("zero_markers":0)"), String::npos) << json;
 }
 
 /// Stage A task 5 (spec INV-4): the `_ckpt` renders as its own object kind. It is point-addressed in
@@ -287,32 +197,6 @@ TEST(CASInspect, RendersRefCkptAbsencesAsExplicitNulls)
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("last_epoch_seal":null)"), String::npos) << json;
-}
-
-/// `CoverageClass` renders as its full wire word, not the enumerator's numeric value: `cas-inspect` is
-/// exactly the tool an operator reaches for to read a fold seal directly, so a coverage row that still
-/// printed a bare integer would send them back to this file's comment to decode it.
-TEST(CASInspect, RendersCoverageClassificationWireWords)
-{
-    const Layout layout("p");
-    CasFoldSeal seal;
-    seal.generation = 3;
-    seal.parent_generation = 2;
-    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Absent};
-    seal.ref_lives[UInt128{2}].coverage = RefCoverage{.classification = CoverageClass::Unchanged};
-    seal.ref_lives[UInt128{3}].coverage
-        = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}};
-    seal.ref_lives[UInt128{4}].coverage = RefCoverage{
-        .classification = CoverageClass::Clamped,
-        .hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
-                        .retry_count = 0, .next_retry_round = 1}};
-
-    const String key = layout.foldSealKey(/*generation*/3, /*attempt*/0);
-    const String json = caInspectToJson(layout, key, encodeFoldSeal(seal));
-    EXPECT_NE(json.find(R"("classification":"absent")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("classification":"unchanged")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("classification":"folded")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("classification":"clamped")"), String::npos) << json;
 }
 
 /// A listed physical id cannot supply a namespace. Inspect must receive the unique catalog join, and

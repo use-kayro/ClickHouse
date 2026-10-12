@@ -327,7 +327,7 @@ TEST(CASRefCheckpointJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
     /// the starting state this test needs.
     backend->withdraw_after_ckpt_write = true;
     CasOperation creator = requests.admit([&backend] { return backend->admitted; });
-    ASSERT_EQ(CasRefCatalog::createNamespace(creator, layout, 1, ns, creatorFence("srv1", 5)),
+    ASSERT_EQ(CasRefCatalog::createNamespace(creator, layout, ns, creatorFence("srv1", 5)),
               CasRefCatalog::NamespaceCreationOutcome::FencedOut);
     backend->withdraw_after_ckpt_write = false;
 

@@ -32,9 +32,9 @@ a part-folder view cache sitting on that path.
 ref pointing at blobs the pool already has, at zero bytes on the wire — with a publish-then-confirm
 protocol that closes the sender-crash and stale-cache races a naive relink would be exposed to.
 
-**Garbage collection.** An 18-phase round built on a causal ack-floor (no separate fence-and-recheck
-phase); sharded folding (`cas_gc_shards`); condemn/spare bookkeeping; generation pruning with a
-configurable retention window; a dry-run mode and a rebuild path for recovery.
+**Garbage collection.** Blob liveness from the Keeper part records of the tables on the pool: a
+record outlives its part and is the delete queue; condemned blobs are deleted exact-`ETag` once no
+record references them and every build that existed at the condemnation retired.
 
 **Mounts and identity.** Explicit `cas_server_root_id` per disk; a renewable mount lease with
 observation-based reclaim of an expired predecessor (never trusting a foreign body's wall-clock
@@ -48,9 +48,8 @@ capability probe runs at every writable mount and refuses a backend that does no
 conditions CAS depends on.
 
 **Operability.** `system.cas_log`, `system.cas_gc_log`, and `system.cas_mounts` for introspection;
-`clickhouse-disks` commands `ca-fsck`, `ca-inspect`, `ca-gc-dryrun`, and `ca-gc-rebuild`; the
-`SYSTEM CAS` SQL control surface (`GC RUN`/`STOP`/`START`/`REBUILD`, `FSCK`, `FORGET`, `DROP POOL
-MEMBER`).
+`clickhouse-disks` commands `cas-fsck` and `cas-inspect`; the `SYSTEM CAS` SQL control surface
+(`GC RUN`/`STOP`/`START`, `FSCK`, `FORGET`, `DROP POOL MEMBER`).
 
 **Coexistence.** `metadata_type = cas` is opt-in per disk; zero-copy replication keeps working
 unmodified on disks that do not opt in — see [why CAS exists](/antalya/cas/) for the fuller

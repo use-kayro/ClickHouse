@@ -4719,7 +4719,7 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
     {
         auto external_requests = DB::Cas::tests::openRequestsForTest(backend);
         auto external = external_requests.admit();
-        DB::Cas::CasRefCatalog::casAdmitEntry(external, layout, 1,
+        DB::Cas::CasRefCatalog::casAdmitEntry(external, layout,
             DB::Cas::CatalogEntry{.ns = DB::Cas::RootNamespace{"zz"}, .state = DB::Cas::NsState::Live, .incarnation = UInt128{99}});
     }
     const uint64_t writes_mid = backend->writeCount(key);

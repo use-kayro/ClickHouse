@@ -137,18 +137,9 @@ struct CatalogFenceMovedMarker : std::exception {};
 struct CatalogEntryMismatchMarker : std::exception {};
 struct CatalogCreatorStillLiveMarker : std::exception {};
 
-/// Live-lock brake for the ONE loop below that is written by hand rather than driven by the engine:
-/// the catalog is a single object mutated by every lifecycle transition of every namespace in the
-/// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
-///
-/// It bounds ATTEMPTS, and is the SECONDARY bound: the loop freezes one `Retry` before it starts and
-/// every verb of every iteration shares that absolute deadline, so wall-clock time is already bounded
-/// by one standard window. This cap exists so a call that somehow converges on neither still ends.
-constexpr size_t kMaxCatalogCasAttempts = 100;
-
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
-/// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
+/// runs the admission predicate (`checkCatalogAdmission`) first. A refused precondition re-runs
 /// `mutate` against the resolve read's fresh body -- the one the pool's hot-key lane remembers and
 /// the next hold starts from -- never re-encoding the stale candidate.
 RefCatalog casUpdateImpl(
@@ -213,8 +204,8 @@ std::function<RefCatalog(const RefCatalog &)> identityPreserving(
         RefCatalog candidate = mutate(current);
         if (candidate.entries.size() != current.entries.size())
             throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry, "
-                "deleteCompletedRemoving, or cancelStalledCreating");
+                "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry "
+                "or cancelStalledCreating");
         for (size_t i = 0; i < current.entries.size(); ++i)
         {
             if (candidate.entries[i].ns != current.entries[i].ns
@@ -285,7 +276,7 @@ std::function<void()> create_namespace_pre_check_hook_for_test;
 /// canonical-order/no-duplicate grammar check abort the process with `LOGICAL_ERROR` for what is, at
 /// this call site only, an ordinary race outcome.
 RefCatalog createNamespaceStep1(
-    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry,
+    CasOperation & op, const Layout & layout, const CatalogEntry & entry,
     const Retry & policy)
 {
     /// Moved into a local before invoking, not called on the global directly: a hook that reassigns
@@ -311,9 +302,9 @@ RefCatalog createNamespaceStep1(
         return next;
     };
     return casUpdateImpl(op, layout, mutate,
-        [&entry, gc_shards, &layout](const RefCatalog & c)
+        [&entry](const RefCatalog & c)
         {
-            return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+            return checkCatalogAdmission(c, entry.ns);
         },
         policy);
 }
@@ -339,7 +330,7 @@ RefCatalog CasRefCatalog::casUpdate(
 }
 
 RefCatalog CasRefCatalog::casAdmitEntry(
-    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
+    CasOperation & op, const Layout & layout, const CatalogEntry & entry)
 {
     if (entry.state == NsState::Removing)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -364,9 +355,9 @@ RefCatalog CasRefCatalog::casAdmitEntry(
     try
     {
         return casUpdateImpl(op, layout, mutate,
-            [&entry, gc_shards, &layout](const RefCatalog & c)
+            [&entry](const RefCatalog & c)
             {
-                return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+                return checkCatalogAdmission(c, entry.ns);
             });
     }
     catch (const CatalogFenceMovedMarker &)
@@ -380,8 +371,7 @@ RefCatalog CasRefCatalog::casAdmitEntry(
 }
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
-    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    uint64_t removal_started_round)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed)
 {
     if (observed.state != NsState::Live || observed.creator || observed.removal_started_round)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -400,7 +390,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
         RefCatalog next = cur;
         CatalogEntry & entry = next.entries[it - cur.entries.begin()];
         entry.state = NsState::Removing;
-        entry.removal_started_round = removal_started_round;
+        entry.removal_started_round = 0;
         return next;
     };
 
@@ -423,142 +413,6 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
         return BeginRemovingOutcome::EntryChanged;
     }
     return BeginRemovingOutcome::Transitioned;
-}
-
-CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemoving(
-    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const CasFoldSeal & authoritative_parent,
-    const std::function<void()> & refresh_authority)
-{
-    if (observed.state != NsState::Removing || !observed.removal_started_round)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
-    if (parent_it == authoritative_parent.ref_lives.end()
-        || !parent_it->second.cleanup_evidence
-        || parent_it->second.coverage.hold)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    return deleteCompletedRemovingAtSnapshot(
-        op, layout, read(op, layout), observed, authoritative_parent, refresh_authority);
-}
-
-CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-    CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
-    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
-    const std::function<void()> & refresh_authority)
-{
-    if (observed.state != NsState::Removing || !observed.removal_started_round)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    const auto parent_it = authoritative_parent.ref_lives.find(observed.incarnation);
-    if (parent_it == authoritative_parent.ref_lives.end()
-        || !parent_it->second.cleanup_evidence
-        || parent_it->second.coverage.hold)
-        return {
-            .outcome = CompletedRemovingDeleteOutcome::ProofRefused,
-            .invalidated_life = std::nullopt,
-            .catalog_snapshot = std::nullopt};
-
-    const NamespaceLifeId old_life
-        = NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation);
-    const auto resolved_result = [&](CompletedRemovingDeleteOutcome outcome)
-    {
-        const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
-        const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
-            && current_it->incarnation == observed.incarnation;
-        return CompletedRemovingDeleteResult{
-            .outcome = outcome,
-            .invalidated_life = old_life_still_cataloged
-                ? std::nullopt
-                : std::optional<NamespaceLifeId>{old_life},
-            .catalog_snapshot = std::move(catalog_snapshot)};
-    };
-
-    /// ONE bound for the whole loop, frozen before the first iteration: every erase and every
-    /// resolution read below shares this deadline, so a permanently contended catalog gives up
-    /// retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration. The paced retry at the end of the loop is a bare sleep that does not consult the
-    /// deadline, so the loop can sleep one backoff (at most 5 s) past it before the next erase refuses
-    /// to start.
-    const Retry policy = op.freeze(Retry::standard());
-
-    for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
-    {
-        /// So the admission consulted below is not one reading taken before the first attempt.
-        if (refresh_authority)
-            refresh_authority();
-
-        catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
-        /// A caller-supplied cut without an incarnation cannot state a precondition, and an erase that
-        /// fell back to an unconditional write would delete whatever a concurrent writer had put there.
-        if (!catalog_snapshot.etag)
-            throwMandatoryCatalogAbsent(layout.refCatalogKey());
-        const auto observed_it = findEntry(catalog_snapshot.catalog, observed.ns);
-        if (observed_it == catalog_snapshot.catalog.entries.end() || *observed_it != observed)
-            return resolved_result(CompletedRemovingDeleteOutcome::EntryChanged);
-
-        /// Nothing is attempted without admission, and a refusal here has sent nothing.
-        if (!op.admitted())
-            return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
-
-        RefCatalog candidate = catalog_snapshot.catalog;
-        candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
-        WriteResult erase = op.replace(layout.refCatalogKey(), encodeRefCatalog(candidate),
-                                       *catalog_snapshot.etag, policy);
-
-        /// An operation whose admission is gone cannot issue the resolution read either, so the call
-        /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further
-        /// this actor may learn, and nothing further it may do.
-        if (!op.admitted())
-            return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
-
-        /// The response to a conditional erase is not authority for what became durable. Resolve every
-        /// attempted erase through one complete catalog read. This snapshot is also the next
-        /// retry/selection cut, so no second read separates them.
-        catalog_snapshot = read(op, layout, policy);
-
-        const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
-        const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
-            && current_it->incarnation == observed.incarnation;
-        if (!old_life_still_cataloged)
-            return resolved_result(current_it == catalog_snapshot.catalog.entries.end()
-                ? CompletedRemovingDeleteOutcome::Deleted
-                : CompletedRemovingDeleteOutcome::EntryChanged);
-
-        /// The row survived the attempt. Only a refused precondition may be tried again against the
-        /// mandatory resolution snapshot above; every other alternative is terminal for this call, and
-        /// a commit the resolution read contradicts is reported rather than believed.
-        if (!std::holds_alternative<Conflict>(erase))
-        {
-            if (std::holds_alternative<Committed>(erase))
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS ref catalog erase for namespace '{}' reported committed, but a complete resolution read "
-                    "still observed incarnation {}",
-                    observed.ns.string(), u128ToHex(observed.incarnation)));
-            throwCatalogWriteFailure(std::move(erase), fmt::format(
-                "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
-        }
-
-        /// Only a refused precondition reaches here, so this pause paces one contended key's retries.
-        /// The argument is the number of reissues so far, which is one more than the zero-based
-        /// iteration: `backoff(0)` is no wait at all, and the first retry is the one most likely to
-        /// collide with the writer that just won.
-        op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1));
-    }
-
-    throwCasWriteRetryLater(fmt::format(
-        "CAS ref catalog erase for namespace '{}' did not converge after {} attempts",
-        observed.ns.string(), kMaxCatalogCasAttempts));
 }
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
@@ -649,7 +503,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
-    CasOperation & op, const Layout & layout, uint64_t gc_shards,
+    CasOperation & op, const Layout & layout,
     const RootNamespace & ns, const CreatorFence & creator, const Retry & policy)
 {
     /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
@@ -695,7 +549,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// above) and reports the race as `Superseded` instead.
     try
     {
-        createNamespaceStep1(op, layout, gc_shards, entry, policy);   /// step 1
+        createNamespaceStep1(op, layout, entry, policy);   /// step 1
     }
     catch (const CatalogEntryAlreadyPresentMarker &)
     {

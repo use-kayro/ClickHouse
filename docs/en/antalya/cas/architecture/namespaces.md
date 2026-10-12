@@ -53,7 +53,7 @@ altogether and carry no `life_id` either.
 ## The namespace catalog {#catalog}
 
 One pool-wide object, `cas/ref_catalog` (`Layout::refCatalogKey`), is the sole authority for which
-namespaces exist. It is read on every fold round and every ref-table recovery, and mutated by one
+namespaces exist. It is read on every ref-table recovery, and mutated by one
 token-`CAS` write per lifecycle transition. Its entries are canonically ordered by namespace bytes,
 strictly ascending, with no duplicate name — both the encoder and the decoder enforce this, so an
 out-of-order or duplicate-keyed catalog can never become durable.
@@ -78,9 +78,8 @@ stateDiagram-v2
     Creating --> Live: completeCreation -- publish genesis _ckpt, then flip, clear creator
     Creating --> Creating: a live foreign creator fence -- retry later, no steal
     Creating --> Live: reconcileStaleCreator finds the creator fence provably dead,<br/>a fresh opener steals and completes it
-    Live --> Removing: beginRemoving -- table drop, stamps removal_started_round
-    Removing --> [*]: GC drains the row once a fold sealed positive cleanup evidence
-    [*] --> Creating: a fresh createNamespace call, only once the old row is fully absent -- brand new life_id
+    Live --> Removing: beginRemoving -- table drop
+    [*] --> Creating: a fresh createNamespace call, only while no row names it -- brand new life_id
 ```
 
 A row's own state machine is linear per row (`Creating → Live → Removing → gone`); what makes the
@@ -129,43 +128,31 @@ Nothing is deleted by the writer at this point. No blob, no manifest, no ref-log
 disappears here — only pointers move, exactly like an ordinary [`DROP TABLE`](/antalya/cas/architecture/part-lifecycle#operation-mapping)
 on any other ref.
 
-### What `GC` does with a `Removing` namespace {#gc-and-removal}
+### What happens to a `Removing` namespace {#gc-and-removal}
 
-The terminal `RemoveNamespace` transaction is folded like any other ref-log record, during the
-[round's fold phases](/antalya/cas/architecture/garbage-collection#the-round). Folding it stamps
-positive **cleanup evidence** directly onto that `life_id`'s row in the new fold seal — there is no
-physical listing and no `Pending`/`Completed` handshake; the evidence is a pure fact about which
-ref-log transaction folded.
-
-The **next** round's `pre_fold_ref_drain` phase is what actually removes the catalog row: it reads
-the just-adopted parent fold seal, and for every `Removing` row whose life carries durable cleanup
-evidence, it exact-`CAS`-deletes the catalog entry before that round does anything else. This
-two-round shape — evidence sealed in round *n*, catalog row deleted in round *n+1* — is why removal
-needs no separate physical-emptiness proof: by the time the row is deleted, a fold has already
-proven its ref history is fully drained.
+Nothing drains a `Removing` row: the S3-listing GC that removed it was deleted, and the Keeper-record
+GC does not touch the catalog (known gap). The row, and the dead life's ref stream and state objects
+(`_log`, `_snap`, `_ckpt`, `_files`), stay.
 
 ### What disappears, and when {#what-disappears}
 
 | Object class | Reclaimed by | When |
 |---|---|---|
-| Catalog row (`cas/ref_catalog` entry) | `GC` phase 2, `pre_fold_ref_drain` | The round after the fold that sealed cleanup evidence for this life |
-| Part manifest bodies | Ordinary owner-removal ([phase 15](/antalya/cas/architecture/garbage-collection#the-round)) for anything that had a committed or precommit binding, the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep) for anything that never got that far | As each owning ref is dropped by the removal transaction itself, independent of the catalog row |
-| Blob bodies | The ordinary condemn/graduate/delete pipeline | Whenever the manifests that named them stop being live, same as any other blob |
-| Ref stream/state objects (`_log`, `_snap`, `_ckpt`, `_files`) under the dead `life_id` | The perpetual namespace janitor ([phase 16](/antalya/cas/architecture/garbage-collection#the-round)) | Best-effort, one bounded `LIST` page at a time, whenever it next lists a key whose `life_id` a fresh catalog cut no longer names — independent of, and not gated on, catalog-row deletion |
-
-The janitor is leak-only: it never fails a round, never blocks progress on an unreadable key, and a
-crash mid-page simply leaves debris for its next page.
+| Catalog row (`cas/ref_catalog` entry) | nothing | never (known gap) |
+| Part manifest bodies | the decommission drain's [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep) | only on `SYSTEM CAS DROP POOL MEMBER`, for unowned bodies of retired builds |
+| Blob bodies | [`GC`](/antalya/cas/architecture/garbage-collection#the-round) | once no Keeper part record references them, same as any other blob |
+| Ref stream/state objects (`_log`, `_snap`, `_ckpt`, `_files`) under the dead `life_id` | nothing | never (known gap) |
 
 ### Recreate while removing {#recreate-while-removing}
 
 A fresh `createNamespace` call for a name whose catalog row is still `Live` or `Removing` is
 refused outright — internally this is a misuse `LOGICAL_ERROR`, because the higher-level open loop
 (`resolveNamespaceLife`) filters that case out first and reports a typed retry-later error instead:
-"creation waits for its terminal fold and catalog removal to complete". A caller that keeps
-resolving the same name simply keeps retrying until the row is gone.
+"creation waits for its terminal fold and catalog removal to complete". Since nothing removes a
+`Removing` row any more, that name cannot be recreated (known gap).
 
-Once `pre_fold_ref_drain` has deleted the row, the name is free again, and the very next opener mints
-a **brand new**, independently random `life_id` — never the retired one. That is the whole answer to
+Were the row gone, the very next opener would mint a **brand new**, independently random `life_id` —
+never the retired one. That is the whole answer to
 "what happens on recreate": the old physical identity is never revived, so every key ever written
 under it — its `_log`, its `_snap`, its `_ckpt`, its `_files` — stays permanently addressed by a
 value nothing will ever mint again, and a reader still holding the old `NamespaceLifeId` observes

@@ -403,7 +403,7 @@ struct HeartbeatFloor
     size_t terminated = 0;
     size_t fenced_now = 0;
     size_t already_fenced = 0;
-    /// The srids of every mount fenced-out THIS call (one GcFenceOut audit event each).
+    /// The srids of every mount fenced-out THIS call.
     std::vector<String> fenced_srids;
     /// The srids whose `/mount` key this call's LIST returned, whatever their classification. The round
     /// resolves a namespace's mount from these instead of probing every prefix of the namespace.

@@ -96,35 +96,11 @@ CatalogEntry entryInState(const String & ns, NsState state, uint64_t inc)
 class WriteCountingBackend : public DB::Cas::tests::CountingBackend
 {
 public:
-    enum class Verb { Read, Write };
-
     uint64_t writes(const String & key) const
     {
         std::lock_guard lock(write_count_mutex);
         const auto it = write_counts.find(key);
         return it == write_counts.end() ? 0 : it->second;
-    }
-
-    /// The ordered READ/WRITE sequence issued against `key` since this backend was created. A count
-    /// alone cannot tell a settled-then-reissued attempt from a blind reissue that happened to read
-    /// more times; the order is what a caller actually needs to pin.
-    std::vector<Verb> journalFor(const String & key) const
-    {
-        std::lock_guard lock(write_count_mutex);
-        std::vector<Verb> filtered;
-        for (const auto & [journaled_key, verb] : journal)
-            if (journaled_key == key)
-                filtered.push_back(verb);
-        return filtered;
-    }
-
-    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        {
-            std::lock_guard lock(write_count_mutex);
-            journal.emplace_back(key, Verb::Read);
-        }
-        return CountingBackend::read(key, access);
     }
 
     std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
@@ -134,7 +110,6 @@ public:
         {
             std::lock_guard lock(write_count_mutex);
             ++write_counts[key];
-            journal.emplace_back(key, Verb::Write);
         }
         return CountingBackend::write(key, bytes, expected_value, access);
     }
@@ -142,69 +117,18 @@ public:
 private:
     mutable std::mutex write_count_mutex;
     std::map<String, uint64_t> write_counts;
-    std::vector<std::pair<String, Verb>> journal;
 };
 
-/// A compact 'R'/'W' rendering of `WriteCountingBackend::journalFor`, so a mismatch prints as one
-/// readable string rather than a wall of enum values.
-String renderJournal(const std::vector<WriteCountingBackend::Verb> & journal)
+/// Erases `ns`'s row from the catalog with one raw conditional write, as another server's catalog
+/// mutation would land underneath a pool's cached copy.
+void eraseRowRaw(CasOperation & op, const Layout & layout, const RootNamespace & ns)
 {
-    String rendered;
-    for (const auto verb : journal)
-        rendered += verb == WriteCountingBackend::Verb::Read ? 'R' : 'W';
-    return rendered;
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+    RefCatalog next = snap.catalog;
+    std::erase_if(next.entries, [&](const CatalogEntry & e) { return e.ns == ns; });
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(layout.refCatalogKey(), encodeRefCatalog(next), *snap.etag, Retry::standard())));
 }
-
-/// Lands a competing catalog body under the erase's own attempt and withdraws this actor's admission
-/// with it -- the concurrent winner an erase has to be resolved against, driven deterministically and
-/// without a second thread.
-class EraseWinnerBackend final : public WriteCountingBackend
-{
-public:
-    void replaceOnNextCatalogWrite(const String & key, std::optional<CatalogEntry> replacement_)
-    {
-        catalog_key = key;
-        replacement = std::move(replacement_);
-        armed = true;
-    }
-
-    bool admitted() const { return !fence_moved; }
-
-    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
-                                                               const std::optional<String> & expected_value,
-                                                               DB::Cas::TransportAccess & access) override
-    {
-        if (armed && key == catalog_key)
-        {
-            armed = false;
-            RefCatalog winner_catalog;
-            if (replacement)
-                winner_catalog.entries.push_back(*replacement);
-            /// Qualified, so the winner's own write is not counted as an attempt of the call under test.
-            const auto current = WriteCountingBackend::read(key, access);
-            if (!current)
-                throw std::runtime_error("test fixture lost mandatory catalog");
-            const auto winner = CountingBackend::write(
-                key, encodeRefCatalog(winner_catalog), std::optional<String>{current->value}, access);
-            if (!winner.has_value())
-                throw std::runtime_error("test fixture winner failed to replace catalog");
-            fence_moved = true;
-        }
-        return WriteCountingBackend::write(key, bytes, expected_value, access);
-    }
-
-private:
-    String catalog_key;
-    std::optional<CatalogEntry> replacement;
-    bool armed = false;
-    bool fence_moved = false;
-};
-
-/// The erase entry points require a liveness refresh because a real drain's liveness is a cached flag
-/// its owner re-reads from the store. These fixtures' operations carry either no liveness or a direct
-/// read of the fixture, so there is nothing cached for a refresh to update. Named rather than repeated
-/// inline, so a site that DOES need a refresh cannot hide among the ones that do not.
-void noAuthorityRefresh() {}
 
 /// Seeds one object, failing the current test rather than returning a value nobody checks.
 void seedObject(CasOperation & op, const String & key, const String & bytes)
@@ -500,8 +424,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAbort
 /// A namespace + creator server_root_id that both max out at their respective byte bounds (512 +
 /// 255), escaped worst-case, land one `entry` line over the 4 KiB line cap (~4.7 KiB) -- reachable
 /// because neither this codec nor `validateServerRootId` restricts the charset, only the length.
-/// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report) --
-/// `encodeFoldSeal`'s own `checkLineBytes` raises `LIMIT_EXCEEDED` for the identical shape of gate.
+/// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report).
 TEST(CASRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
 {
     RefCatalog c;
@@ -653,157 +576,15 @@ TEST(CASRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
     }
 }
 
-TEST(CASRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
+TEST(CASRefCatalogAdmission, AdmissionReturnsTheCheckedBytes)
 {
-    const Layout layout("p");
-    constexpr uint64_t gc_shards = 1;
-    /// The exact boundary is expressed in ENTRIES (predicate (2) is a sum over admitted entries), so
-    /// the boundary count is derived from the real registry constants rather than assumed.
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    ASSERT_GT(reservation, 0u);
-    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
-        + widestCondemnedSummaryReservationBytes(gc_shards);
-    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
-
-    const RootNamespace ns{"admitted"};
-    EXPECT_NO_THROW(checkFoldSealReservation(max_entries, gc_shards, layout, ns));
-    try
-    {
-        checkFoldSealReservation(max_entries + 1, gc_shards, layout, ns);
-        FAIL() << "expected LIMIT_EXCEEDED";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LIMIT_EXCEEDED);
-        EXPECT_NE(e.message().find("predicate 2"), String::npos) << e.message();
-        EXPECT_NE(e.message().find(ns.string()), String::npos) << e.message();
-    }
-}
-
-/// `entry_count * worstCaseEntryFoldReservationBytes()` must saturate, not wrap: choosing
-/// `entry_count` as the SMALLEST value whose true (unbounded) product with `reservation` crosses
-/// 2^64, an unsaturated `uint64_t` multiplication wraps to a remainder SMALLER than `reservation`
-/// itself (a few KiB) -- which reads as trivially "fits" a 256 MiB cap even though the real
-/// reservation this many entries demands is astronomically larger. A saturating multiply refuses it
-/// regardless of the wraparound arithmetic underneath.
-TEST(CASRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWrapping)
-{
-    const Layout layout("p");
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t entry_count = std::numeric_limits<uint64_t>::max() / reservation + 1;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
-        [&] { checkFoldSealReservation(entry_count, 1, layout, RootNamespace{"huge"}); });
-}
-
-TEST(CASRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
-{
-    /// `checkCatalogAdmission` runs predicate (1) then predicate (2) against the SAME candidate; for
-    /// an ordinary small catalog both hold slack and it returns the exact bytes `encodeRefCatalog`
-    /// would produce.
+    /// For an ordinary small catalog `checkCatalogAdmission` holds slack and returns the exact bytes
+    /// `encodeRefCatalog` would produce.
     RefCatalog candidate;
     candidate.entries.push_back(liveEntry("a", 1));
     candidate.entries.push_back(liveEntry("b", 2));
-    const Layout layout("p");
-    const String encoded = checkCatalogAdmission(candidate, 1, layout, RootNamespace{"b"});
+    const String encoded = checkCatalogAdmission(candidate, RootNamespace{"b"});
     EXPECT_EQ(encoded, encodeRefCatalog(candidate));
-}
-
-TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimalTransitions)
-{
-    const Layout layout("p/quoted-\"prefix");
-    constexpr uint64_t gc_shards = 100;
-    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
-
-    for (const uint64_t entry_count : {9, 10, 99, 100})
-    {
-        CasFoldSeal seal;
-        seal.generation = max;
-        seal.parent_generation = max;
-        for (uint64_t i = 0; i < entry_count; ++i)
-        {
-            seal.ref_lives.emplace(std::numeric_limits<UInt128>::max() - i, RefLifeFoldState{
-                .coverage = RefCoverage{
-                    .classification = CoverageClass::Clamped,
-                    .last_folded_ref_id = RefTxnId{max, max},
-                    .hold = RefHold{
-                        .reason = HoldReason::UnconsumedSealCrossing,
-                        .offending_position = RefTxnId{max, max},
-                        .retry_count = std::numeric_limits<uint32_t>::max(),
-                        .next_retry_round = max}},
-                .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{max, max}}});
-        }
-        for (uint64_t shard = 0; shard < gc_shards; ++shard)
-        {
-            /// Predicate 2 charges exactly `gc_shards` widest `blob_run` rows. This fixture is the maximum
-            /// legal cardinality, not an optimistic producer convention: authoritative fold-seal
-            /// grammar permits at most one run per shard and requires its canonical key to use seq 0.
-            seal.blob_target_runs.push_back(RunRef{
-                .key = layout.blobTargetRunKey(max, max, shard, 0),
-                .checksum = std::numeric_limits<UInt128>::max(),
-                .shard = shard,
-                .key_generation = max});
-            seal.condemned_summary.emplace(shard, CondemnedSummary{
-                .condemned_total = max,
-                .pending_total = max,
-                .oldest_nonpending_condemn_round = max});
-        }
-
-        ASSERT_EQ(seal.blob_target_runs.size(), gc_shards);
-        EXPECT_NO_THROW(validateFoldSealForWrite(seal, layout, gc_shards));
-
-        const uint64_t bound = foldSealFixedBytes()
-            + entry_count * worstCaseEntryFoldReservationBytes()
-            + gc_shards * widestBlobTargetRunReservationBytes(layout, gc_shards)
-            + gc_shards * widestCondemnedSummaryReservationBytes(gc_shards);
-        EXPECT_LE(encodeFoldSeal(seal).size(), bound) << "entry_count=" << entry_count;
-    }
-}
-
-/// ---------- Constraint 13: removal is never refused, even at the admission boundary ----------
-
-TEST(CASRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
-{
-    const Layout layout("p");
-    constexpr uint64_t gc_shards = 1;
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
-        + widestCondemnedSummaryReservationBytes(gc_shards);
-    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
-
-    /// Confirm the boundary is real: one entry beyond it is refused through admission.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
-        [&] { checkFoldSealReservation(max_entries + 1, gc_shards, layout, RootNamespace{"z"}); });
-
-    /// Build a catalog carrying exactly `max_entries` Live entries -- as full as admission ever
-    /// permits -- directly (a fixture, not itself an admission call).
-    RefCatalog full;
-    full.entries.reserve(max_entries);
-    for (uint64_t i = 0; i < max_entries; ++i)
-        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
-
-    auto backend = std::make_shared<InMemoryBackend>();
-
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-
-    CasOperation op = requests.admit();
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(full));
-
-    /// The removal transition (Live -> Removing) on one entry goes through the PLAIN update path
-    /// (`casUpdate`, which runs no admission check at all) and succeeds even though the catalog is
-    /// already at the point where ANY growth would be refused.
-    const RefCatalog after = CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & cur)
-    {
-        RefCatalog next = cur;
-        next.entries[0].state = NsState::Removing;
-        next.entries[0].removal_started_round = 1;
-        return next;
-    });
-    EXPECT_EQ(after.entries.size(), max_entries);
-    EXPECT_EQ(after.entries[0].state, NsState::Removing);
 }
 
 /// ---------- Pool/CasRefCatalog: read / create / update / conflict-retry ----------
@@ -839,7 +620,7 @@ TEST(CASRefCatalog, CasUpdateAppliesOnTopOfExistingState)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
 
     const RefCatalog updated = CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & cur)
     {
@@ -867,7 +648,7 @@ TEST(CASRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
         CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
-        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
         {
             (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog &) { return RefCatalog{}; });
@@ -879,7 +660,7 @@ TEST(CASRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
         CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
-        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
         {
             (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
@@ -902,7 +683,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
-        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
         EXPECT_DEATH(
             { (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog &) { return RefCatalog{}; }); },
             "cannot add or delete catalog entries");
@@ -913,7 +694,7 @@ TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
         CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation op = requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
-        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
         EXPECT_DEATH(
             {
                 (void)CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
@@ -935,7 +716,7 @@ TEST(CASRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
 
     backend->refuseNextWrite(layout.refCatalogKey());   /// one-shot artificial Conflict on the next write
 
@@ -965,7 +746,7 @@ TEST(CASRefCatalog, BeginRemovingRechecksAdmissionAfterACatalogConflict)
     const Layout layout("p");
     const CatalogEntry observed = liveEntry("a", 1);
     CasRefCatalog::initializeEmptyForNewPool(reader, layout);
-    CasRefCatalog::casAdmitEntry(reader, layout, 1, observed);
+    CasRefCatalog::casAdmitEntry(reader, layout, observed);
     const uint64_t writes_before = backend->writes(layout.refCatalogKey());
 
     /// The transition's one attempt is refused, and this actor's admission is withdrawn as it is sent.
@@ -976,7 +757,7 @@ TEST(CASRefCatalog, BeginRemovingRechecksAdmissionAfterACatalogConflict)
     backend->onBeforeWrite(layout.refCatalogKey(), [&admitted] { admitted = false; });
     CasOperation op = requests.admit([&admitted] { return admitted; });
 
-    const auto outcome = CasRefCatalog::beginRemoving(op, layout, observed, /*removal_started_round*/ 13);
+    const auto outcome = CasRefCatalog::beginRemoving(op, layout, observed);
 
     EXPECT_EQ(outcome, CasRefCatalog::BeginRemovingOutcome::FencedOut);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_before + 1)
@@ -1002,7 +783,7 @@ TEST(CASRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(op, layout);
     ASSERT_TRUE(seeded.etag.has_value());
 
@@ -1032,7 +813,7 @@ TEST(CASRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(op, layout);
     ASSERT_TRUE(seeded.etag.has_value());
 
@@ -1092,7 +873,7 @@ TEST(CASRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
 
-    const RefCatalog created = CasRefCatalog::casAdmitEntry(op, layout, 1,
+    const RefCatalog created = CasRefCatalog::casAdmitEntry(op, layout,
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1),
             .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
     ASSERT_EQ(created.entries.size(), 1u);
@@ -1107,8 +888,8 @@ TEST(CASRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
 
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("b", 1));
-    const RefCatalog after = CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("b", 1));
+    const RefCatalog after = CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 2));
     ASSERT_EQ(after.entries.size(), 2u);
     EXPECT_EQ(after.entries[0].ns.string(), "a");   /// inserted BEFORE "b", not appended
     EXPECT_EQ(after.entries[1].ns.string(), "b");
@@ -1125,9 +906,9 @@ TEST(CASRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); });
+        [&] { CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 2)); });
 }
 #endif
 
@@ -1139,108 +920,13 @@ TEST(CASRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
     CasOperation op = requests.admit();
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
-    CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 1));
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(op, layout, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
-TEST(CASRefCatalog, CasAdmitEntryRefusesOverCapacity)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    Layout layout("p");
-
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, 1)
-        + widestCondemnedSummaryReservationBytes(1);
-    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
-
-    /// Seed the catalog directly at the admission boundary (a fixture -- not itself an admission call).
-    RefCatalog full;
-    full.entries.reserve(max_entries);
-    for (uint64_t i = 0; i < max_entries; ++i)
-        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(full));
-
-    /// Admitting ONE more namespace is refused -- the additive predicate is checked BEFORE the write,
-    /// so the backend object is untouched.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
-    {
-        CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("zzz", 999999999));
-    });
-
-    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
-    EXPECT_EQ(snap.catalog.entries.size(), max_entries);
-}
-
-TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndAdmission)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const Layout layout("p");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-
-    CasFoldSeal held_parent;
-    held_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{
-            .classification = CoverageClass::Clamped,
-            .last_folded_ref_id = RefTxnId{1, 2},
-            .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, held_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
-
-    CasFoldSeal mismatched_parent;
-    mismatched_parent.ref_lives.emplace(UInt128{8}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, mismatched_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
-
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    CatalogEntry live = removing;
-    live.state = NsState::Live;
-    live.removal_started_round.reset();
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, live, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
-    CatalogEntry creating = live;
-    creating.state = NsState::Creating;
-    creating.creator = CreatorFence{.server_root_id = "server", .writer_epoch = 3, .fence_generation = 4};
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, creating, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
-
-    /// An operation whose admission is gone erases nothing and sends nothing. It is driven at a cut an
-    /// ADMITTED operation took, because a withdrawn one cannot issue the mandatory read that would
-    /// take one.
-    CasOperation withdrawn = requests.admit([] { return false; });
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                  withdrawn, layout, CasRefCatalog::read(op, layout), removing, ready_parent,
-                  noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
-    const uint64_t writes_before_erase = backend->writes(layout.refCatalogKey());
-
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-    EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_before_erase + 1);
-    EXPECT_EQ(backend->listTotal(), 0u);
-    EXPECT_EQ(backend->deleteTotal(), 0u);
-}
-
-TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCarryRemoval)
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASRefCatalogRemoval, AdmissionCannotCarryRemoval)
 {
     auto backend = std::make_shared<WriteCountingBackend>();
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -1252,29 +938,10 @@ TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         .state = NsState::Removing,
         .incarnation = UInt128{7},
         .removal_started_round = 13};
-#ifndef DEBUG_OR_SANITIZER_BUILD
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { (void)CasRefCatalog::casAdmitEntry(op, layout, 1, removing); });
-#endif
-
-    const CatalogEntry current{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 14};
-    seedObject(op, "unrelated", "sentinel");
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {current}}),
-        *CasRefCatalog::read(op, layout).etag, Retry::standard())));
-
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
-    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{current});
+        [&] { (void)CasRefCatalog::casAdmitEntry(op, layout, removing); });
 }
+#endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
@@ -1291,453 +958,10 @@ TEST(CASRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
         .removal_started_round = 13};
 
     EXPECT_DEATH(
-        { (void)CasRefCatalog::casAdmitEntry(op, layout, 1, removing); },
+        { (void)CasRefCatalog::casAdmitEntry(op, layout, removing); },
         "cannot admit namespace.*directly as Removing");
 }
 #endif
-
-/// Mutation caught: deriving the control outcome from the resolution read would turn a stale leader's
-/// `FencedOut` into `Deleted` or `EntryChanged`. A winner that replaced the catalog under this erase
-/// cannot restore the caller's authority to continue the GC round, and the refusal stays a returned
-/// outcome rather than an exception -- the caller distinguishes "I lost the round" from "I could not
-/// talk to the store" by exactly that.
-///
-/// An operation whose admission is gone cannot issue the resolution read either, so the result carries
-/// the cut this call was GIVEN rather than a fresh one: the erase's own effect is deliberately left
-/// unreported, because there is no admitted request left with which to learn it.
-TEST(CASRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrReplacesLife)
-{
-    for (const bool replace : {false, true})
-    {
-        auto backend = std::make_shared<EraseWinnerBackend>();
-        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-        CasOperation reader = requests.admit();
-        CasOperation op = requests.admit([&backend] { return backend->admitted(); });
-        const Layout layout(replace ? "replacement" : "absence");
-        const CatalogEntry removing{
-            .ns = RootNamespace{"a"},
-            .state = NsState::Removing,
-            .incarnation = UInt128{7},
-            .removal_started_round = 13};
-        seedObject(reader, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-
-        CasFoldSeal ready_parent;
-        ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-            .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-        std::optional<CatalogEntry> replacement;
-        if (replace)
-            replacement = CatalogEntry{
-                .ns = removing.ns,
-                .state = NsState::Live,
-                .incarnation = UInt128{8}};
-        backend->replaceOnNextCatalogWrite(layout.refCatalogKey(), replacement);
-
-        const CasRefCatalog::CompletedRemovingDeleteResult result
-            = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                op, layout, CasRefCatalog::read(reader, layout), removing, ready_parent,
-                noAuthorityRefresh);
-
-        EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
-        const RefCatalog current = CasRefCatalog::read(reader, layout).catalog;
-        if (replace)
-            EXPECT_EQ(current.entries, std::vector<CatalogEntry>{*replacement});
-        else
-            EXPECT_TRUE(current.entries.empty());
-    }
-}
-
-/// A transient failure of the erase attempt is settled by the mandatory resolution read and reissued,
-/// never concluded from. Treating it as ordinary non-convergence would hide a real backend fault behind
-/// `ProofRefused`/`EntryChanged`; treating it as a landed erase would report a deletion nobody proved.
-TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("cas-put-throw");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    const size_t journal_before = backend->journalFor(layout.refCatalogKey()).size();
-    backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
-        Poco::TimeoutException("injected erase failure whose outcome never reached the caller")));
-
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-
-    /// A blind reissue still performs a baseline read, a post-write read and a verification read,
-    /// satisfying a bare count. The ORDER pins what a count cannot: the lost attempt's outcome is
-    /// settled by a read (the engine's own ambiguity resolution) before it is ever reissued, and the
-    /// reissue that lands is settled by the loop's mandatory resolution read in turn. Captured before
-    /// the test's own verification read below, which is not part of the call under test.
-    const std::vector<WriteCountingBackend::Verb> full_journal = backend->journalFor(layout.refCatalogKey());
-    const std::vector<WriteCountingBackend::Verb> journal_since(
-        full_journal.begin() + static_cast<ptrdiff_t>(journal_before), full_journal.end());
-    using Verb = WriteCountingBackend::Verb;
-    EXPECT_EQ(journal_since, (std::vector<Verb>{Verb::Read, Verb::Write, Verb::Read, Verb::Write, Verb::Read}))
-        << "got " << renderJournal(journal_since) << "; a baseline read, the lost attempt settled by the "
-        << "engine's own resolution read BEFORE it is reissued, then the reissue settled by the loop's "
-        << "mandatory resolution read -- not a blind reissue that happens to read more times";
-
-    EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
-        << "the seed, the attempt whose outcome was lost, and the reissue that landed";
-}
-
-/// A refused precondition is the only thing the erase loop retries, and it PACES that retry on the
-/// engine's own clock. Without the pause a contended catalog would spend its whole conflict budget in
-/// back-to-back requests, which is the shape that turns one hot key into a request storm.
-///
-/// Nothing else on this path sleeps -- the write returns a refused precondition without reissuing, and
-/// no read fails -- so every wait the clock records is the loop's own.
-TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("erase-backoff");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    backend->refuseNextWrite(layout.refCatalogKey());
-
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-    ASSERT_EQ(clock.sleeps.size(), 1u) << "one refusal, so exactly one paced retry";
-    EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
-        << "the seed, the refused erase, and the retry that landed";
-}
-
-/// A caller's liveness need not be a fact this loop can read. The GC drain's is a cached
-/// leader-authority flag its owner refreshes by re-reading `gc/state`, so a leader deposed while an
-/// erase is in flight leaves that flag stale -- and on an unrecoverable delete path one reading taken
-/// before the first erase must not authorise the rest. Hence the refresh hook, run at the top of every
-/// attempt.
-///
-/// The winner here writes the SAME row back: the incarnation moves, so the erase is refused, and the
-/// row survives for the retry the loop would otherwise send. The cached flag still answers "admitted"
-/// at the post-write probe, deliberately -- that probe is not the subject, and leaving it stale is what
-/// makes this test about the refresh and nothing else.
-TEST(CASRefCatalogRemoval, TheEraseLoopRefreshesItsLivenessBeforeEveryAttempt)
-{
-    auto backend = std::make_shared<EraseWinnerBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation reader = requests.admit();
-    bool cached_authority = true;
-    CasOperation op = requests.admit([&cached_authority] { return cached_authority; });
-    const Layout layout("erase-refresh");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(reader, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    backend->replaceOnNextCatalogWrite(layout.refCatalogKey(), removing);
-    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
-    size_t refreshes = 0;
-
-    const CasRefCatalog::CompletedRemovingDeleteResult result
-        = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-            op, layout, CasRefCatalog::read(reader, layout), removing, ready_parent,
-            [&] { ++refreshes; cached_authority = backend->admitted(); });
-
-    EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
-    EXPECT_EQ(refreshes, 2u) << "once before the attempt it sent, once before the one it did not";
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
-        << "the one refused erase; the paced retry was abandoned before it reached the store";
-    EXPECT_EQ(CasRefCatalog::read(reader, layout).catalog.entries, std::vector<CatalogEntry>{removing})
-        << "the row a deposed leader must not erase is still there";
-}
-
-/// The refresh hook can fail the same way the read it wraps can -- and a failure of it is not a
-/// negative liveness answer to fold into `FencedOut`; it is a fact this call cannot evaluate, so it
-/// must escape rather than be swallowed into any of the loop's own outcomes. This is the case where
-/// the hook fails before the loop has sent anything at all: no erase may reach the store on an
-/// authority this call could not even ask about.
-TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("erase-refresh-throws-before");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
-
-    EXPECT_THROW(
-        CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent,
-            [] { throw std::runtime_error("injected authority-refresh failure before the first attempt"); }),
-        std::runtime_error);
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed)
-        << "an authority this call could not even ask about must not send an erase";
-    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
-        << "nothing changed under an authority failure that reached no attempt";
-}
-
-/// The counterpart to the case above: the hook fails AFTER the loop has already sent one erase and
-/// resolved it (a refusal, so the row is provably unchanged), on the refresh that would gate the next
-/// attempt. The failure must still escape rather than be read as the fenced-out liveness answer this
-/// class's default `admitted()` would otherwise report, and -- exactly as when it fails up front -- no
-/// further erase may reach the store on an authority this call could not evaluate.
-TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("erase-refresh-throws-after");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    backend->refuseNextWrite(layout.refCatalogKey());
-    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
-
-    size_t refreshes = 0;
-    EXPECT_THROW(
-        CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, [&]
-        {
-            ++refreshes;
-            if (refreshes > 1)
-                throw std::runtime_error("injected authority-refresh failure after the erase resolved");
-        }),
-        std::runtime_error);
-    EXPECT_EQ(refreshes, 2u) << "once before the refused attempt, once before the retry it never sent";
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
-        << "the one refused erase; the retry the resolution read would have paced never reached the store";
-    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
-        << "the row a failed authority refresh must not let a later attempt erase is still there";
-}
-
-/// The loop iterates on ONE alternative and one only: a refused precondition. Every other non-committed
-/// answer is terminal for the call and leaves through the same throw, so a future retry added for any
-/// of them would be retrying a write whose fate the store already settled. `Refused` is the alternative
-/// a test can construct exactly; `GaveUp{FenceLost}` cannot reach this arm at all, because the
-/// admission probe immediately after the write returns `FencedOut` first.
-#if USE_AWS_S3
-TEST(CASRefCatalogRemoval, AStoreRefusalEndsTheEraseLoopInsteadOfRetryingIt)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("erase-refused");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
-
-    /// A malformed request is one of the answers that prove the write never applied, so the engine
-    /// reports it as a refusal rather than settling it by a read.
-    backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
-        DB::S3Exception("injected malformed erase request", Aws::S3::S3Errors::UNKNOWN, "MalformedXML")));
-
-    /// The store's own code, not a class of this module's choosing: `orThrow` re-raises a refusal
-    /// under the code the store gave, so an operator sees what the store actually said.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&]
-    {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
-    });
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1)
-        << "a refusal is terminal: the loop must not send a second erase";
-    EXPECT_TRUE(clock.sleeps.empty()) << "and must not pace a retry it is not going to make";
-    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
-        << "the refused erase changed nothing";
-}
-#endif
-
-/// The response to a conditional erase is not authority for what became durable, and this is the case
-/// that makes that concrete: the attempt commits, a concurrent writer puts the row back, and the
-/// mandatory resolution read contradicts the commit. Believing the response would report a namespace
-/// deleted while its row is still cataloged, so the call fails retry-later instead.
-TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterInsteadOfReportingDeleted)
-{
-    auto backend = std::make_shared<WriteCountingBackend>();
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    CasOperation restorer = requests.admit();
-    const Layout layout("erase-contradicted");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    const String seeded_catalog = encodeRefCatalog(RefCatalog{.entries = {removing}});
-    seedObject(op, layout.refCatalogKey(), seeded_catalog);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    /// Fires once the erase is durable and before its answer is returned, so the call really does see
-    /// `Committed` and really does find the row back when it resolves.
-    bool restored = false;
-    backend->onWriteCommitted(layout.refCatalogKey(), [&]
-    {
-        if (restored)
-            return;
-        restored = true;
-        (void)restorer.readModifyWrite(layout.refCatalogKey(),
-            [&](const std::optional<Object> &) -> std::optional<String> { return seeded_catalog; },
-            Retry::standard());
-    });
-
-    String message;
-    try
-    {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
-        ADD_FAILURE() << "a commit the resolution read contradicts must not be reported as a deletion";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-        message = e.message();
-    }
-    EXPECT_TRUE(restored) << "the concurrent restore never ran, so nothing was contradicted";
-    EXPECT_NE(message.find("reported committed"), String::npos) << message;
-    EXPECT_NE(message.find(u128ToHex(removing.incarnation)), String::npos)
-        << "the message must name the life still observed: " << message;
-}
-
-/// The loop captures ONE bound before it starts and every call it makes shares it, so a permanently
-/// contended catalog gives up "retry later" inside one standard window rather than spending a fresh
-/// window per verb across a hundred paced iterations -- which is hours against a document that
-/// promises ninety seconds. Every erase is refused and the injected clock absorbs every paced retry,
-/// so what ends the call is visible in the virtual time it took. The attempt cap stays as the
-/// secondary bound; it is not what ends this call.
-TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemptCap)
-{
-    class AlwaysRefusesCatalogWrites final : public WriteCountingBackend
-    {
-    public:
-        String refused_key;
-
-        uint64_t refusedAttempts() const { return refused_attempts; }
-
-        std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
-                                                                   const std::optional<String> & expected_value,
-                                                                   DB::Cas::TransportAccess & access) override
-        {
-            if (key == refused_key)
-            {
-                /// A genuine refused precondition never applies -- unlike `WriteCountingBackend::write`,
-                /// which both counts AND delegates to the real, LANDING write. Counting this attempt
-                /// through that base would apply it to storage and then lie about the outcome, which
-                /// made the erase loop's very first attempt land for real and see `Deleted` instead of
-                /// the perpetual conflict this backend's name promises. Count it here instead, and
-                /// return only the refusal.
-                ++refused_attempts;
-                return std::unexpected(DB::Cas::Backend::RawConflict{});
-            }
-            return WriteCountingBackend::write(key, bytes, expected_value, access);
-        }
-
-    private:
-        uint64_t refused_attempts = 0;
-    };
-
-    auto backend = std::make_shared<AlwaysRefusesCatalogWrites>();
-    DB::Cas::tests::FakeClock clock;
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-    requests.setNowFnForTest(clock.nowFn());
-    requests.setSleepFnForTest(clock.sleepFn());
-    CasOperation op = requests.admit();
-    const Layout layout("erase-cap");
-    const CatalogEntry removing{
-        .ns = RootNamespace{"a"},
-        .state = NsState::Removing,
-        .incarnation = UInt128{7},
-        .removal_started_round = 13};
-    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    backend->refused_key = layout.refCatalogKey();
-
-    const uint64_t start = clock.now;
-    String message;
-    try
-    {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
-        ADD_FAILURE() << "a permanently refused erase must not return an outcome";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-        message = e.message();
-    }
-    EXPECT_NE(message.find("deadline"), String::npos)
-        << "the shared bound, not the attempt cap, is what ended this call: " << message;
-    /// Two windows, so the assertion survives the jitter of the paced retries while still failing a
-    /// loop that binds a fresh window per iteration -- that one spends minutes here.
-    EXPECT_LT(clock.now - start, 2 * 90'000u) << "the loop outlived the window it captured";
-    EXPECT_LT(backend->refusedAttempts(), 100u) << "the attempt cap must not be what ends this call";
-    /// Greater than one is what proves the loop iterated rather than failing on its first attempt.
-    EXPECT_GT(backend->refusedAttempts(), 1u);
-    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
-}
 
 TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
 {
@@ -1829,7 +1053,7 @@ TEST(CASRefCatalog, AStaleHintNeverProducesAFalseEntryChanged)
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, creating);   /// through the lane: the cache holds Creating
+    CasRefCatalog::casAdmitEntry(pool_op, layout, creating);   /// through the lane: the cache holds Creating
 
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, creating), CasRefCatalog::NamespaceCreationOutcome::Live);
@@ -1838,7 +1062,7 @@ TEST(CASRefCatalog, AStaleHintNeverProducesAFalseEntryChanged)
     ASSERT_EQ(observed.state, NsState::Live);
     const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
     const uint64_t rereads_before = eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread);
-    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed, 7), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed), CasRefCatalog::BeginRemovingOutcome::Transitioned);
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
     EXPECT_EQ(eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread) - rereads_before, 1u);
     EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.at(0).state, NsState::Removing);
@@ -1852,7 +1076,7 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, creating);
 
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, creating), CasRefCatalog::NamespaceCreationOutcome::Live);
@@ -1879,23 +1103,16 @@ TEST(CASRefCatalog, AStaleHintCreateNamespaceStep1AdmitsANewIncarnation)
     CasOperation pool_op = f.pool.admit();
     const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
-    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, RootNamespace{"a"}, creator),
               CasRefCatalog::NamespaceCreationOutcome::Live);   /// the cache now holds "a" Live
 
     CasOperation other = f.external.admit();
     const CatalogEntry observed = CasRefCatalog::read(other, layout).catalog.entries.at(0);
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 9), CasRefCatalog::BeginRemovingOutcome::Transitioned);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(observed.incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
-                                .incarnation = observed.incarnation, .removal_started_round = 9};
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
-              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    eraseRowRaw(other, layout, observed.ns);
 
     const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
-    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, RootNamespace{"a"}, creator),
               CasRefCatalog::NamespaceCreationOutcome::Live);
     /// Two reads, not one: `createNamespace`'s own pre-check (`read`) never goes through the lane, so
     /// it always issues its own request regardless of the cache; the lane's ONE read is the one
@@ -1911,20 +1128,13 @@ TEST(CASRefCatalog, ATrueRefusalCreateNamespaceStep1SeesASuperseder)
     CasOperation pool_op = f.pool.admit();
     const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
-    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, RootNamespace{"a"}, creator),
               CasRefCatalog::NamespaceCreationOutcome::Live);
 
     CasOperation other = f.external.admit();
     const CatalogEntry observed = CasRefCatalog::read(other, layout).catalog.entries.at(0);
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 9), CasRefCatalog::BeginRemovingOutcome::Transitioned);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(observed.incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
-                                .incarnation = observed.incarnation, .removal_started_round = 9};
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
-              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    eraseRowRaw(other, layout, observed.ns);
     /// The store now carries no row for "a"; the pool's cache still holds its own stale "a" Live from
     /// the first `createNamespace` above. `createNamespace`'s own pre-check read is unconditional and
     /// always fresh, so if the rival lands its row BEFORE this call, the pre-check alone would already
@@ -1940,7 +1150,7 @@ TEST(CASRefCatalog, ATrueRefusalCreateNamespaceStep1SeesASuperseder)
     other_creating.creator = other_creator;
     CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest([&]
     {
-        CasRefCatalog::casAdmitEntry(other, layout, 1, other_creating);
+        CasRefCatalog::casAdmitEntry(other, layout, other_creating);
     });
 
     /// The hook's own admission is a real write on the SAME shared backend the pool uses, so a raw
@@ -1949,7 +1159,7 @@ TEST(CASRefCatalog, ATrueRefusalCreateNamespaceStep1SeesASuperseder)
     /// verdict is dropped and re-decided, which the rival's cache-less admission (its own private,
     /// budget-0 `CasHotKeys`) never does, so it isolates the lane's own contribution cleanly.
     const uint64_t rereads_before = eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread);
-    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, RootNamespace{"a"}, creator),
               CasRefCatalog::NamespaceCreationOutcome::Superseded);
     EXPECT_EQ(eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread) - rereads_before, 1u)
         << "one lane read: the cached hint's verdict was dropped and redecided on a fresh read";
@@ -1973,11 +1183,11 @@ TEST(CASRefCatalog, AStaleHintCompleteCreationLandsWhenItsOwnRowIsUnchanged)
     const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);   /// cache: "a" Creating
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a_creating);   /// cache: "a" Creating
 
     CasOperation other = f.external.admit();
     const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
-    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, 1, RootNamespace{"b"}, other_creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, RootNamespace{"b"}, other_creator),
               CasRefCatalog::NamespaceCreationOutcome::Live);
 
     EXPECT_EQ(CasRefCatalog::completeCreation(pool_op, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
@@ -1992,7 +1202,7 @@ TEST(CASRefCatalog, ATrueRefusalCompleteCreationSeesItsOwnRowCompletedElsewhere)
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a_creating);
 
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
@@ -2009,11 +1219,11 @@ TEST(CASRefCatalog, AStaleHintReconcileStaleCreatorLandsWhenItsOwnRowIsUnchanged
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);   /// cache: "a" Creating under creator X
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a_creating);   /// cache: "a" Creating under creator X
 
     CasOperation other = f.external.admit();
     const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
-    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, 1, RootNamespace{"b"}, other_creator),
+    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, RootNamespace{"b"}, other_creator),
               CasRefCatalog::NamespaceCreationOutcome::Live);
 
     const CreatorFence new_creator{.server_root_id = "srv2", .writer_epoch = 1, .fence_generation = 1};
@@ -2031,7 +1241,7 @@ TEST(CASRefCatalog, ATrueRefusalReconcileStaleCreatorSeesItsOwnRowCompletedElsew
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a_creating);
 
     CasOperation other = f.external.admit();
     ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
@@ -2040,76 +1250,6 @@ TEST(CASRefCatalog, ATrueRefusalReconcileStaleCreatorSeesItsOwnRowCompletedElsew
     EXPECT_EQ(CasRefCatalog::reconcileStaleCreator(pool_op, layout, a_creating, new_creator,
                   [](const CreatorFence &) { return true; }),
               CasRefCatalog::ReconcileCreatorOutcome::EntryChanged);
-}
-
-/// Admission refusal (LIMIT_EXCEEDED): the pool's cache holds a catalog at the namespace limit, but
-/// the external erased one row, so the fresh catalog admits.
-TEST(CASRefCatalog, AStaleHintAdmissionRefusalAdmitsWhenTheFreshCatalogHasRoom)
-{
-    const Layout layout("p");
-    constexpr uint64_t gc_shards = 1;
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
-        + widestCondemnedSummaryReservationBytes(gc_shards);
-    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
-
-    PoolAndExternal f(std::make_shared<CountingBackend>());
-    CasOperation pool_op = f.pool.admit();
-    RefCatalog full;
-    full.entries.reserve(max_entries);
-    for (uint64_t i = 0; i < max_entries; ++i)
-        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
-    seedObject(pool_op, layout.refCatalogKey(), encodeRefCatalog(full));
-    /// Prime the cache with the full catalog: any further admission through the pool refuses on it.
-    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
-
-    CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, full.entries[0], 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
-    const CasRefCatalog::Snapshot after_remove = CasRefCatalog::read(other, layout);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(full.entries[0].incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const CatalogEntry removing{.ns = full.entries[0].ns, .state = NsState::Removing,
-                                .incarnation = full.entries[0].incarnation, .removal_started_round = 5};
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(other, layout, after_remove, removing, ready_parent, noAuthorityRefresh).outcome,
-              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-
-    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
-    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, gc_shards, RootNamespace{"fresh"}, creator),
-              CasRefCatalog::NamespaceCreationOutcome::Live);
-}
-
-/// Admission refusal (LIMIT_EXCEEDED): the fresh catalog is also full -- thrown, no write.
-TEST(CASRefCatalog, ATrueRefusalAdmissionRefusalThrowsWhenTheFreshCatalogIsAlsoFull)
-{
-    const Layout layout("p");
-    constexpr uint64_t gc_shards = 1;
-    const uint64_t cap = foldSealCaps().object_cap;
-    const uint64_t fixed = foldSealFixedBytes();
-    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
-        + widestCondemnedSummaryReservationBytes(gc_shards);
-    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
-
-    PoolAndExternal f(std::make_shared<CountingBackend>());
-    CasOperation pool_op = f.pool.admit();
-    RefCatalog full;
-    full.entries.reserve(max_entries);
-    for (uint64_t i = 0; i < max_entries; ++i)
-        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
-    seedObject(pool_op, layout.refCatalogKey(), encodeRefCatalog(full));
-    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });   /// prime the cache
-
-    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
-    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
-    {
-        (void)CasRefCatalog::createNamespace(pool_op, layout, gc_shards, RootNamespace{"overflow"}, creator);
-    });
-    EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
 }
 
 /// casAdmitEntry: the cache holds "a"; the external erased it -- admits it again on the fresh read.
@@ -2125,21 +1265,14 @@ TEST(CASRefCatalog, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoom)
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a = liveEntry("a", 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);   /// cache: "a"
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a);   /// cache: "a"
 
     CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(a.incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const CatalogEntry removing{.ns = a.ns, .state = NsState::Removing,
-                                .incarnation = a.incarnation, .removal_started_round = 5};
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
-              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    eraseRowRaw(other, layout, a.ns);
 
     const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
-    EXPECT_NO_THROW(CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)));
+    EXPECT_NO_THROW(CasRefCatalog::casAdmitEntry(pool_op, layout, liveEntry("a", 2)));
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
 }
 #endif
@@ -2152,22 +1285,15 @@ TEST(CASRefCatalogDeathTest, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoomAbo
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a = liveEntry("a", 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);   /// cache: "a"
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a);   /// cache: "a"
 
     CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(a.incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const CatalogEntry removing{.ns = a.ns, .state = NsState::Removing,
-                                .incarnation = a.incarnation, .removal_started_round = 5};
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
-              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    eraseRowRaw(other, layout, a.ns);
 
     /// The lane's re-render on a fresh read cannot rescue this, because constructing the
     /// `LOGICAL_ERROR` for the hint's own duplicate aborts before the reread ever happens.
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -2182,13 +1308,13 @@ TEST(CASRefCatalog, ATrueRefusalCasAdmitEntrySeesItsRowStillPresent)
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a = liveEntry("a", 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a);
 
     CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a), CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); });
+        [&] { CasRefCatalog::casAdmitEntry(pool_op, layout, a); });
 }
 #endif
 
@@ -2200,12 +1326,12 @@ TEST(CASRefCatalogDeathTest, ATrueRefusalCasAdmitEntrySeesItsRowStillPresentAbor
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry a = liveEntry("a", 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, a);
 
     CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a), CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, a); }, "not canonically ordered");
 }
 #endif
 
@@ -2223,7 +1349,7 @@ TEST(CASRefCatalog, AFenceLostDuringStepOneIsFencedOutNotABareMarker)
         CasOperation op = f.pool.admit([&] { return alive; });
         f.hot_keys.enter_after_lane_hook_for_test = [&] { alive = false; };
         const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
-        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, RootNamespace{"a"}, creator),
+        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, RootNamespace{"a"}, creator),
                   CasRefCatalog::NamespaceCreationOutcome::FencedOut);
         f.hot_keys.enter_after_lane_hook_for_test = {};
         EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before);
@@ -2234,7 +1360,7 @@ TEST(CASRefCatalog, AFenceLostDuringStepOneIsFencedOutNotABareMarker)
         bool alive = true;
         CasOperation op = f.pool.admit([&] { return alive; });
         f.backend->onWriteCommitted(layout.refCatalogKey(), [&] { alive = false; });
-        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, RootNamespace{"b"}, creator),
+        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, RootNamespace{"b"}, creator),
                   CasRefCatalog::NamespaceCreationOutcome::FencedOut);
         f.backend->onWriteCommitted(layout.refCatalogKey(), {});
         const auto snap = CasRefCatalog::read(seed, layout);
@@ -2245,7 +1371,7 @@ TEST(CASRefCatalog, AFenceLostDuringStepOneIsFencedOutNotABareMarker)
     {
         CasOperation op = f.pool.admit([] { return false; });
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
-            [&] { CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("c", 3)); });
+            [&] { CasRefCatalog::casAdmitEntry(op, layout, liveEntry("c", 3)); });
     }
 }
 
@@ -2258,34 +1384,34 @@ TEST(CASRefCatalog, TheStoresAnswerToAHintsWriteIsDeliveredAndTheRetryLearnsTheR
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
     const CatalogEntry observed = liveEntry("a", 1);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, observed);   /// the cache holds "a" Live
+    CasRefCatalog::casAdmitEntry(pool_op, layout, observed);   /// the cache holds "a" Live
 
     /// Another server moved the row on; the hint still matches what this caller observed, so a write
     /// goes out, and the store refuses it definitively.
     CasOperation other = f.external.admit();
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed), CasRefCatalog::BeginRemovingOutcome::Transitioned);
     f.backend->failNextWriteWith(layout.refCatalogKey(), s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
     const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
     const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR,
-        [&] { (void)CasRefCatalog::beginRemoving(pool_op, layout, observed, 5); });
+        [&] { (void)CasRefCatalog::beginRemoving(pool_op, layout, observed); });
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()) - writes_before, 1u);
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 0u);
     /// The caller's ordinary retry after a fresh observation learns the row moved.
-    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed, 5), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
+    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
 
     /// The same stale hint, and the fence trips between the refused write and its resolve read.
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("b", 2));
+    CasRefCatalog::casAdmitEntry(pool_op, layout, liveEntry("b", 2));
     const CatalogEntry b = liveEntry("b", 2);
-    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, b), CasRefCatalog::BeginRemovingOutcome::Transitioned);
     bool alive = true;
     CasOperation fenced = f.pool.admit([&] { return alive; });
     f.backend->onBeforeWrite(layout.refCatalogKey(), [&] { alive = false; });
-    EXPECT_EQ(CasRefCatalog::beginRemoving(fenced, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::FencedOut);
+    EXPECT_EQ(CasRefCatalog::beginRemoving(fenced, layout, b), CasRefCatalog::BeginRemovingOutcome::FencedOut);
     f.backend->onBeforeWrite(layout.refCatalogKey(), {});
     EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.at(1).state, NsState::Removing) << "nothing of ours landed";
     CasOperation readmitted = f.pool.admit();
-    EXPECT_EQ(CasRefCatalog::beginRemoving(readmitted, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
+    EXPECT_EQ(CasRefCatalog::beginRemoving(readmitted, layout, b), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
 }
 #endif
 
@@ -2295,7 +1421,7 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
     const Layout layout("p");
     CasOperation pool_op = f.pool.admit();
     CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(pool_op, layout, liveEntry("a", 1));
     CasOperation other = f.external.admit();
     const String key = layout.refCatalogKey();
 
@@ -2322,7 +1448,7 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
         if (inside || moved >= limit)
             return;
         inside = true;
-        CasRefCatalog::casAdmitEntry(other, layout, 1, liveEntry(prefix + std::to_string(moved), incarnation_base + moved));
+        CasRefCatalog::casAdmitEntry(other, layout, liveEntry(prefix + std::to_string(moved), incarnation_base + moved));
         if (ambiguous)
             f.backend->injectAmbiguousWrite(key);
         ++moved;
@@ -2360,63 +1486,3 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
            "somewhere in 8 draws, so this is what tells the two schedules apart";
 }
 
-TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)
-{
-    PoolAndExternal f(std::make_shared<CountingBackend>());
-    const Layout layout("p");
-    CasOperation pool_op = f.pool.admit();
-    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
-    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
-                                .incarnation = UInt128{7}, .removal_started_round = 13};
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("keep", 1));
-    /// Seed the Removing row through the external, as raw bytes: `casUpdate` refuses to add rows, and
-    /// the point is that the pool's cache is stale about this one.
-    CasOperation other = f.external.admit();
-    {
-        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(other, layout);
-        RefCatalog with_removing = snap.catalog;
-        with_removing.entries.insert(with_removing.entries.begin(), removing);   /// "a" sorts before "keep"
-        (void)orThrow(other.replace(layout.refCatalogKey(), encodeRefCatalog(with_removing), *snap.etag, Retry::standard()), "seed");
-    }
-    CasFoldSeal ready_parent;
-    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-
-    /// The erase runs on an open plane of the same pool while a lane holder is parked in its write:
-    /// it does not wait.
-    CasRequests open_plane(f.backend, Fence::open(), f.clock.nowFn(), f.clock.sleepFn(), &f.hot_keys);
-    CasOperation erase_op = open_plane.admit();
-    std::latch parked(1);
-    std::latch release(1);
-    int seen = 0;
-    f.backend->onBeforeWrite(layout.refCatalogKey(), [&]
-    {
-        if (seen++ != 0)
-            return;
-        parked.count_down();
-        release.wait();
-    });
-    std::thread holder([&]
-    {
-        CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
-    });
-    parked.wait();
-    const auto result = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-        erase_op, layout, CasRefCatalog::read(other, layout), removing, ready_parent, noAuthorityRefresh);
-    EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-    EXPECT_EQ(f.hot_keys.queueDepthForTest(layout.refCatalogKey()), 1u) << "the holder is still parked";
-    release.count_down();
-    holder.join();
-    f.backend->onBeforeWrite(layout.refCatalogKey(), {});
-
-    /// The pool's next submission pays exactly one resolve read and one retry write for the erase.
-    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
-    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("c", 3));
-    EXPECT_LE(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u);
-    EXPECT_LE(f.backend->writeCount(layout.refCatalogKey()) - writes_before, 2u);
-    const uint64_t reads_after = f.backend->getCount(layout.refCatalogKey());
-    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("d", 4));
-    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), reads_after) << "the one after starts from the cache";
-}

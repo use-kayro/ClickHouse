@@ -34,7 +34,7 @@ The fastest way to load the model is Git, which most readers already carry:
 | blob (file content by hash) | **blob** — one part file's bytes, keyed by content hash |
 | tree (directory listing) | **part manifest** — the immutable file list of one part |
 | ref (`refs/heads/main`) | **ref** — `part name → manifest id`, the only mutable state |
-| `gc` / reachability | **GC round** — an in-degree fold over refs → manifests → blobs |
+| `gc` / reachability | **GC round** — blob liveness from the `Keeper` part records of the tables on the pool |
 
 Where the analogy breaks: Git's objects are locally addressed and GC runs against a single
 repository with no concurrent writers; CAS objects are addressed inside a shared, multi-writer
@@ -76,9 +76,9 @@ substance:
 | Exact-token deletes | Every delete names the exact object incarnation it removes, never "the object at this key" |
 | `TOKEN ⟹ CONTENT` | A repeated write token implies unchanged bytes — the backend must never let a token be reused over different content |
 | Fail closed on ambiguity | An operation that may have landed is never treated as one that did not |
-| One content-delete site | Exactly one place in the whole codebase ever deletes a blob body, gated on a previously published `GC` round |
+| One content-delete site | Exactly one place in the whole codebase ever deletes a blob body: the `GC` round's `remove` phase |
 | `GC` never invents history | Cleaning up an abandoned write is the writer's job, not `GC`'s |
-| Over-count only | A lost or duplicated `GC` fold can only delay a reclaim, never bring one forward |
+| Over-count only | A lost condemnation or a part with no record can only delay a reclaim, never bring one forward |
 | No dangle / no loss / no return | A live ref always resolves through present objects; a delete requires proven unreachability at an exact token; a retired object identity is never valid again (though the same logical key can return under a new token) |
 
 ## Positioning: shared-nothing, not shared-state {#positioning}
@@ -104,7 +104,7 @@ and its load does not grow with pool size, because the pool's own bookkeeping ne
 | [Namespaces](/antalya/cas/architecture/namespaces) | Namespaces, `life_id`, the catalog, and their lifetime |
 | [Blob protocol](/antalya/cas/architecture/blob-protocol) | Conditional writes, deduplication, the writer-vs-GC race |
 | [Part lifecycle](/antalya/cas/architecture/part-lifecycle) | Build, precommit, upload, promote; crash points and their cleaners |
-| [Manifests and refs](/antalya/cas/architecture/manifests-and-refs) | Part manifests and the ref machinery: publish, fold, recovery |
+| [Manifests and refs](/antalya/cas/architecture/manifests-and-refs) | Part manifests and the ref machinery: publish, recovery |
 | [Mounts and leases](/antalya/cas/architecture/mounts-and-leases) | Server identity, the owner claim, the mount lease, fencing |
 | [Replication](/antalya/cas/architecture/replication) | Fetch-by-relink between replicas sharing one pool |
 | [Read path](/antalya/cas/architecture/read-path) | Ref resolution, manifest reads, ranged blob reads, the caches |
