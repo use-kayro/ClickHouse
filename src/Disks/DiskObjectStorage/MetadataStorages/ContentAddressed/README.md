@@ -27,9 +27,12 @@ blobs over S3-family object storage, for `ReplicatedMergeTree` tables. Every uni
   a removed record named that no remaining record names is deleted only if, after its ETag is read, nothing on
   this server references it -- by that exact ETag. The pending candidates live in memory only: a writer restart
   between a record removal and the deletes leaks those blobs, never loses one.
-- **Readers** (servers that do not write blobs) refuse every blob upload (`NOT_IMPLEMENTED`): an INSERT, a fetch
-  of a part's bytes. They attach parts from records, clone them locally (REPLACE), and fetch merged and mutated
-  parts (`always_fetch_merged_part` covers mutations on a CAS disk).
+- **Readers** (servers that do not write blobs) build no part (`NOT_IMPLEMENTED`, before any blob is
+  consulted): no INSERT, local clone, merge or mutation. They commit only fetched parts, attached from their
+  records: REPLACE parts are fetched, and merged and mutated parts too (`always_fetch_merged_part` covers
+  mutations on a CAS disk; without it the local attempt is refused before any request).
+- **One writer per pool.** Nothing in the server prevents two servers with `replicated_can_become_leader = 1`
+  on one pool; keeping exactly one is a deployment precondition (readers 0, writer 1).
 - **Refused on a content-addressed disk**, because nothing would persist the result: a table-level or loose
   file, FREEZE, DETACH, a fetch into `detached/`, a MOVE to or from another disk (`moving/`), and non-replicated
   MergeTree tables.
@@ -71,7 +74,7 @@ A CAS disk is an `object_storage` disk with `metadata_type` = `cas`:
         <type>object_storage</type>
         <object_storage_type>s3</object_storage_type>
         <metadata_type>cas</metadata_type>
-        <!-- Required: prefix of this server's in-memory namespaces and of its S3 staging subtree. -->
+        <!-- Required: prefix of this server's in-memory namespaces. -->
         <cas_server_root_id>replica-1</cas_server_root_id>
         <cas_gc_enabled>1</cas_gc_enabled>
         <cas_gc_interval_sec>60</cas_gc_interval_sec>

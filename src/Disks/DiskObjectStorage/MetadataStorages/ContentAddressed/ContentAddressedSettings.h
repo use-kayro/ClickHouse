@@ -9,14 +9,6 @@
 
 namespace Poco { namespace Util { class AbstractConfiguration; } } // NOLINT(cppcoreguidelines-virtual-class-destructor)
 
-namespace DB::Cas
-{
-/// Forward declared to keep this header light: the full definition lives in
-/// `ContentAddressedMetadataStorage.h`, which is heavy and will itself include this header once the
-/// metadata storage is rewired onto it. A legal opaque declaration: `StagingBackend` fixes no
-/// explicit underlying type, matching its definition.
-enum class StagingBackend;
-}
 
 namespace DB
 {
@@ -68,17 +60,14 @@ struct ContentAddressedSettings
     /// Fail-closed checks: `gc_interval_sec` must be >= 1; `server_root_id` must
     /// be present (an ABSENT key throws a typed `NO_ELEMENTS_IN_CONFIG`, distinct from a
     /// PRESENT-but-invalid value, which throws `BAD_ARGUMENTS`); and the
-    /// two enum-valued string settings (`blob_hash`, `staging_backend`) must parse. The parsed enum
-    /// values are cached for the typed accessors below.
+    /// enum-valued `blob_hash` must parse. The parsed value is cached for the typed accessor below.
     void validate();
 
-    /// Typed accessors for the enum-valued string settings, parsed and cached by `validate`.
+    /// Typed accessor for the enum-valued string setting, parsed and cached by `validate`.
     Cas::BlobHashAlgo blobHashAlgo() const;
-    Cas::StagingBackend stagingBackend() const;
 
 private:
-    /// The parsed enum values live inside `impl` (defined in the .cpp, where the forward-declared
-    /// `Cas::StagingBackend` type is complete), not as members here.
+    /// The parsed value lives inside `impl` (defined in the .cpp).
     std::unique_ptr<ContentAddressedSettingsImpl> impl;
 };
 

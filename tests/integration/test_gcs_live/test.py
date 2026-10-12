@@ -237,7 +237,6 @@ def _disk_xml(
     client,
     bucket=None,
     skip_access_check=False,
-    staging_backend="local",
 ):
     lines = [
         "            <{}>".format(name),
@@ -262,7 +261,6 @@ def _disk_xml(
             "                <cas_server_root_id>{}</cas_server_root_id>".format(name),
             "                <cas_gc_interval_sec>3600</cas_gc_interval_sec>",
             "                <gcs_max_conditional_put_bytes>{}</gcs_max_conditional_put_bytes>".format(FORMER_CONDITIONAL_PUT_CAP),
-            "                <cas_staging_backend>{}</cas_staging_backend>".format(staging_backend),
             "                <http_keep_alive_timeout>30</http_keep_alive_timeout>",
             "                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>",
         ]
@@ -357,7 +355,6 @@ def _write_config(path):
                 "cas-hmac-staged",
                 cas=True,
                 client="gcs_hmac",
-                staging_backend="s3",
             ),
         ]
         if AMBIGUITY_DRIVER_AVAILABLE:
@@ -367,7 +364,6 @@ def _write_config(path):
                     "cas-hmac-ambiguity",
                     cas=True,
                     client="gcs_hmac",
-                    staging_backend="s3",
                 )
             )
         policies += [
@@ -388,7 +384,6 @@ def _write_config(path):
                 "cas-oauth-staged",
                 cas=True,
                 client="gcp_oauth",
-                staging_backend="s3",
             ),
         ]
         if AMBIGUITY_DRIVER_AVAILABLE:
@@ -398,7 +393,6 @@ def _write_config(path):
                     "cas-oauth-ambiguity",
                     cas=True,
                     client="gcp_oauth",
-                    staging_backend="s3",
                 )
             )
         policies += [

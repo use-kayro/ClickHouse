@@ -410,25 +410,6 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
     EXPECT_EQ(after->bytes, "fresh-envelopepayload");
 }
 
-TEST(CASInMemory, PublishBlobCopiesStagedObjectBytesVerbatim)
-{
-    InMemoryBackend backend;
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("stage", "staged-envelopepayload", Retry::once())));
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("blob", "old-body", Retry::once())));
-
-    op.publish(BlobPublishRequest{
-        .destination_key = "blob",
-        .publication = VerbatimStagedBlobPublication{
-            .object_key = "stage",
-            .object_size = 22}}, Retry::once());
-
-    const auto after = op.read("blob", Retry::once());
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->bytes, "staged-envelopepayload");
-}
-
 // =====================================================================
 // Task 4: CasInMemoryBackend — fault injection and probe-test modes
 // =====================================================================
@@ -1113,69 +1094,6 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayl
     EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
 }
 
-TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultRequestMode)
-{
-    auto storage = makePublicationRecordingStorage();
-    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/staging");
-    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/copied");
-
-    {
-        auto out = storage->writeObject(
-            DB::StoredObject(staging), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
-        DB::writeString(String("staged-envelopepayload"), *out);
-        out->finalize();
-    }
-    storage->resetRecording();
-
-    op.publish(BlobPublishRequest{
-        .destination_key = destination,
-        .publication = VerbatimStagedBlobPublication{
-            .object_key = staging,
-            .object_size = 22}}, Retry::once());
-
-    ASSERT_EQ(storage->copy_calls, 1u);
-    ASSERT_TRUE(storage->last_copy_settings.has_value());
-    EXPECT_EQ(storage->last_copy_settings->object_storage_copy_mode, DB::ObjectStorageCopyMode::NativeOnly);
-    EXPECT_EQ(storage->last_copy_settings->object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
-    EXPECT_EQ(storage->last_copy_settings->object_storage_retry_profile, DB::ObjectStorageRetryProfile::Default);
-    EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_none_match.empty());
-    EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_match.empty());
-    EXPECT_EQ(readStorageObject(storage, destination), "staged-envelopepayload");
-}
-
-TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTransport)
-{
-    auto storage = makePublicationRecordingStorage();
-    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    CasRequests requests = openRequestsForTest(backend);
-    CasOperation op = requests.admit();
-    const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-staging");
-    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-copy");
-
-    {
-        auto out = storage->writeObject(
-            DB::StoredObject(staging), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
-        DB::writeString(String("complete-staged-object"), *out);
-        out->finalize();
-    }
-    storage->resetRecording();
-    storage->native_copy_supported = false;
-
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
-    {
-        op.publish(BlobPublishRequest{
-            .destination_key = destination,
-            .publication = VerbatimStagedBlobPublication{
-                .object_key = staging,
-                .object_size = 22}}, Retry::once());
-    });
-
-    EXPECT_EQ(storage->copy_calls, 0u);
-    EXPECT_FALSE(storage->exists(DB::StoredObject(destination)));
-}
 
 /// Every Native conditional write selects the SingleAttempt object-storage retry profile (RFC
 /// cas-s3-timeout-retry-control §disable-transparent-conditional-write-retries): the CAS request

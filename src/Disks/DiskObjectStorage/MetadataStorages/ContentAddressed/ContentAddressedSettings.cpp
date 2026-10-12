@@ -59,17 +59,14 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(Bool,   blob_hash_allow_new, false, "Explicit opt-in to admit a NEW hash algo into an existing pool's algos_used", 0) \
     DECLARE(String, server_root_id, "", "REQUIRED explicit layout subtree identity; macros expand as in the s3 endpoint", 0) \
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a pool request (blob PUT, HEAD, exact DELETE; `_pool_meta` read), at least 1", 0) \
-    DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
 
 DECLARE_SETTINGS_TRAITS(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES)
 
 struct ContentAddressedSettingsImpl : public BaseSettings<ContentAddressedSettingsTraits>
 {
-    /// Parsed by `validate` from the corresponding string setting; cached here (rather than
-    /// re-parsed on every access) because the public header only forward-declares
-    /// `Cas::StagingBackend` and cannot store it by value.
+    /// Parsed by `validate` from the corresponding string setting; cached here rather than re-parsed on
+    /// every access.
     Cas::BlobHashAlgo blob_hash_algo_cached = Cas::BlobHashAlgo::CityHash128;
-    Cas::StagingBackend staging_backend_cached = Cas::StagingBackend::Local;
 };
 
 IMPLEMENT_SETTINGS_TRAITS_CUSTOM_IMPL(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, ContentAddressedSettings, ContentAddressedSetting)
@@ -217,8 +214,7 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
             "Expected `cas_server_root_id` in config for a content-addressed disk");
 
-    /// A clean relative path: it prefixes every in-memory namespace and names this server's S3 staging
-    /// subtree. Non-empty, at most 255 bytes, no empty, '.' or '..' segment.
+    /// A clean relative path: it prefixes every in-memory namespace. Non-empty, at most 255 bytes, no empty, '.' or '..' segment.
     const String & id = settings[ContentAddressedSetting::server_root_id].value;
     if (id.empty() || id.size() > 255)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -236,17 +232,11 @@ void ContentAddressedSettings::validate()
     }
 
     impl->blob_hash_algo_cached = Cas::parseBlobHashAlgo(settings[ContentAddressedSetting::blob_hash].value);
-    impl->staging_backend_cached = ContentAddressedMetadataStorage::parseStagingBackend(settings[ContentAddressedSetting::staging_backend].value);
 }
 
 Cas::BlobHashAlgo ContentAddressedSettings::blobHashAlgo() const
 {
     return impl->blob_hash_algo_cached;
-}
-
-Cas::StagingBackend ContentAddressedSettings::stagingBackend() const
-{
-    return impl->staging_backend_cached;
 }
 
 }

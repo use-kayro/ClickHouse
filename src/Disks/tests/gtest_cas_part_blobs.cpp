@@ -37,7 +37,7 @@ BlobUploadRequest request(const String & payload)
 PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & backend)
 {
     DB::Cas::tests::ensureBlobUploadPoolForTest();
-    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 }
 
 /// A deterministic local failure on every blob publication.
@@ -55,12 +55,12 @@ TEST(CASPartBlobs, UploadsEachDistinctBlobOnceAndAdoptsWhatIsReferenced)
     auto pool = openPool(backend);
     const std::vector<BlobUploadRequest> first{request("a"), request("b"), request("a")};
     {
-        PartBlobs build(pool, "ns/all_1_1_0", /*may_upload=*/true);
+        PartBlobs build(pool, "ns/all_1_1_0");
         build.upload(first);
         EXPECT_EQ(backend->publishTotal(), 2u);   /// one task per distinct blob
 
         /// A second part with the same content, while the first build still references it: adopted.
-        PartBlobs second(pool, "ns/all_2_2_0", /*may_upload=*/true);
+        PartBlobs second(pool, "ns/all_2_2_0");
         second.upload(std::vector<BlobUploadRequest>{request("a"), request("b")});
         EXPECT_EQ(backend->publishTotal(), 2u);
         EXPECT_FALSE(pool->blobRefs()->unreferencedNow(first[0].ref));
@@ -70,20 +70,9 @@ TEST(CASPartBlobs, UploadsEachDistinctBlobOnceAndAdoptsWhatIsReferenced)
     EXPECT_TRUE(pool->blobRefs()->unreferencedNow(first[1].ref));
 
     /// With nothing referencing it, the next build uploads again, unconditionally.
-    PartBlobs third(pool, "ns/all_3_3_0", /*may_upload=*/true);
+    PartBlobs third(pool, "ns/all_3_3_0");
     third.upload(std::vector<BlobUploadRequest>{request("a")});
     EXPECT_EQ(backend->publishTotal(), 3u);
-}
-
-TEST(CASPartBlobs, RefusedOnAServerThatDoesNotWriteBlobs)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto pool = openPool(backend);
-    const auto req = request("reader-payload");
-    PartBlobs build(pool, "ns/all_1_1_0", /*may_upload=*/false);
-    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { build.upload(std::vector<BlobUploadRequest>{req}); });
-    EXPECT_EQ(backend->publishTotal(), 0u);
-    EXPECT_TRUE(pool->blobRefs()->unreferencedNow(req.ref)) << "a refused upload must not keep its claim";
 }
 
 TEST(CASPartBlobs, FailedUploadRethrowsAndReleasesTheClaim)
@@ -91,7 +80,7 @@ TEST(CASPartBlobs, FailedUploadRethrowsAndReleasesTheClaim)
     auto backend = std::make_shared<FailingPublishBackend>();
     auto pool = openPool(backend);
     const auto req = request("doomed");
-    PartBlobs build(pool, "ns/all_1_1_0", /*may_upload=*/true);
+    PartBlobs build(pool, "ns/all_1_1_0");
     EXPECT_THROW(build.upload(std::vector<BlobUploadRequest>{req, request("doomed-too")}), std::exception);
     EXPECT_TRUE(pool->blobRefs()->unreferencedNow(req.ref)) << "a failed upload must not be adopted later";
 }

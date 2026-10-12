@@ -105,7 +105,7 @@ PoolMeta admitOrValidate(CasOperation & op, const String & key, BlobHashAlgo con
 
 PoolMeta PoolMeta::createOrValidate(
     CasOperation & op, const Layout & layout, uint64_t blob_header_len,
-    BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint)
+    BlobHashAlgo blob_hash_algo, bool allow_new, bool writer)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
@@ -125,6 +125,11 @@ PoolMeta PoolMeta::createOrValidate(
         PoolMeta pm = decodePoolMeta(existing->bytes);
         if (isAlgoAdmittedIn(pm, blob_hash_algo))
             return pm;
+        /// Admitting an algorithm writes `_pool_meta`: the writer's alone, like the mint.
+        if (!writer)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "CAS pool blob_hash mismatch: pool has {{{}}}; config requests {}; only the pool's writer admits a new "
+                "algo, and this server is not the writer", joinAlgoNames(pm.algos_used), blobHashAlgoName(blob_hash_algo));
         return admitOrValidate(op, key, blob_hash_algo, allow_new);
     }
 
@@ -133,9 +138,9 @@ PoolMeta PoolMeta::createOrValidate(
     /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
     /// creation, not left at 0.
     ///
-    /// Only the pool's writer mints (`allow_mint`, TEC-851 step 3c): every other open fails closed here, so a
+    /// Only the pool's writer mints (`writer`, TEC-851 step 3c): every other open fails closed here, so a
     /// reader started on a brand-new pool before its writer refuses to boot instead of writing.
-    if (!allow_mint)
+    if (!writer)
         throw Exception(ErrorCodes::INVALID_STATE,
             "CAS pool meta: _pool_meta absent and this server is not the pool's writer; "
             "start the writer first on a new pool");

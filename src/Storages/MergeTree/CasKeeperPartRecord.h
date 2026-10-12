@@ -40,7 +40,8 @@ UInt128 casBlobDigestOf(const MergeTreeDataPartChecksum & checksum);
 /// targets the purpose-built INTERFACE, never the concrete metadata-storage class.
 IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk);
 
-/// The disks of `disks` a Keeper record can hold a part on: content-addressed and writable.
+/// The content-addressed disks of `disks`: the ones a Keeper record can hold a part on, read-only ones included
+/// (their parts exist only in the records too).
 Disks casRecordDisks(const Disks & disks);
 
 /// What a commit of `part` adds to `ops` for its Keeper record `<zookeeper_path>/cas_parts/<part>`.

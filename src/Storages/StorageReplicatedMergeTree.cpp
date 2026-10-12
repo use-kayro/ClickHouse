@@ -3491,8 +3491,13 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
     {
         /// Fetches with zero-copy-replication are cheap, but cloneAndLoadDataPart(must_on_same_disk=true) will do full copy.
         /// It's okay to check the setting for current table and disk for the source table, because src and dst part are on the same disk.
-        bool prefer_fetch_from_other_replica = !part_desc->replica.empty() && (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-            && part_desc->src_table_part && part_desc->src_table_part->isStoredOnRemoteDiskWithZeroCopySupport();
+        /// On a content-addressed disk only the pool's writer builds a part (a local clone is a build): any other
+        /// replica fetches the result, attached from its Keeper record.
+        bool prefer_fetch_from_other_replica = !part_desc->replica.empty() && part_desc->src_table_part
+            && (((*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
+                    && part_desc->src_table_part->isStoredOnRemoteDiskWithZeroCopySupport())
+                || (part_desc->src_table_part->getDataPartStorage().isContentAddressed()
+                    && !(*storage_settings_ptr)[MergeTreeSetting::replicated_can_become_leader]));
 
         if (part_desc->src_table_part && !prefer_fetch_from_other_replica)
         {

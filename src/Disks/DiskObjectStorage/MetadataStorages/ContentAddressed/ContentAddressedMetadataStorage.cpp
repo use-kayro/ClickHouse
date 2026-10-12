@@ -160,7 +160,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
-    , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
 {
@@ -169,22 +168,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 ContentAddressedMetadataStorage::~ContentAddressedMetadataStorage()
 {
     stopAndDrainForTeardown();
-}
-
-Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(const std::string & value)
-{
-    if (value == "local")
-        return Cas::StagingBackend::Local;
-    if (value == "s3")
-        return Cas::StagingBackend::S3;
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_staging_backend value '{}' (expected 'local' or 's3')", value);
-}
-
-Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
-    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
-{
-    return parseStagingBackend(config.getString(config_prefix + ".staging_backend", "local"));
 }
 
 ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)
@@ -390,7 +373,7 @@ std::optional<uint64_t> ContentAddressedMetadataStorage::freezeConnectTimeoutCap
 
 ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView() const
 {
-    /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
+    /// Native mode rides real conditional ops (the store's own); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
@@ -399,7 +382,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
     /// pool (e.g. an NFS/shared mount) each keep independent token state and would silently violate
-    /// the CAS invariants — the capability probe cannot detect this (each process passes it alone).
+    /// the CAS invariants, and nothing can detect it (each process sees a consistent store alone).
     /// Make a shared-pool misconfiguration visible at INFO, not WARNING.
     /// An inline `disk = disk(... object_storage_type=local ...)` opens the disk on the QUERY thread, so
     /// a WARNING is forwarded to the client at the functional-test default `send_logs_level=warning` and
@@ -424,8 +407,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     String pool_prefix = storage_path_prefix;
     /// The configured prefix is an endpoint sub-path and usually carries a TRAILING slash
     /// ("content_addressed_s3/"); Cas::Layout joins components with '/', and a doubled slash in
-    /// keys is backend-hostile (RustFS rejects "p//_probe" LIST prefixes with InvalidArgument -
-    /// Some backends reject such prefixes while others merely tolerate them).
+    /// keys is backend-hostile (some backends reject such keys while others merely tolerate them).
     while (!pool_prefix.empty() && pool_prefix.back() == '/')
         pool_prefix.pop_back();
     String physical_key_prefix_local;
@@ -456,7 +438,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.blob_hash_algo = blob_hash_algo;
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
     /// Only the server that writes blobs mints a brand-new pool's `_pool_meta`.
-    pool_config.mint_pool_meta = may_write_blobs;
+    pool_config.writer = may_write_blobs;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     /// Frozen here, once: see `freezeConnectTimeoutCapMs`.
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);
@@ -498,14 +480,6 @@ void ContentAddressedMetadataStorage::startup()
 
     read_only = object_storage->isReadOnly();
 
-    if (staging_backend == Cas::StagingBackend::S3
-        && !read_only
-        && !object_storage->supportsCopyMode(ObjectStorageCopyMode::NativeOnly))
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "cas_staging_backend=s3 requires native-only same-store copy, but object storage {} does not support it",
-            object_storage->getName());
-
     /// Only the server whose replicas can become merge leader writes blob bodies and runs the GC
     /// (TEC-851 decision of 11/10): the record GC's safety covers this process's builds only. A CAS table
     /// whose own `replicated_can_become_leader` differs from this server's is refused at creation, so this
@@ -518,13 +492,6 @@ void ContentAddressedMetadataStorage::startup()
     auto pool = std::move(view.pool);
     auto uuid = Cas::u128ToHex(pool->poolMeta().pool_id);
     auto facade = std::make_shared<Cas::HeldParts>(pool->blobRefs());
-
-    if (staging_backend == Cas::StagingBackend::S3 && !read_only)
-    {
-        Cas::sweepOwnMountStaging(
-            *object_storage,
-            physicalKey(view.pool_prefix + "/staging/" + server_root_id) + "/");
-    }
 
     /// The background GC runs only on the disk-factory path (context non-null), when enabled, and only on
     /// the server that writes blobs: its delete is safe against this process's builds only (`BlobRefCount`).
@@ -738,13 +705,6 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
     checkNotReadOnly("writes");
     return std::make_shared<ContentAddressedTransaction>(*this);
-}
-
-String ContentAddressedMetadataStorage::stagingKeyPrefix() const
-{
-    /// This is the writer-owned `staging/<server_root_id>/` subtree. `store` throws `INVALID_STATE`
-    /// when no pool is published; every writer caller runs after `startup`.
-    return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
 }
 
 /// ==== namespace mapping ====
@@ -1152,35 +1112,6 @@ bool ContentAddressedMetadataStorage::holdKeeperPart(
     }
     partAccess()->install(r->refKey(), std::move(entries));
     return true;
-}
-
-void Cas::sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept
-{
-    try
-    {
-        RelativePathsWithMetadata children;
-        object_storage.listObjects(mount_staging_prefix, children, /*max_keys=*/0);
-        size_t removed = 0;
-        for (const auto & child : children)
-        {
-            try
-            {
-                object_storage.removeObjectIfExists(StoredObject(child->relative_path));
-                ++removed;
-            }
-            catch (...) // NOLINT(bugprone-empty-catch)
-            {
-                /// Best-effort: retried by the next startup's sweep.
-            }
-        }
-        if (removed)
-            LOG_INFO(getLogger("CasStagingSweeper"), "Reclaimed {} leaked S3 staging object(s) under '{}' at startup",
-                removed, mount_staging_prefix);
-    }
-    catch (...) // NOLINT(bugprone-empty-catch)
-    {
-        /// Best-effort: a LIST failure must never fail the startup; the debris waits for the next sweep.
-    }
 }
 
 void throwNotPersistedOnContentAddressedDisk(const String & what)

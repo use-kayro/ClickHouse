@@ -49,7 +49,7 @@ namespace
 PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConfig config = {})
 {
     config.pool_prefix = "p";
-    config.mint_pool_meta = true;
+    config.writer = true;
     return Pool::open(backend, config);
 }
 

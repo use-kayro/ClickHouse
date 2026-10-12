@@ -30,7 +30,7 @@ struct PoolConfig
     BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128;
     bool blob_hash_allow_new = false;
     /// Whether this open may create a brand-new pool's `_pool_meta`: only the server that writes blobs.
-    bool mint_pool_meta = false;
+    bool writer = false;
     /// The CAS retry controller's budget (cas-s3-timeout-retry-control).
     CasRequestBudget cas_request_budget{};
     /// The requests' clock and inter-attempt sleep (CLOCK_BOOTTIME ms and a real sleep woken by
@@ -60,7 +60,7 @@ struct BlobLocation
 class Pool
 {
 public:
-    /// Validates (or, with `mint_pool_meta`, creates) `_pool_meta`. Throws when it is absent and may not be
+    /// Validates (or, with `writer`, creates) `_pool_meta`. Throws when it is absent and may not be
     /// minted, or does not admit `blob_hash_algo`.
     static PoolPtr open(BackendPtr backend, PoolConfig config);
 

@@ -63,7 +63,7 @@ struct FakeTable : public DB::ICasKeeperRecordSource
 struct CASKeeperGc : public ::testing::Test
 {
     std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
-    PoolPtr store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    PoolPtr store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
     std::shared_ptr<FakeTable> table = std::make_shared<FakeTable>();
     KeeperGc gc{store, [this] { return KeeperRecordTables{{table, table->snapshot}}; }, getLogger("CASKeeperGcTest")};
 

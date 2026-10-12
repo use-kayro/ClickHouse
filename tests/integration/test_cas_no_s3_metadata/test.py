@@ -203,10 +203,15 @@ def test_identical_content_is_uploaded_once():
     assert answer(node("reader1"), "t_dedup") == answer(w, "t_dedup")
 
 
-def test_reader_does_not_write_blobs():
+def test_reader_does_not_build_parts():
     create("t_reader_insert")
-    err = node("reader1").query_and_get_error("INSERT INTO t_reader_insert VALUES (1, 1, 'a')")
-    assert "only the pool's writer writes blobs" in err, err
+    # Even when the reader holds every blob of the new part (identical content, deduplication off): the build
+    # is refused before blob presence is consulted, since the writer's GC cannot see a reader's reference.
+    row = "INSERT INTO t_reader_insert SETTINGS insert_deduplicate = 0 VALUES (1, 1, 'a')"
+    node("writer").query(row)
+    sync("t_reader_insert")
+    err = node("reader1").query_and_get_error(row)
+    assert "only the pool's writer builds parts" in err, err
 
 
 def test_refusals_of_what_cannot_have_a_record():

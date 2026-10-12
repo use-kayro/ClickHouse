@@ -54,7 +54,7 @@ Disks casRecordDisks(const Disks & disks)
 {
     Disks out;
     for (const auto & disk : disks)
-        if (tryGetContentAddressedExchange(disk) && !disk->isReadOnly())
+        if (tryGetContentAddressedExchange(disk))
             out.push_back(disk);
     return out;
 }

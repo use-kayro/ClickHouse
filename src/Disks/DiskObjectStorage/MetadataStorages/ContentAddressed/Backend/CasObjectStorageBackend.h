@@ -41,7 +41,8 @@ ConditionalWriteOutcome finalizeConditionalWrite(WriteBuffer & buf);
 /// Native mode (S3-like): conditions ride the existing plumbing — WriteSettings
 /// object_storage_write_if_none_match / object_storage_write_if_match (consumed by WriteBufferFromS3)
 /// and IObjectStorage::removeObjectIfTokenMatches. Tokens are backend ETags from getObjectMetadata.
-/// Trust is NEVER assumed: Cas::Probe validates enforcement per pool at open.
+/// Conditional enforcement is a requirement of the store (see `Backend`'s CONTRACT); the writer's open
+/// checks the generation-store preconditions it can verify without writing.
 ///
 /// EmulatedSingleProcess mode (LocalObjectStorage — tests and local development ONLY): the object
 /// storage has no conditional ops, so this adapter provides EXACT token semantics itself with a
@@ -93,9 +94,8 @@ public:
     /// absent. Nothing is materialized; mutable objects must use `read` because their contents may
     /// change while the stream is open.
     std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess & access) override;
-    /// Execute the selected unconditional blob transport without observing destination state or
-    /// returning a write-response value. Streaming uses ordinary write settings; staged bytes require
-    /// a native same-store copy.
+    /// Stream one unconditional blob rewrite without observing destination state or returning a
+    /// write-response value, under ordinary write settings.
     void publish(const BlobPublishRequest & request, TransportAccess & access) override;
     /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
     /// own values.
@@ -129,13 +129,9 @@ public:
     /// Backend::checkPoolPreconditions.
     void checkPoolPreconditions() override;
 
-    /// Fail-closed precondition: a Native, generation-dialect (GCS) backend refuses a writable mount
-    /// that asked to skip the access check — see Backend::checkSkipAccessCheckSupport.
-    void checkSkipAccessCheckSupport() override;
-
     /// Fail-closed precondition for writable Native mode: require that the object storage supports the
     /// SingleAttempt retry profile (ObjectStorageRetryProfile), which disables transparent
-    /// conditional-write retries. Without it, an SDK retry could cross the mount lease boundary or turn
+    /// conditional-write retries. Without it, an SDK retry could turn
     /// an uncertain result into a misleading precondition failure. A non-S3 object storage used for
     /// test construction reports no support; this check is the mount-time gate. No-op for
     /// `EmulatedSingleProcess`.

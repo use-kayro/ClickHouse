@@ -16,19 +16,11 @@ namespace DB::Cas
 {
 
 /// Re-readable source for one blob upload. `open` returns a fresh reader over exactly `size` logical bytes
-/// and may be called more than once. `server_side_copy_from` names an already-verified complete staged
-/// object that may be copied verbatim on this source's first publication only (every copy of the source
-/// shares `publication_attempted`); later publications stream the payload under a new envelope.
+/// and may be called more than once; every publication streams it under a new envelope.
 struct BlobSource
 {
     uint64_t size = 0;
     std::function<std::unique_ptr<ReadBuffer>()> open;   /// yields exactly `size` bytes, from the start
-    std::optional<String> server_side_copy_from;
-    std::shared_ptr<std::atomic<bool>> publication_attempted = std::make_shared<std::atomic<bool>>(false);
-
-    /// Consumes the source's first-publication privilege (the verbatim staged copy).
-    bool beginPublication() const { return !publication_attempted->exchange(true, std::memory_order_acq_rel); }
-
     /// A re-readable source backed by an owned string; for small payloads and tests.
     static BlobSource fromString(String bytes);
 };
@@ -60,12 +52,12 @@ bool isDeterministicBlobPublicationFailure(const std::exception & error);
 /// envelope (no `HEAD`, no freshness marker). See `BlobRefCount` for why this order makes GC's exact-ETag
 /// delete safe.
 ///
-/// `may_upload == false` (a server whose replicas cannot become merge leader: a reader) refuses every
-/// upload with `NOT_IMPLEMENTED`; only the pool's writer writes blob bodies (TEC-851 decision of 11/10).
+/// Only the pool's writer constructs one: the transaction refuses a build on any other server
+/// (`ContentAddressedTransaction::buildFor`).
 class PartBlobs
 {
 public:
-    PartBlobs(PoolPtr store_, String intended_ref_, bool may_upload_);
+    PartBlobs(PoolPtr store_, String intended_ref_);
     ~PartBlobs();
 
     PartBlobs(const PartBlobs &) = delete;
@@ -87,7 +79,6 @@ private:
     PoolPtr store;
     std::shared_ptr<BlobRefCount> refs;
     String intended_ref;
-    bool may_upload;
     std::mutex claimed_mutex;
     std::vector<BlobRef> claimed;
 };

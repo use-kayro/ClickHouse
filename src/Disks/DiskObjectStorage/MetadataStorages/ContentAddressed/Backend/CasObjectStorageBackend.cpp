@@ -144,7 +144,7 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// to have versioning enabled refuses the mount. A probe that cannot answer does not: it is not
 /// evidence of a versioned bucket, its usual cause is a credential without permission to read the
 /// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
-/// mount proceeds with a warning that names what was not verified and how the operator can verify it.
+/// open proceeds with a warning that names what was not verified and how the operator can verify it.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != Dialect::Generation)
@@ -172,30 +172,12 @@ void ObjectStorageBackend::checkPoolPreconditions()
             "soft-delete duration 0 for CAS pools) and retry the mount.");
 }
 
-/// See Backend::checkSkipAccessCheckSupport. A writable generation-dialect (GCS) mount is the one
-/// combination whose correctness depends on the MUTATING capability battery having run: the battery
-/// is what proves a numeric generation actually reaches GCS as x-goog-if-generation-match on a
-/// DELETE, and nothing else in the mount path proves it.
-void ObjectStorageBackend::checkSkipAccessCheckSupport()
-{
-    if (mode != Mode::Native || native_token_type != Dialect::Generation)
-        return;
-
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-        "CAS on GCS: skip_access_check=true is not supported on a WRITABLE generation-token mount. "
-        "The capability battery this setting skips is what verifies that a token-exact DELETE "
-        "actually honours the generation precondition; without it GC could delete an incarnation it "
-        "did not condemn, and the bucket-versioning precondition would go unchecked too. Remove "
-        "skip_access_check from this disk, or mount it read-only.");
-}
-
 /// See Backend::checkConditionalWriteSingleAttemptSupport. This is a MOUNT-TIME gate, deliberately
 /// separate from the ctor: narrow, targeted unit tests can keep constructing a raw Native-mode backend
 /// over a non-S3 IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the
 /// established convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A
-/// REAL writable mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls
-/// it for every non-read-only Pool::open, so production never silently runs Native-mode conditional
-/// writes under the disk's default (~500-attempt) transparent retry policy.
+/// REAL writer, by contrast, always reaches this check (`Pool::open`), so production never silently
+/// runs Native-mode conditional writes under the disk's default (~500-attempt) transparent retry policy.
 void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 {
     if (mode != Mode::Native)
@@ -803,76 +785,53 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
 
 void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
-    if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+    const StreamingBlobPublication & streaming = request.publication;
+    std::unique_ptr<ReadBuffer> payload = streaming.open_payload();
+    if (!payload)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ObjectStorageBackend::publish: payload source for {} returned no reader",
+            request.destination_key);
+
+    if (mode != Mode::Native)
     {
-        std::unique_ptr<ReadBuffer> payload = streaming->open_payload();
-        if (!payload)
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: payload source for {} returned no reader",
-                request.destination_key);
-
-        if (mode != Mode::Native)
-        {
-            /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
-            emuPublishBlobAtomically(
-                request.destination_key, streaming->fresh_envelope, *payload, streaming->payload_size);
-            return;
-        }
-
-        /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
-        /// In particular, generation stores are not restricted by the conditional single-PUT cap.
-        auto out = object_storage->writeObject(
-            StoredObject(request.destination_key),
-            WriteMode::Rewrite,
-            /*attributes=*/std::nullopt,
-            DBMS_DEFAULT_BUFFER_SIZE,
-            WriteSettings{});
-        out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
-        try
-        {
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming->payload_size);
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        if (!copy_result.exact(streaming->payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
-        }
-        out->finalize();
+        /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
+        emuPublishBlobAtomically(
+            request.destination_key, streaming.fresh_envelope, *payload, streaming.payload_size);
         return;
     }
 
-    const auto & staged = std::get<VerbatimStagedBlobPublication>(request.publication);
-    if (mode != Mode::Native)
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publish: verbatim staged publication requires Native mode");
-
-    WriteSettings write_settings;
-    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
-    if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publish: object storage {} does not support native-only same-store copy",
-            object_storage->getName());
-
-    object_storage->copyObject(
-        StoredObject(staged.object_key),
+    /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
+    /// In particular, generation stores are not restricted by the conditional single-PUT cap.
+    auto out = object_storage->writeObject(
         StoredObject(request.destination_key),
-        getReadSettings(),
-        write_settings);
+        WriteMode::Rewrite,
+        /*attributes=*/std::nullopt,
+        DBMS_DEFAULT_BUFFER_SIZE,
+        WriteSettings{});
+    out->write(streaming.fresh_envelope.data(), streaming.fresh_envelope.size());
+    blob_publication_detail::BlobPayloadCopyResult copy_result;
+    try
+    {
+        copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming.payload_size);
+    }
+    catch (...)
+    {
+        out->cancel();
+        throw;
+    }
+    if (!copy_result.exact(streaming.payload_size))
+    {
+        out->cancel();
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
+            copy_result.has_excess ? "more than " : "",
+            copy_result.copied,
+            request.destination_key,
+            streaming.payload_size);
+    }
+    out->finalize();
 }
 
 Backend::RawRemoval ObjectStorageBackend::remove(const String & key, const String & expected_value, TransportAccess & access)

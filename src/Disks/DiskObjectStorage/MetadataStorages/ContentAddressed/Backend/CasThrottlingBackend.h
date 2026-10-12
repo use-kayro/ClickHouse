@@ -114,7 +114,6 @@ public:
     uint64_t attemptEnvelopeMs() const override { return inner->attemptEnvelopeMs(); }
     bool refreshCredentials() override { return inner->refreshCredentials(); }
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
-    void checkSkipAccessCheckSupport() override { inner->checkSkipAccessCheckSupport(); }
     void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
 
 private:

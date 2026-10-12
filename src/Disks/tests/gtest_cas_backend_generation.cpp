@@ -289,31 +289,6 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
     EXPECT_TRUE(capture.captured().empty()) << capture.captured();
 }
 
-/// A writable generation-dialect (GCS) mount may not skip the mutating capability battery: that
-/// battery is the only proof that a token-exact DELETE actually carries its generation precondition.
-TEST(CASBackendGeneration, CheckSkipAccessCheckSupportRejectsGenerationDialect)
-{
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(Dialect::Generation);
-
-    expectThrowsNotImplementedSaying("skip_access_check=true is not supported", [&] { b->checkSkipAccessCheckSupport(); });
-}
-
-/// Scoped to the generation dialect: an ETag-dialect Native backend and the emulated backend keep the
-/// pre-existing skip_access_check behaviour, so widening the refusal would fail this test.
-TEST(CASBackendGeneration, CheckSkipAccessCheckSupportAllowsEtagAndEmulatedBackends)
-{
-    auto etag = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    ASSERT_EQ(etag->nativeTokenType(), Dialect::ETag);
-    EXPECT_NO_THROW(etag->checkSkipAccessCheckSupport());
-
-    auto emulated = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
-    EXPECT_NO_THROW(emulated->checkSkipAccessCheckSupport());
-}
-
 /// GCS enforces NO preconditions on CompleteMultipartUpload (measured 2026-07-03), so a conditional
 /// write on a generation-token store must never take the multipart path. conditionalWriteSettings
 /// must force the single-PUT path when the backend's native token kind is Generation, and stay a

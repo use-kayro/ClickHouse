@@ -126,9 +126,8 @@ inline void ensureBlobUploadPoolForTest(size_t size = 8)
 
 /// Minimal `ContentAddressedSettings` for a direct-construction gtest fixture: sets only
 /// `server_root_id` and `scratch_path` (the two values every positional-ctor call site used to pass
-/// explicitly) and validates, so the cached enum-valued accessors (`stagingBackend`, `blobHashAlgo`)
-/// are populated from their (default) string settings exactly as the disk-factory path would populate
-/// them. Callers that need a non-default setting (e.g. `staging_backend=s3`) apply
+/// explicitly) and validates, so the cached `blobHashAlgo` is populated from its (default) string
+/// setting exactly as the disk-factory path would populate it. Callers that need a non-default setting apply
 /// the override via `settings[ContentAddressedSetting::x] = value;` and re-run `settings.validate()`
 /// themselves before constructing.
 inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & server_root_id, const std::filesystem::path & scratch_path)
@@ -308,7 +307,7 @@ template <typename BackendT>
 DB::Cas::PoolPtr openPoolForTest(std::shared_ptr<BackendT> backend)
 {
     return DB::Cas::Pool::open(std::move(backend),
-        DB::Cas::PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+        DB::Cas::PoolConfig{.pool_prefix = "p", .writer = true});
 }
 
 /// Serves an inner stream in windows of at most `chunk` bytes, and records the largest window it ever

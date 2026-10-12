@@ -35,21 +35,6 @@ namespace DB::Cas
 
 /// Selects where a content-addressed blob is staged before it is published.
 ///
-/// `Local` is the default and preserves the existing local scratch-file path. `S3` is opt-in and
-/// streams large blobs to an object-store staging key. Writable S3-staging mounts require the
-/// storage to advertise `ObjectStorageCopyMode::NativeOnly`; an unsupported explicit selection is
-/// rejected instead of silently switching to local staging.
-enum class StagingBackend
-{
-    Local,
-    S3,
-};
-
-/// Removes every object under `mount_staging_prefix` (this server's `staging/<server_root_id>/` subtree): the
-/// S3 staging objects an aborted or failed transaction left behind (`ContentAddressedTransaction` never
-/// deletes a remote staging key on abort). Run once at startup in S3 staging mode. Best-effort, never throws.
-void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept;
-
 }
 
 namespace DB
@@ -90,14 +75,6 @@ public:
     /// Runs the same bounded, fail-soft teardown as explicit `shutdown`, including for callers that
     /// destroy the storage without first invoking its lifecycle hook.
     ~ContentAddressedMetadataStorage() override;
-
-    /// Parses a `staging_backend` value (`local` | `s3`). Throws `BAD_ARGUMENTS` for an unrecognized
-    /// value rather than silently selecting a backend.
-    static Cas::StagingBackend parseStagingBackend(const std::string & value);
-
-    /// Reads `staging_backend` from `config`, defaulting to `local`, and parses it. Kept only as a
-    /// thin wrapper around the string-taking overload for callers that still hold a config reference.
-    static Cas::StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Returns the content-addressed metadata storage backing `disk`, or nullptr if `disk` is not
     /// content-addressed. Plain (non-object-storage) disks do not implement `getMetadataStorage` at
@@ -247,15 +224,6 @@ public:
     std::shared_ptr<Cas::HeldParts> partAccess() const;
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
-    /// Returns the configured staging backend. `Local` is the behavior-preserving default. A
-    /// writable S3-staging mount is published only after native-copy capability validation.
-    Cas::StagingBackend stagingBackend() const { return staging_backend; }
-    /// Returns the underlying object storage for an S3 staging writer. It is meaningful only when
-    /// `stagingBackend` is `S3`.
-    const ObjectStoragePtr & objectStorage() const { return object_storage; }
-    /// Returns the physical `pool_prefix/staging/server_root_id` prefix for this mount's staging
-    /// area. Callers append a unique leaf.
-    String stagingKeyPrefix() const;
 
     /// The bytes of an Inline-placement entry of a held part; nullopt for anything else.
     std::optional<String> tryGetInManifestBytes(const std::string & path) const;
@@ -351,7 +319,6 @@ private:
     /// backend's own `attemptTimeoutMs()`.
     const uint64_t cas_attempt_timeout_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
-    const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
     const Cas::BlobHashAlgo blob_hash_algo;
     /// Whether `blob_hash_algo` may be admitted into the pool's persisted `algos_used` set.

@@ -144,9 +144,9 @@ std::vector<ManifestEntry> readEntriesAndPayload(ReadBuffer & in, uint64_t line_
         ManifestEntry e;
         e.path = r.readString();
 
-        /// Manifest bytes arrive over the interserver relink channel: enforce the same path hygiene
-        /// as CasLayout::checkNamespace so no future consumer can inherit a traversal. Relative,
-        /// no empty/'.'/'..' segments. (Syntactic only — legal projection subdirs pass.)
+        /// A record's bytes come from Keeper, written by another server: enforce path hygiene so no
+        /// consumer can inherit a traversal. Relative, no empty/'.'/'..' segments. (Syntactic only —
+        /// legal projection subdirs pass.)
         if (e.path.empty() || e.path.front() == '/')
             throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: invalid entry path '{}'", what, e.path);
         for (std::string_view rest = e.path; !rest.empty();)

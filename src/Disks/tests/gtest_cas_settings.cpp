@@ -183,10 +183,6 @@ TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)
         "<cas_server_root_id>srv1</cas_server_root_id><cas_blob_hash>md5</cas_blob_hash>",
         ErrorCodes::BAD_ARGUMENTS,
         "parseBlobHashAlgo: unknown cas_blob_hash config value 'md5' (expected one of cityhash128|xxh3-128|sha256)");
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_staging_backend>remote</cas_staging_backend>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_staging_backend value 'remote' (expected 'local' or 's3')");
 }
 
 /// The point of this test is that none of these names appears anywhere in CAS code. It is not an

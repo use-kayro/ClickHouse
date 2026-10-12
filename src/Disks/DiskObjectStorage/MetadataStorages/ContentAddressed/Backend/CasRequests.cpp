@@ -360,8 +360,7 @@ namespace
 ///
 /// The predicate is held BY VALUE -- the fence's `admit` closure, the admitted generation, the
 /// caller's liveness -- never through the operation: `CasOperation::stream` returns a buffer that can
-/// outlive the operation object (S3 staging opens its stream under a local mount-plane operation and
-/// hands the buffer to the backend). Modelled on `LimitReadBuffer`: no byte is copied, the SDK's
+/// outlive the operation object. Modelled on `LimitReadBuffer`: no byte is copied, the SDK's
 /// window is exposed as this buffer's own.
 class AdmittedBodyReadBuffer : public ReadBuffer
 {

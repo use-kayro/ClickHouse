@@ -91,7 +91,7 @@ KeeperRecordTablesFn throwingSources(int code, std::function<void()> before_thro
 TEST(CASGCLog, NonWriterRoundEmitsOnlyTheRecordsPhase)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
@@ -120,7 +120,7 @@ TEST(CASGCLog, NonWriterRoundEmitsOnlyTheRecordsPhase)
 TEST(CASGCLog, AbortedFinishOnThrowingRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
@@ -152,7 +152,7 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
 TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
@@ -185,7 +185,7 @@ TEST(CASGCLog, TransientErrorClassifierFailsClosed)
 TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
@@ -215,7 +215,7 @@ TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
 TEST(CASGCHealth, NonWriterRoundLeavesHealthIdle)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
 
     DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", noSources());
 
@@ -238,7 +238,7 @@ TEST(CASGCHealth, NonWriterRoundLeavesHealthIdle)
 TEST(CASGCLog, TransientFailureAfterTeardownBeganIsStopped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca",
@@ -260,7 +260,7 @@ TEST(CASGCLog, TransientFailureAfterTeardownBeganIsStopped)
 TEST(CASGCLog, NonTransientFailureCoincidingWithTeardownStaysFailed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .writer = true});
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca",

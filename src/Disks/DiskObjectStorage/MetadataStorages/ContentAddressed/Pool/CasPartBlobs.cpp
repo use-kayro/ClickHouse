@@ -33,7 +33,6 @@ namespace ErrorCodes
     extern const int CANNOT_READ_FROM_SOCKET;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
-    extern const int NOT_IMPLEMENTED;
     extern const int POCO_EXCEPTION;
     extern const int S3_ERROR;
     extern const int SOCKET_TIMEOUT;
@@ -82,11 +81,10 @@ bool isDeterministicBlobPublicationFailure(const std::exception & error)
     return dynamic_cast<const Poco::Exception *>(&error) == nullptr;
 }
 
-PartBlobs::PartBlobs(PoolPtr store_, String intended_ref_, bool may_upload_)
+PartBlobs::PartBlobs(PoolPtr store_, String intended_ref_)
     : store(std::move(store_))
     , refs(store->blobRefs())
     , intended_ref(std::move(intended_ref_))
-    , may_upload(may_upload_)
 {
 }
 
@@ -138,12 +136,6 @@ void PartBlobs::uploadOne(const BlobUploadRequest & req)
 
     bool succeeded = false;
     SCOPE_EXIT({ uploadFinished(req.ref, succeeded); });
-    if (!may_upload)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Cannot write blob {} of '{}': only the pool's writer writes blobs to a content-addressed disk, and "
-            "this server's replicas cannot become merge leader (replicated_can_become_leader = 0). Run the "
-            "write on the writer; this replica attaches the result from its Keeper record",
-            blobIdOf(req.ref), intended_ref);
 
     CasOperation op = store->openRequests().admit();
     const Retry policy = op.freeze(Retry::standard());
@@ -158,24 +150,18 @@ void PartBlobs::uploadOne(const BlobUploadRequest & req)
     {
         if (attempt > 0)
             op.pause(Retry::backoff(static_cast<uint32_t>(attempt)));
-        BlobPublication publication;
-        if (source.server_side_copy_from && source.beginPublication())
-            publication = VerbatimStagedBlobPublication{*source.server_side_copy_from, meta.blob_header_len + source.size};
-        else
-        {
-            if (!source.open)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "PartBlobs: streaming source for {} is not re-readable", key);
-            EnvelopeHeader header;
-            header.kind = ObjectKind::Blob;
-            header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
-            header.provenance = Provenance{
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()),
-                store->poolConfig().server_id, VERSION_INTEGER, ProvenanceOp::Insert};
-            header.intended_ref = intended_ref;
-            publication = StreamingBlobPublication{
-                source.size, encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len)), source.open};
-        }
+        if (!source.open)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "PartBlobs: streaming source for {} is not re-readable", key);
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+        header.provenance = Provenance{
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()),
+            store->poolConfig().server_id, VERSION_INTEGER, ProvenanceOp::Insert};
+        header.intended_ref = intended_ref;
+        StreamingBlobPublication publication{
+            source.size, encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len)), source.open};
         try
         {
             op.publish(BlobPublishRequest{key, std::move(publication)}, policy.asSingleAttempt());

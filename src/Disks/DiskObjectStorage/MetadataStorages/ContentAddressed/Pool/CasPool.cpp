@@ -19,10 +19,17 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
     /// Every pool request flows through the per-key-class ProfileEvents chokepoint.
     backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    /// The writer writes `_pool_meta` conditionally and deletes blobs by exact token: refuse a store
+    /// that cannot honour either (these checks write nothing).
+    if (config.writer)
+    {
+        backend->checkConditionalWriteSingleAttemptSupport();
+        backend->checkPoolPreconditions();
+    }
     CasRequests bootstrap(backend, Fence::open(), config.boot_ms_fn);
     CasOperation op = bootstrap.admit();
     PoolMeta meta = PoolMeta::createOrValidate(op, Layout(config.pool_prefix), config.blob_header_len, config.blob_hash_algo,
-        config.blob_hash_allow_new, config.mint_pool_meta);
+        config.blob_hash_allow_new, config.writer);
     return PoolPtr(new Pool(std::move(backend), std::move(config), std::move(meta)));
 }
 
