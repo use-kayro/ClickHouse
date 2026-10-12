@@ -10,7 +10,7 @@ Corrige uma pausa do GC do CAS no writer: depois do primeiro DROP de uma tabela 
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:6dcd83ffb0cc11258fe279e4f166e248926391446cb3208535efdc6cb6a8db02` |
 | Tag da imagem | `kayro/clickhouse:1550abe87523a982a589ea04890f006e45ef3c27` (head do PR #12) |
 | Linear | TEC-850 |
-| Em produção | deploy previsto para ~17:10Z de 12/10 (writer → reader-mdb → reader compartilhado); horários `TODO` |
+| Em produção | nos três nós desde 12/10 21:37:25Z (writer → reader-mdb → reader compartilhado), na 2ª tentativa; a 1ª fez rollback automático por falso negativo da gate |
 
 ## Incidente (12/10)
 
@@ -68,8 +68,36 @@ Sem mudança de protocolo: qualquer ordem, um nó por vez. Só o writer roda rod
 - push 14:33:52Z;
 - `BUILD_COMPLETE` 15:26:45Z.
 
-Paridade de features: não registrada.
+Paridade de features: `compare-features.py` contra a base oficial fixada, idêntica em build_options, functions, formats, engines, table_functions e settings (`parity.json`, 14:29:01Z).
 
-## Deploy
+## Deploy (12/10)
 
-Previsto para ~17:10Z de 12/10, na ordem writer → reader-mdb → reader compartilhado. Rollback preparado: passo 2b, `sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`. Horários e resultado: `TODO`.
+Orquestrado por systemd no builder `gcfix`, não do Mac. Ordem writer → reader-mdb → reader compartilhado. Rollback preparado: passo 2b, `sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`.
+
+### 1ª tentativa: rollback automático por falso negativo da gate
+
+- Writer: apply 17:30:05Z, saudável 17:33:10Z.
+- A gate da fase A esperava 17 min pela linha "CA GC round 1" e desistiu às 17:50:04Z com `rounds=0`. Rollback automático do writer para `1912bde0` às 17:50:07Z. Readers não foram tocados.
+- **Causa: falso negativo da gate, não defeito da imagem.** A linha da rodada só sai no **fim** da rodada, e a rodada 1 tinha 46.638 registros condenados acumulados nas ~10 h de pausa. Na imagem antiga, depois do rollback, a mesma rodada 1 fechou às 18:10:21Z (19,4 min depois do mount, `condemned=46638`), e as rodadas 2–13 apagaram o backlog (46.537 na rodada 2).
+- No intervalo 17:30–17:51Z, nenhum erro do GC e nenhum "removing nothing".
+- O vazamento de `startup_table` é por processo e um restart o zera. Por isso a imagem antiga voltou a apagar depois do rollback, até o próximo DROP de tabela do boot.
+- Gate corrigida: espera até 25 min pela rodada 1 fechar (`writer-gate.sh`, 75 × 20 s).
+
+### 2ª tentativa
+
+| Nó | Apply | Saudável | Observação |
+|---|---|---|---|
+| Writer `i-02e3809e0b416b25e` | 20:51:12Z | 20:54:13Z | rodada 1 às 21:02:06Z (`condemned=313 deleted=0`); `WRITER_GATE_OK` 21:02:24Z |
+| Reader-mdb `i-0bc5ccb44d4141059` | 21:30:10Z | 21:30:35Z | |
+| Reader compartilhado `i-02369cef982eb67d2` | 21:30:35Z | 21:37:25Z | |
+
+**Prova do fix em produção (fase B):** a tabela-sonda `default.gc_probe_boot_20261012`, uma tabela do boot com 0 linhas, foi dropada às 21:02:25Z. A rodada 2, às 21:12:19Z, deu `condemned=0 deleted=313`, sem "removing nothing". `PHASE B OK` às 21:13:33Z.
+
+`SEQUENCE DONE` às 21:37:25Z.
+
+**Depois do deploy:**
+- 0 réplicas readonly nos três nós (501 / 54 / 446);
+- a lista de tabelas Replicated do writer é igual à do reader compartilhado (563, mesmo hash);
+- `cepera.customer_embeddings`: 16.714 = 16.714.
+
+**kayro-infra:** PR #238 põe o digest `6dcd83ff` no tfvars; o plan só muda outputs.
