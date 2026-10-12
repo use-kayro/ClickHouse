@@ -251,7 +251,7 @@ TEST(CASForget, ForgetStopsAndJoinsRealGcScheduler)
     auto store = DB::Cas::tests::openPoolForTest(backend);
 
     Cas::CasGcScheduler sched(store, std::chrono::seconds(3600), "CasForgetTest", "forget-disk",
-        [] { return Cas::KeeperRecordSources{}; });
+        [] { return std::optional<Cas::KeeperRecordTables>(Cas::KeeperRecordTables{}); });
     sched.start();
 
     bool gc_joined = false;

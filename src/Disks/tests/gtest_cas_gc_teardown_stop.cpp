@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <base/scope_guard.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -99,22 +100,34 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage()
 class WriterWithNoRecords : public DB::ICasKeeperRecordSource
 {
 public:
-    DB::CasKeeperRecordSnapshot snapshotCasRecords(const String &) override
+    DB::CasKeeperRecordSnapshot snapshotCasRecords(const DB::IContentAddressedExchange &) override
     {
         DB::CasKeeperRecordSnapshot snapshot;
         snapshot.writer = true;
         return snapshot;
     }
-    void markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override {}
+    DB::Strings markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override { return {}; }
     DB::Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> &) override
     {
         return {};
     }
 };
 
-KeeperRecordSourcesFn writerSources()
+KeeperRecordTablesFn writerSources()
 {
-    return [source = std::make_shared<WriterWithNoRecords>()] { return KeeperRecordSources{source}; };
+    return [source = std::make_shared<WriterWithNoRecords>()]
+    {
+        DB::CasKeeperRecordSnapshot snapshot;
+        snapshot.writer = true;
+        return std::optional<KeeperRecordTables>(KeeperRecordTables{{source, snapshot}});
+    };
+}
+
+/// The disk's tables, as a provider: one table this server writes, with no part on the disk.
+std::optional<std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>> oneWriterTable(const DB::IContentAddressedExchange &)
+{
+    static const auto source = std::make_shared<WriterWithNoRecords>();
+    return std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>{source};
 }
 
 uint64_t requestsTotal(const CountingBackend & backend)
@@ -284,8 +297,8 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
     auto storage = openTestStorage();
     auto pool = storage->poolForTest();
     ASSERT_TRUE(pool);
-    const auto source = std::make_shared<WriterWithNoRecords>();
-    storage->registerKeeperRecordSource(source);
+    DB::setCasKeeperRecordSourcesProvider(&oneWriterTable);
+    SCOPE_EXIT({ DB::setCasKeeperRecordSourcesProvider(nullptr); });
 
     auto parked = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();

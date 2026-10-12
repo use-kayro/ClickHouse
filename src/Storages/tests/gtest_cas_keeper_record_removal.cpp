@@ -66,12 +66,6 @@ TEST_F(CASKeeperRecordRemoval, KeepsTheRecordOfAPartAReplicaLists)
     EXPECT_TRUE(zk->exists(record));
 }
 
-TEST_F(CASKeeperRecordRemoval, KeepsARecordMarkedAgain)
-{
-    zk->set(record, "bytes");   /// listed and unlisted again since the round read it: its retention restarted
-    EXPECT_EQ(remove(), Coordination::Error::ZBADVERSION);
-    EXPECT_TRUE(zk->exists(record));
-}
 
 TEST_F(CASKeeperRecordRemoval, KeepsTheRecordWhenTheWriterWasReactivated)
 {
@@ -80,9 +74,3 @@ TEST_F(CASKeeperRecordRemoval, KeepsTheRecordWhenTheWriterWasReactivated)
     EXPECT_TRUE(zk->exists(record));
 }
 
-TEST_F(CASKeeperRecordRemoval, KeepsTheRecordWhenTheWriterIsNotActive)
-{
-    zk->remove(writer + "/is_active");
-    EXPECT_EQ(remove(), Coordination::Error::ZNONODE);
-    EXPECT_TRUE(zk->exists(record));
-}

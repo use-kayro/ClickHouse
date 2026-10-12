@@ -151,7 +151,7 @@ def led_rounds(since):
         gc_scalar(
             node,
             "SELECT count() FROM system.cas_gc_log WHERE disk_name = '{}' AND event_type = 'Finish' "
-            "AND outcome IN ('Success', 'Deferred') AND event_time > '{}'".format(CA_DISK, since),
+            "AND outcome = 'Success' AND writer = 1 AND event_time > '{}'".format(CA_DISK, since),
         )
         for node in cluster.instances.values()
     )

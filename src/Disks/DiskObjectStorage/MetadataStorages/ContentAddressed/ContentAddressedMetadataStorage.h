@@ -380,8 +380,6 @@ public:
                         const std::vector<CasKeeperInlineFile> & inline_files,
                         const std::vector<CasKeeperBlobFile> & blob_files) override;
     bool isHeldFromKeeper(const String & part_path) const override;
-    void registerKeeperRecordSource(std::weak_ptr<ICasKeeperRecordSource> source) override;
-    void unregisterKeeperRecordSource(const ICasKeeperRecordSource * source) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
@@ -682,8 +680,6 @@ private:
     /// is one request long -- held for the WHOLE round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
     /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
-    mutable std::mutex record_sources_mutex;
-    mutable std::vector<std::weak_ptr<ICasKeeperRecordSource>> record_sources TSA_GUARDED_BY(record_sources_mutex);
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
     /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler` themselves
     /// (snapshot, create-if-absent, reset) -- always held briefly. Lock ordering when more than one of
@@ -787,9 +783,8 @@ private:
     /// ContentAddressedGarbageCollectionLogElement, and appends it to the SystemLog (best-effort).
     /// Returns an empty sink when context is null.
     Cas::GcRoundLogger makeGcRoundLogger() const;
-    /// The GC scheduler of this disk; its rounds read the registered Keeper record sources.
+    /// The GC scheduler of this disk; its rounds read the tables `getCasKeeperRecordSourcesProvider` finds on it.
     std::shared_ptr<Cas::CasGcScheduler> makeGcScheduler(Cas::PoolPtr pool) const;
-    std::vector<std::shared_ptr<ICasKeeperRecordSource>> keeperRecordSources() const;
 
     /// Builds the per-event CAS audit sink: the `std::function` the pool calls on every
     /// content-addressed decision. Captures the weak `Context` reference, converts the decoupled Core POD

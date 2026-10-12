@@ -5,12 +5,13 @@
 # B3: system.cas_mounts exposes per-disk GC health (is_leader / pending_reclaim /
 # last_success_age_seconds / wedged_namespace_count), replacing the retired process-global
 # CasGcIsLeader / CasGcPendingReclaimEntries CurrentMetrics gauges (clobbered with >= 2 CAS disks).
-# Build one named inline CA disk, run a synchronous GC round so this process has led at least once,
-# then assert the column shapes on the healthy single-disk fixture.
+# Build one named inline CA disk, run a synchronous GC round, then assert the column shapes on the
+# healthy single-disk fixture. The table is a non-replicated MergeTree, so the round does not run as
+# the writer: `is_leader` reads 0 and `last_success_age_seconds` 0 (never led).
 #
 # This is a .sh test (not .sql) because `SYSTEM CAS GC RUN` now returns a
-# one-row-per-disk result set (UX pass); the round below only cares about its side effect (leading
-# once), so its own output is redirected to /dev/null.
+# one-row-per-disk result set (UX pass); the round below only cares about its side effect, so its
+# own output is redirected to /dev/null.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
