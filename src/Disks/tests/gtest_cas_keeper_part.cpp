@@ -207,6 +207,48 @@ TEST(CASKeeperPart, WriteIntoHeldPartIsRefused)
     EXPECT_EQ(storage->tryGetInManifestBytes(part + "/count.txt"), std::optional<String>("3"));
 }
 
+/// The MergeTree fast removal of an outdated part (`DataPartStorageOnDiskBase::clearDirectory`): one
+/// transaction unlinks the part's files, the next removes its directory. On a held part it edits and then
+/// forgets what is held, in memory, with no object-store request and no refusal.
+TEST(CASKeeperPart, FastRemovalOfHeldPart)
+{
+    auto storage = openStorage();
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, String(READER_TABLE) + "/format_version.txt", "1\n");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    (void)storage->listDirectory(READER_TABLE);   /// warm the reader namespace
+    const String part = String(READER_TABLE) + "/delete_tmp_all_5_5_0";
+    EXPECT_TRUE(storage->holdKeeperPart(
+        part, {{"count.txt", "3"}, {"checksums.txt", "c"}}, {{"data.bin", 9, contentHash("content-A")}}));
+    const uint64_t before = objectStoreWritesAndLists();
+
+    {
+        auto tx = storage->createTransaction();
+        tx->unlinkFile(part + "/count.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile(part + "/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile(part + "/txn_version.txt", /*if_exists=*/true, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(storage->isHeldFromKeeper(part));
+    EXPECT_EQ(storage->listDirectory(part), (std::vector<std::string>{"checksums.txt"}));
+    {
+        auto tx = storage->createTransaction();
+        tx->unlinkFile(part + "/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(storage->isDirectoryEmpty(part));
+    {
+        auto tx = storage->createTransaction();
+        tx->removeDirectory(part);
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(storage->isHeldFromKeeper(part));
+    EXPECT_FALSE(storage->existsDirectory(part));
+    EXPECT_EQ(objectStoreWritesAndLists(), before);
+}
+
 TEST(CASKeeperPart, RefTablePartIsNeverShadowed)
 {
     auto storage = openStorage();

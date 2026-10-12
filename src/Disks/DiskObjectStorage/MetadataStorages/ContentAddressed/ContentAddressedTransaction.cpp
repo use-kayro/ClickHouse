@@ -370,12 +370,22 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     {
         if (auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh))
         {
-            /// Refused before anything is staged: a part held from its Keeper record has no ref in the
-            /// pool to repoint, and nothing would persist the change.
+            /// A part held from its Keeper record has no ref in the pool to repoint. Removing its files
+            /// (the MergeTree fast removal unlinks them, then drops the directory) edits what is held,
+            /// in memory, as a rename or a drop of it does; a write is refused before anything is
+            /// staged, since nothing would persist the changed part.
             if (metadata_storage.partAccess()->isKeeperPart({ns, ref}))
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                    "Cannot rewrite files of part {}/{}: its metadata is held from Keeper, and a changed "
-                    "Keeper-held part has nowhere to persist", ns.string(), ref);
+            {
+                if (st.build || !st.entries.empty())
+                    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                        "Cannot rewrite files of part {}/{}: its metadata is held from Keeper, and a changed "
+                        "Keeper-held part has nowhere to persist", ns.string(), ref);
+                auto remaining = std::make_shared<Cas::PartManifest>(*view->manifest());
+                std::erase_if(remaining->entries, [&](const Cas::ManifestEntry & e) { return st.content_removed.contains(e.path); });
+                metadata_storage.partAccess()->holdKeeperPart({ns, ref}, std::move(remaining));
+                st.published = true;
+                return;
+            }
             if (st.build)
             {
                 /// EDGE-BEFORE-OBSERVE is still load-

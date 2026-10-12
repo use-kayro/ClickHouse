@@ -412,3 +412,62 @@ def test_replace_partition_creates_records():
     for node in (writer, reader):
         node.query("DROP TABLE {} SYNC".format(table))
     writer.query("DROP TABLE {} SYNC".format(source))
+
+
+def test_reader_removes_outdated_record_parts():
+    """A part the reader attached from its record becomes outdated after the writer's merge, and the
+    reader's cleanup removes it the fast way: no refusal, and nothing of it is left, on disk or in memory."""
+    writer = cluster.instances["writer"]
+    reader = cluster.instances["reader"]
+    table = "keeper_parts_removal"
+    for node in (writer, reader):
+        node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    create_table(writer, table, wide=True, reader=False)
+    create_table(reader, table, wide=True, reader=True)
+    uuid = reader.query("SELECT uuid FROM system.tables WHERE name = '{}'".format(table)).strip()
+
+    for i in range(3):
+        writer.query(
+            "INSERT INTO {table} SELECT number, number, toString(number), NULL FROM numbers({start}, 1000)".format(
+                table=table, start=i * 1000
+            )
+        )
+    reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
+    from_records = active_parts(reader, table)
+    attached = log_lines(reader, r"default\.{} .*Attached part .* from its Keeper record".format(table))
+    assert from_records and all(any(" {} ".format(p) in line for line in attached) for p in from_records), (
+        from_records,
+        attached,
+    )
+
+    def part_dirs():
+        """The part directories the reader's disk serves for the table."""
+        return set(
+            reader.query(
+                "SELECT DISTINCT splitByChar('/', local_path)[4] FROM system.remote_data_paths "
+                "WHERE disk_name = '{}' AND local_path LIKE '%/{}/%/%'".format(CA_DISK, uuid)
+            ).split()
+        )
+
+    assert set(from_records) <= part_dirs()
+
+    writer.query("OPTIMIZE TABLE {} FINAL".format(table))
+    for node in (writer, reader):
+        node.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
+    active = active_parts(writer, table)
+    assert active_parts(reader, table) == active and not set(from_records) & set(active)
+    assert results(reader, table) == results(writer, table)
+
+    # Removed from memory (no part in any state but the active ones) and from the disk.
+    wait_until(
+        lambda: reader.query(
+            "SELECT name FROM system.parts WHERE table = '{}' ORDER BY name".format(table)
+        ).split() == active,
+        60,
+        "the reader's cleanup to remove its outdated parts",
+    )
+    assert part_dirs() == set(active), part_dirs()
+    assert not log_lines(reader, r"Cannot quickly remove directory .*{}".format(uuid))
+    assert not log_lines(reader, r"{}.*NOT_IMPLEMENTED".format(uuid))
+    for node in (writer, reader):
+        node.query("DROP TABLE {} SYNC".format(table))
