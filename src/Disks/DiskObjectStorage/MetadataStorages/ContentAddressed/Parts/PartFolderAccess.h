@@ -319,8 +319,9 @@ public:
     /// server's ref table. It is held here, in memory, for the lifetime of the disk and is never written to
     /// the object store. `getView`, `resolve`/`existsRef` and the ref-moving primitives (`republishRef`,
     /// `dropRef*`, `dropNamespace`) consult it before the ref table, so a rename or a removal of such a
-    /// part re-keys or forgets it in memory with no object-store request. A standalone write into such a
-    /// part is refused by the transaction (`isKeeperPart`): nothing persists a changed Keeper-held part.
+    /// part re-keys or forgets it in memory with no object-store request, and removing some of its files
+    /// holds what remains. A standalone write into such a part is refused by the transaction
+    /// (`isKeeperPart`): nothing persists a changed Keeper-held part.
 
     /// Holds `manifest` (Inline entries + Blob entries derived from `checksums.txt`) under `key`,
     /// replacing whatever was held there.
