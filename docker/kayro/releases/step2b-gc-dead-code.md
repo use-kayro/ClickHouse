@@ -124,3 +124,32 @@ Por `configure-image.py`, um nó por vez. Rollback preparado: a imagem do passo 
 | Reader compartilhado `i-02369cef982eb67d2` | 06:00:36Z | 06:07:16Z | |
 
 Sequência encerrada às 06:07:16Z.
+
+O rollout nunca teve os dois readers fora ao mesmo tempo: o reader-mdb voltou 7 s antes de o reader compartilhado sair.
+
+## Observado após o deploy
+
+Reconferido às 06:25Z de 12/10. Só fatos medidos.
+
+1. **A correção do PR #8 funciona em produção.**
+   - O reader compartilhado removeu 119 partes anexadas pelo registro, de uma tabela, com 0 `NOT_IMPLEMENTED` e 0 fallbacks "Cannot quickly remove". Na mesma tabela, a imagem do passo 2 tinha logado 161.
+   - O reader-mdb removeu 1.276 partes, com 0 `NOT_IMPLEMENTED`.
+   - O reader compartilhado anexou 139 partes pelos registros, com 0 PUT e 0 LIST.
+2. **GC no writer.**
+   - Rodada 1, 05:59:51Z: 570 condenados, 0 apagados.
+   - Rodada 2, 06:10:18Z: 203 condenados, 570 apagados.
+   - 1 LIST por rodada. Nenhuma leitura falhou por objeto ausente.
+3. **`system.errors` não indica erro novo.**
+   - `S3_ERROR` conta todo erro do S3. A rajada de boot de "key does not exist" deu 1.293, contra 1.570 no boot do passo 2.
+   - A mensagem `PreconditionFailed` é o PUT condicional de `shared_pool/cas/ref_catalog` (~152 KB) perdendo uma corrida e sendo repetido: 17 na janela das 06:00, contra 12–33 por 10 min com a imagem anterior.
+4. **Cargas:** 201 OK e 0 falhas no writer.
+5. **`NO_REPLICA_HAS_PART`:** só no reader compartilhado (78), a corrida de merge já conhecida (ver o [passo 2](step2-keeper-gc.md)). Parou às 06:16:30Z.
+6. **S3 por 10 min, às 06:10Z:**
+
+   | Nó | PUT | LIST | GET |
+   |---|---:|---:|---:|
+   | Writer | 1.685 | 1.025 | 18.221 |
+   | Reader-mdb | 60 | 108 | 2 |
+   | Reader compartilhado | 249 | 917 | 374 |
+
+   No writer, PUT e GET já estavam altos antes do restart, por causa da carga de refresh.
