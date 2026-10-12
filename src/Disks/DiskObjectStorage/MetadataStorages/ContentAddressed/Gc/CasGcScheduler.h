@@ -23,19 +23,15 @@ struct GcRoundLogRecord
     /// and `ProfileEvents` delta. Emitted between the round's `Start` and `Finish`, correlated with them
     /// by `round_id`.
     enum class EventType { Start, Finish, Phase };
-    /// `Deferred`: the round acquired the lease and took the skip-unchanged fast path (`RoundReport::deferred`)
-    /// -- no fold, no pre-CAS deletes, no `gc/state` CAS. Distinct from `Success` so a reader of
-    /// `system.cas_gc_log` (or this scheduler's own log line) can tell a round
-    /// that genuinely folded and found nothing apart from one that never folded at all.
-    /// `Aborted`: the round threw an exception whose code names a transient condition (backend
-    /// unavailability, a lost lease, a concurrent leader) -- the next scheduled round retries it and
-    /// nothing durable is wrong. `Stopped`: the same transient class, observed after the pool's
+    /// `Success`: the round completed (`writer` says whether it ran as the writer or only read records).
+    /// `Aborted`: the round threw an exception whose code names a transient condition (backend or Keeper
+    /// unavailability) -- the next scheduled round retries it and nothing durable is wrong. `Stopped`: the same transient class, observed after the pool's
     /// teardown began -- a correlation, not a cause: the engine reports a refused teardown fence
     /// exactly like a lost mount fence, so the flag is the only witness, and the row says so honestly
     /// rather than reading a clean restart as a backend incident. `Failed` is reserved for everything
     /// else (a logic error, corrupted data, an unclassified code): fail-closed, an unrecognised
     /// failure reads as real -- during a teardown too.
-    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred, Aborted, Stopped };
+    enum class Outcome { Unknown, Success, Failed, Aborted, Stopped };
     enum class Trigger { Scheduled, Manual };
 
     EventType event_type = EventType::Start;
@@ -43,20 +39,15 @@ struct GcRoundLogRecord
     Trigger trigger = Trigger::Scheduled;
     String disk_name;
     String srid;          /// server_root_id of the mount that ran this round (this pool's poolConfig())
-    String gc_id;        /// hex of the scheduler's gc_id
+    /// The `Cas::RoundReport` of a Finish row.
+    bool writer = false;
     UInt64 round = 0;
-    UInt64 candidates_marked = 0;
+    UInt64 objects_condemned = 0;
     UInt64 objects_deleted = 0;
     UInt64 objects_absent = 0;
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
-    UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted, distinct from blob deletes
-    /// Counts for the three-stage deletion pipeline reported by `Cas::RoundReport`.
-    UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
-    UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
-    UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
-    UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
-    UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
+    UInt64 fence_outs = 0;
     UInt64 duration_ms = 0;
     String error;
     /// `getCurrentExceptionCode()` of the failure on an `Aborted`/`Failed` Finish row; 0 otherwise.
@@ -68,16 +59,12 @@ struct GcRoundLogRecord
     /// Correlator for every row of ONE round attempt: a fresh random hex id minted per `runRoundLogged`
     /// invocation and stamped on the `Start` row, every `Phase` row, and the `Finish` row.
     ///
-    /// DELIBERATELY NOT `round`. `round` is 0 on `Start`, is only known after the round's single
-    /// `gc/state` CAS on a folding round, and does not exist AT ALL on a `NotALeader` round -- and the
-    /// rounds a reader most needs to reconstruct are exactly the ones that never got that far.
+    /// DELIBERATELY NOT `round`: it is 0 on `Start` and on a round that does not run as the writer.
     String round_id;
     /// The GC phase this row describes; empty on `Start`/`Finish`. The literals are the ones passed to
     /// `Cas::GcPhaseTimer` at each phase's single instrumentation site.
     String phase;
-    /// Wall time of this phase. MICROseconds, not milliseconds: `meta_pool_wait`, `round_commit` and
-    /// `parent_seal_read` are routinely sub-millisecond and the whole point of the row is seeing when
-    /// they are not.
+    /// Wall time of this phase, in microseconds.
     UInt64 phase_duration_microseconds = 0;
     /// Phase-specific semantic counts (`Phase` rows only). The per-phase verb counts ride
     /// `profile_events` above instead, so no verb columns are invented.
@@ -108,7 +95,7 @@ public:
         std::chrono::seconds interval_,
         const String & log_name,
         String disk_name_,
-        Cas::KeeperRecordSourcesFn sources_,
+        Cas::KeeperRecordTablesFn tables_,
         GcRoundLogger logger_ = {});
     ~CasGcScheduler();
 
@@ -138,8 +125,8 @@ public:
     {
         bool is_leader = false;
         bool ever_succeeded = false;
-        Int64 pending_reclaim = 0;             /// cumulative condemned - executed deletes (this process)
-        UInt64 last_success_age_seconds = 0;   /// seconds since the last led round (0 if never)
+        Int64 pending_reclaim = 0;             /// blobs condemned and not yet deleted or spared (this process)
+        UInt64 last_success_age_seconds = 0;   /// seconds since the last round that ran as the writer (0 if never)
         UInt64 wedged_namespace_count = 0;
     };
     /// Takes a consistent-enough atomic snapshot for diagnostics. The returned counters are local
@@ -181,7 +168,6 @@ private:
     const Cas::PoolPtr store;
     const std::chrono::seconds interval;
     const LoggerPtr log;
-    const UInt128 gc_id;
     const String disk_name;
     const GcRoundLogger logger;
 
@@ -213,8 +199,7 @@ private:
     std::mutex terminal_exit_mutex;
     std::condition_variable terminal_exit_cv;
 
-    /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
-    /// led. It is an approximate health gauge, not durable GC state.
+    /// `KeeperGc::pendingCount` after the last round.
     std::atomic<Int64> pending_reclaim{0};
     /// Steady-clock timestamp of the last round that ran as the writer; zero means never.
     std::atomic<UInt64> last_success_ms{0};

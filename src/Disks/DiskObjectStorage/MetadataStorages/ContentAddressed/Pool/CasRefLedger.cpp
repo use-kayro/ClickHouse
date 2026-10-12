@@ -1,5 +1,4 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -5193,12 +5192,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         else if (entry_it->state == NsState::Live)
         {
             observed_live = *entry_it;
-            uint64_t removal_started_round = 0;
-            if (const auto got = removal_op.read(layout.gcStateKey(), Retry::standard()))
-                removal_started_round = decodeGcState(got->bytes).round;
-
-            switch (CasRefCatalog::beginRemoving(
-                removal_op, layout, *observed_live, removal_started_round))
+            /// `removal_started_round` stays in the row format, sealed at 0: its only reader was the deleted GC.
+            switch (CasRefCatalog::beginRemoving(removal_op, layout, *observed_live, /*removal_started_round=*/ 0))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:

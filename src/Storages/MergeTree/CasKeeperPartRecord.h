@@ -67,6 +67,11 @@ void addCasPartRecordOps(
     const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & zookeeper_path, const IMergeTreeDataPart & part,
     const std::optional<String> & copied_from_replica_path, Coordination::Requests & ops);
 
+/// `CasKeeperRecordSourcesProvider` (installed by `registerStorageMergeTree`): the replicated tables in
+/// `DatabaseCatalog` with a disk that is `disk`; nullopt when a table on `disk` is not replicated (no records:
+/// its blobs are unknown), or some table is not loaded yet or detached (its records are not read).
+std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRecordSourcesOnDisk(const IContentAddressedExchange & disk);
+
 /// The one multi-op that removes the record of `part` (at `<zookeeper_path>/cas_parts/<part>`, at
 /// `record_version`): it checks that no replica of `replicas` lists the part and that the writer epoch the GC
 /// read -- the versions of `<replica_path>/is_active` and `<replica_path>/host` -- still holds.

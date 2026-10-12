@@ -46,9 +46,9 @@ struct Entry
 
 }
 
-KeeperGc::KeeperGc(PoolPtr store_, KeeperRecordSourcesFn sources_, LoggerPtr log_)
+KeeperGc::KeeperGc(PoolPtr store_, KeeperRecordTablesFn tables_, LoggerPtr log_)
     : store(std::move(store_))
-    , sources(std::move(sources_))
+    , tables(std::move(tables_))
     , log(std::move(log_))
     , meta_writer(std::make_unique<GcMetaWriter>(store, log, static_cast<size_t>(store->poolConfig().gc_meta_pool_size)))
 {
@@ -92,42 +92,45 @@ void KeeperGc::runRound(RoundReport & report)
     report = RoundReport{};
     SCOPE_EXIT({ meta_writer->drainOnExitNoThrow(); });
 
-    const String pool_uuid = u128ToHex(store->poolMeta().pool_id);
-    const KeeperRecordSources srcs = sources();
     /// Read BEFORE the records: a build retired by now has its record in the snapshot below if it committed.
     const uint64_t build_floor = store->minActive();
 
-    std::vector<CasKeeperRecordSnapshot> snapshots;
+    std::optional<KeeperRecordTables> read;
     size_t unrecorded = 0;
     {
         GcPhaseTimer t(phase_sink, "keeper_records");
-        snapshots.reserve(srcs.size());
-        for (const auto & source : srcs)
+        read = tables();
+        if (!read)
         {
-            snapshots.push_back(source->snapshotCasRecords(pool_uuid));
-            if (!snapshots.back().writer)
+            t.metric("unreadable", 1);
+            LOG_INFO(log, "CAS GC: some table on the disk cannot be read this round (not loaded yet, or not "
+                     "replicated); removing nothing");
+            return;
+        }
+        size_t records = 0;
+        for (const auto & table : *read)
+        {
+            if (!table.snapshot.writer)
             {
                 t.metric("not_writer", 1);
                 return;   /// only the writer deletes
             }
-            unrecorded += snapshots.back().unrecorded_listed;
+            unrecorded += table.snapshot.unrecorded_listed;
+            records += table.snapshot.records.size();
         }
-        size_t records = 0;
-        for (const auto & s : snapshots)
-            records += s.records.size();
-        t.metric("sources", snapshots.size());
+        t.metric("tables", read->size());
         t.metric("records", records);
         t.metric("unrecorded_listed", unrecorded);
     }
-    if (snapshots.empty())
+    if (read->empty())
         return;
-    report.acquired_lease = true;
+    const KeeperRecordTables & tbls = *read;
+    report.writer = true;
     report.round = ++rounds;
 
     CasOperation op = store->openRequests().admit();
 
-    /// Kept from the previous GC: one LIST of `gc/server-roots/` and the fence-out of mounts whose lease
-    /// stopped renewing (goes with the server roots in step 3c).
+    /// One LIST of `gc/server-roots/` and the fence-out of mounts whose lease stopped renewing.
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
         const HeartbeatFloor floor = computeHeartbeatFloor(
@@ -143,8 +146,8 @@ void KeeperGc::runRound(RoundReport & report)
 
     std::vector<Entry> unlisted;
     std::unordered_map<BlobRef, size_t, BlobRefHash> listed_refs;
-    for (size_t s = 0; s < snapshots.size(); ++s)
-        for (const auto & record : snapshots[s].records)
+    for (size_t s = 0; s < tbls.size(); ++s)
+        for (const auto & record : tbls[s].snapshot.records)
         {
             if (!record.listed)
             {
@@ -176,37 +179,37 @@ void KeeperGc::runRound(RoundReport & report)
     std::vector<Entry> removable;
     {
         GcPhaseTimer t(phase_sink, "mark");
-        std::vector<std::vector<const CasKeeperRecordState *>> to_mark(snapshots.size());
+        std::vector<std::vector<const CasKeeperRecordState *>> to_mark(tbls.size());
         std::map<BlobRef, UInt64> to_condemn;
         std::set<MarkedRecord> still_marked;
         for (const Entry & e : unlisted)
         {
-            MarkedRecord key{srcs[e.source].get(), e.record->part};
-            /// Its retention counts from a mark this process wrote while the part was unlisted: a record marked
-            /// by an earlier process, or listed again since (a lagging replica attached it, a clone fetched it),
-            /// is marked anew.
-            const bool marked_unlisted = e.record->version > 0 && marked_records.contains(key);
-            still_marked.insert(std::move(key));
-            if (!marked_unlisted)
+            /// Its retention counts from a mark this process wrote while the part was unlisted (`marked_records`).
+            MarkedRecord key{tbls[e.source].source.get(), e.record->part};
+            if (!marked_records.contains(key))
             {
                 to_mark[e.source].push_back(e.record);
                 for (const auto & f : e.record->blobs)
                     if (!listed_refs.contains(blobRefOf(f)))
                         to_condemn.emplace(blobRefOf(f), f.size);
             }
-            else if (now_ms >= static_cast<uint64_t>(e.record->mtime_ms) + snapshots[e.source].retention_ms)
-                removable.push_back(e);
-        }
-        marked_records = std::move(still_marked);
-        size_t marked = 0;
-        for (size_t s = 0; s < snapshots.size(); ++s)
-            if (!to_mark[s].empty())
+            else
             {
-                srcs[s]->markCasRecords(to_mark[s]);
-                marked += to_mark[s].size();
+                if (now_ms >= static_cast<uint64_t>(e.record->mtime_ms) + tbls[e.source].snapshot.retention_ms)
+                    removable.push_back(e);
+                still_marked.insert(std::move(key));
             }
+        }
+        size_t marked = 0;
+        for (size_t s = 0; s < tbls.size(); ++s)
+            if (!to_mark[s].empty())
+                for (auto & part : tbls[s].source->markCasRecords(to_mark[s]))
+                {
+                    still_marked.emplace(tbls[s].source.get(), std::move(part));
+                    ++marked;
+                }
+        marked_records = std::move(still_marked);
         report.condemned = condemn(op, to_condemn, report.round);
-        report.candidates = report.condemned;
         t.metric("marked", marked);
         t.metric("condemned", report.condemned);
         t.metric("due", removable.size());
@@ -261,17 +264,17 @@ void KeeperGc::runRound(RoundReport & report)
             changed = true;
         }
     }
-    /// Blobs absent at observation never enter `condemned`; they need no delete, so they do not hold a
-    /// record back once observed absent.
-    condemn(op, uncondemned, report.round);
+    /// Condemned now, they hold their records back until a later round (a blob observed absent enters with no
+    /// token: nothing to delete, and a later upload of it shows as replaced).
+    report.condemned += condemn(op, uncondemned, report.round);
 
-    std::vector<std::vector<const CasKeeperRecordState *>> to_remove(snapshots.size());
+    std::vector<std::vector<const CasKeeperRecordState *>> to_remove(tbls.size());
     for (const Entry & e : removable)
         to_remove[e.source].push_back(e.record);
     std::set<std::pair<size_t, String>> removed;
-    for (size_t s = 0; s < snapshots.size(); ++s)
+    for (size_t s = 0; s < tbls.size(); ++s)
         if (!to_remove[s].empty())
-            for (auto & part : srcs[s]->removeCasRecords(snapshots[s], to_remove[s]))
+            for (auto & part : tbls[s].source->removeCasRecords(tbls[s].snapshot, to_remove[s]))
                 removed.emplace(s, std::move(part));
 
     std::map<BlobRef, UInt64> dead;
@@ -300,7 +303,7 @@ void KeeperGc::runRound(RoundReport & report)
                 : Removal::Mismatch;   /// re-uploaded since its condemnation (or uploaded after it was absent)
         switch (del)
         {
-            case Removal::Removed: ++report.deleted; ++report.redeleted; ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted); break;
+            case Removal::Removed: ++report.deleted; ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted); break;
             case Removal::Gone: ++report.absent; break;
             case Removal::Mismatch: ++report.replaced; ProfileEvents::increment(ProfileEvents::CASGCRetireReplaced); break;
         }

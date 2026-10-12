@@ -487,7 +487,6 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         }
         e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
         e.srid = r.srid;
-        e.gc_id = r.gc_id;
         e.trigger = r.trigger == Cas::GcRoundLogRecord::Trigger::Manual
             ? ContentAddressedGarbageCollectionLogElement::MANUAL
             : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
@@ -499,14 +498,8 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
             case Cas::GcRoundLogRecord::Outcome::Success:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::SUCCESS;
                 break;
-            case Cas::GcRoundLogRecord::Outcome::NotALeader:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::NOT_A_LEADER;
-                break;
             case Cas::GcRoundLogRecord::Outcome::Failed:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Deferred:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
                 break;
             case Cas::GcRoundLogRecord::Outcome::Aborted:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
@@ -515,18 +508,14 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
                 e.outcome = ContentAddressedGarbageCollectionLogElement::STOPPED;
                 break;
         }
+        e.writer = r.writer;
         e.round = r.round;
-        e.candidates_marked = r.candidates_marked;
+        e.objects_condemned = r.objects_condemned;
         e.objects_deleted = r.objects_deleted;
         e.objects_absent = r.objects_absent;
         e.objects_replaced = r.objects_replaced;
         e.objects_spared = r.objects_spared;
-        e.manifests_deleted = r.manifests_deleted;
-        e.entries_condemned = r.entries_condemned;
-        e.entries_graduated = r.entries_graduated;
-        e.entries_redeleted = r.entries_redeleted;
         e.fence_outs = r.fence_outs;
-        e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
         e.error = r.error;
         e.error_code = r.error_code;
@@ -2394,37 +2383,37 @@ bool ContentAddressedMetadataStorage::isHeldFromKeeper(const String & part_path)
     return r && !r->ref.empty() && r->file.empty() && partAccess()->isKeeperPart(r->refKey());
 }
 
-void ContentAddressedMetadataStorage::registerKeeperRecordSource(std::weak_ptr<ICasKeeperRecordSource> source)
+namespace
 {
-    std::lock_guard lock(record_sources_mutex);
-    record_sources.push_back(std::move(source));
+std::atomic<CasKeeperRecordSourcesProvider> keeper_record_sources_provider{nullptr};
 }
 
-void ContentAddressedMetadataStorage::unregisterKeeperRecordSource(const ICasKeeperRecordSource * source)
+void setCasKeeperRecordSourcesProvider(CasKeeperRecordSourcesProvider provider)
 {
-    std::lock_guard lock(record_sources_mutex);
-    std::erase_if(record_sources, [&](const auto & weak)
-    {
-        const auto locked = weak.lock();
-        return !locked || locked.get() == source;
-    });
+    keeper_record_sources_provider.store(provider);
 }
 
-std::vector<std::shared_ptr<ICasKeeperRecordSource>> ContentAddressedMetadataStorage::keeperRecordSources() const
+CasKeeperRecordSourcesProvider getCasKeeperRecordSourcesProvider()
 {
-    std::lock_guard lock(record_sources_mutex);
-    std::vector<std::shared_ptr<ICasKeeperRecordSource>> out;
-    for (const auto & weak : record_sources)
-        if (auto source = weak.lock())
-            out.push_back(std::move(source));
-    return out;
+    return keeper_record_sources_provider.load();
 }
 
 std::shared_ptr<Cas::CasGcScheduler> ContentAddressedMetadataStorage::makeGcScheduler(Cas::PoolPtr pool) const
 {
     return std::make_shared<Cas::CasGcScheduler>(
         std::move(pool), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full), disk_name,
-        [this] { return keeperRecordSources(); }, makeGcRoundLogger());
+        [this]() -> std::optional<Cas::KeeperRecordTables>
+        {
+            const auto provider = getCasKeeperRecordSourcesProvider();
+            const auto sources = provider ? provider(*this) : std::nullopt;
+            if (!sources)
+                return std::nullopt;
+            Cas::KeeperRecordTables tables;
+            for (const auto & source : *sources)
+                tables.push_back({source, source->snapshotCasRecords(*this)});
+            return tables;
+        },
+        makeGcRoundLogger());
 }
 
 /// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary

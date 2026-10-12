@@ -25,7 +25,7 @@
 /// Task 11 (rev.7 spec §6): `SYSTEM CAS GC STOP` / `GC START` -- granular operator control
 /// of ONLY the background GC scheduler. STOP is STOP-IN-PLACE: it joins the worker + heartbeat threads and
 /// clears the in-process leadership hint, but RETAINS the scheduler object so a later START restarts the
-/// SAME instance (its `gc_id` + lease-observation history preserved). The disk stays fully usable (reads/
+/// SAME instance (its condemnations preserved). The disk stays fully usable (reads/
 /// writes unaffected) while GC is stopped. START refuses on a decommissioned/uncertain pool (typed 668).
 ///
 /// These tests exercise the scheduler-level behavior directly (`CasGcScheduler::stop`/`start`) and the
@@ -103,7 +103,7 @@ void commitOnePart(ContentAddressedMetadataStorage & storage)
 
 /// A thread-safe sink for the scheduler's per-round log records, with a condition variable so a test can
 /// WAIT (never sleep) for a background round to land. `waitForSuccessFinish` blocks until a Finish record
-/// with `outcome == Success` (the round acquired/renewed the GC lease) appears at index >= `from`, or the
+/// with `outcome == Success` and `writer` (the round ran as the writer) appears at index >= `from`, or the
 /// timeout trips (only on a genuine hang/regression -- the round is sub-millisecond on an in-memory pool).
 class RoundLogSink
 {
@@ -134,7 +134,7 @@ public:
         {
             for (size_t i = from; i < records.size(); ++i)
                 if (records[i].event_type == GcRoundLogRecord::EventType::Finish
-                    && records[i].outcome == GcRoundLogRecord::Outcome::Success)
+                    && records[i].outcome == GcRoundLogRecord::Outcome::Success && records[i].writer)
                     return true;
             return false;
         });
@@ -142,7 +142,7 @@ public:
             return std::nullopt;
         for (size_t i = from; i < records.size(); ++i)
             if (records[i].event_type == GcRoundLogRecord::EventType::Finish
-                && records[i].outcome == GcRoundLogRecord::Outcome::Success)
+                && records[i].outcome == GcRoundLogRecord::Outcome::Success && records[i].writer)
                 return records[i];
         return std::nullopt;
     }
@@ -154,26 +154,31 @@ private:
 };
 
 /// The record source of one table this server writes, with no part on the disk: a round reads it and
-/// runs as the writer (`acquired_lease`), with nothing to mark or remove.
+/// runs as the writer (`writer`), with nothing to mark or remove.
 class WriterWithNoRecords : public DB::ICasKeeperRecordSource
 {
 public:
-    DB::CasKeeperRecordSnapshot snapshotCasRecords(const String &) override
+    DB::CasKeeperRecordSnapshot snapshotCasRecords(const DB::IContentAddressedExchange &) override
     {
         DB::CasKeeperRecordSnapshot snapshot;
         snapshot.writer = true;
         return snapshot;
     }
-    void markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override {}
+    DB::Strings markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override { return {}; }
     Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> &) override
     {
         return {};
     }
 };
 
-Cas::KeeperRecordSourcesFn writerSources()
+Cas::KeeperRecordTablesFn writerSources()
 {
-    return [source = std::make_shared<WriterWithNoRecords>()] { return Cas::KeeperRecordSources{source}; };
+    return [source = std::make_shared<WriterWithNoRecords>()]
+    {
+        DB::CasKeeperRecordSnapshot snapshot;
+        snapshot.writer = true;
+        return std::optional<Cas::KeeperRecordTables>(Cas::KeeperRecordTables{{source, snapshot}});
+    };
 }
 
 /// A generous wait bound for a background round to land -- trips only on a real deadlock/regression.
@@ -291,7 +296,7 @@ TEST(CASGCStopStart, StopJoinsWorkersAndClearsLeadershipHint)
 
     /// Acquire REAL leadership: a manual round on a free lease acquires it.
     const RoundReport rep = sched.runOneRoundNow();
-    ASSERT_TRUE(rep.acquired_lease) << "a manual round on a fresh pool must acquire the free GC lease";
+    ASSERT_TRUE(rep.writer) << "a manual round on a fresh pool must acquire the free GC lease";
     ASSERT_TRUE(sched.gcHealth().is_leader) << "leadership must be true BEFORE stop for the clear to prove anything";
     ASSERT_TRUE(sched.isQuiescent()) << "the manual round completed; nothing is in flight";
 
@@ -302,12 +307,11 @@ TEST(CASGCStopStart, StopJoinsWorkersAndClearsLeadershipHint)
         << "stop must clear the in-process leadership hint (the disk no longer leads GC)";
 }
 
-/// (b) START after STOP restarts the SAME scheduler: background rounds resume, they carry the SAME gc_id
-/// (identity preserved across the restart), and leadership is re-entered via the next round's NORMAL
-/// acquisition (is_leader becomes true only after the restarted background round re-acquires the lease).
+/// (b) START after STOP restarts the SAME scheduler: background rounds resume, and `is_leader` (the last
+/// round ran as the writer) becomes true again only after a restarted background round.
 /// Deterministic and sleep-free: a condition variable fed by the round logger waits for each background
 /// Finish. This also exercises `start()`'s post-join re-entrancy -- a bug there would hang the wait.
-TEST(CASGCStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
+TEST(CASGCStopStart, StartAfterStopResumesBackgroundRounds)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -322,20 +326,16 @@ TEST(CASGCStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
     const auto first = sink.waitForSuccessFinish(/*from=*/0, kRoundWait);
     ASSERT_TRUE(first.has_value()) << "the background scheduler must run a round and acquire the lease after start()";
     EXPECT_TRUE(sched.gcHealth().is_leader) << "leadership is held after the first background round";
-    const std::string gc_id_before = first->gc_id;
-    EXPECT_FALSE(gc_id_before.empty());
 
     /// Stop: leadership hint cleared, threads joined.
     sched.stop();
     EXPECT_FALSE(sched.gcHealth().is_leader) << "stop clears the leadership hint";
     const size_t after_stop = sink.mark();
 
-    /// Restart the SAME instance: a NEW background round must land, re-acquiring the lease, and it must
-    /// carry the SAME gc_id (proving the instance -- and its lease observer -- survived the restart).
+    /// Restart the SAME instance: a NEW background round must land.
     sched.start();
     const auto second = sink.waitForSuccessFinish(/*from=*/after_stop, kRoundWait);
     ASSERT_TRUE(second.has_value()) << "background rounds must resume after START (start() is re-enterable post-join)";
-    EXPECT_EQ(second->gc_id, gc_id_before) << "the restarted scheduler must preserve its gc_id (same instance)";
     EXPECT_TRUE(sched.gcHealth().is_leader)
         << "leadership is re-entered via the restarted round's normal lease acquisition";
 
@@ -361,7 +361,7 @@ TEST(CASGCStopStart, StopAndStartAreIdempotent)
     /// After the double-stop, START still restarts the same instance and it runs a round.
     sched.start();
     const RoundReport rep = sched.runOneRoundNow();
-    EXPECT_TRUE(rep.acquired_lease) << "the restarted scheduler still runs rounds after idempotent stop/start";
+    EXPECT_TRUE(rep.writer) << "the restarted scheduler still runs rounds after idempotent stop/start";
     sched.stop();
 }
 
@@ -469,7 +469,7 @@ TEST(CASGCStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
 /// was genuinely running+leading first, STOP it, drive a real transient→Live recovery on the pool, then show
 /// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
 /// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the
-/// SAME instance (`gc_id` preserved). The positive control makes the negative meaningful: the sink IS live.
+/// SAME instance. The positive control makes the negative meaningful: the sink IS live.
 TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -506,7 +506,7 @@ TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
     EXPECT_FALSE(sink.waitForSuccessFinish(after_stop, kStayStoppedWindow).has_value())
         << "a self-remount recovery must NOT restart an operator-STOPped GC scheduler";
 
-    /// Positive control: only an explicit START resumes rounds, on the SAME instance (gc_id preserved).
+    /// Positive control: only an explicit START resumes rounds, on the SAME instance.
     /// This also proves the sink WOULD have caught a round, so the negative above is meaningful.
     sched.start();
     const auto resumed = sink.waitForSuccessFinish(after_stop, kRoundWait);
