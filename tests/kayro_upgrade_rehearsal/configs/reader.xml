@@ -1,0 +1,24 @@
+<clickhouse>
+    <interserver_http_host>reader</interserver_http_host>
+    <macros><shard>1</shard><replica>reader</replica></macros>
+    <storage_configuration>
+        <disks>
+            <shared_s3>
+                <cas_server_root_id>reader</cas_server_root_id>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+            </shared_s3>
+            <shared_s3_cache>
+                <type>cache</type><disk>shared_s3</disk>
+                <path>/var/lib/clickhouse/caches/shared_s3/</path>
+                <max_size>2147483648</max_size>
+            </shared_s3_cache>
+        </disks>
+        <policies><shared_s3><volumes><main><disk>shared_s3_cache</disk></main></volumes></shared_s3></policies>
+    </storage_configuration>
+    <merge_tree>
+        <!-- Readers never assign merges: the writer merges, readers fetch the merged part (TEC-836). -->
+        <replicated_can_become_leader>0</replicated_can_become_leader>
+        <always_fetch_merged_part>1</always_fetch_merged_part>
+    </merge_tree>
+</clickhouse>

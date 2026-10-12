@@ -1,0 +1,15 @@
+<clickhouse>
+    <!-- As production's kayro-keeper (kayro-infra platforms/aws/modules/clickhouse-shared/user-data.sh.tftpl):
+         single node, no feature_flags block, so the image's defaults decide CREATE_IF_NOT_EXISTS. -->
+    <logger><level>information</level><console>1</console></logger>
+    <listen_host>0.0.0.0</listen_host>
+    <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse-keeper/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse-keeper/snapshots</snapshot_storage_path>
+        <raft_configuration>
+            <server><id>1</id><hostname>keeper</hostname><port>9234</port></server>
+        </raft_configuration>
+    </keeper_server>
+</clickhouse>

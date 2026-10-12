@@ -1,0 +1,24 @@
+<clickhouse>
+    <!-- Production's shared-pool config (kayro-infra platforms/aws/modules/clickhouse-shared/storage.xml.tftpl)
+         with the bucket swapped for a local RustFS. LAB-ONLY values are marked as such. -->
+    <listen_host replace="replace">0.0.0.0</listen_host>
+    <interserver_http_port>9009</interserver_http_port>
+    <logger><level>debug</level></logger>
+    <zookeeper><node><host>keeper</host><port>9181</port></node></zookeeper>
+    <storage_configuration>
+        <disks>
+            <shared_s3>
+                <type>object_storage</type><object_storage_type>s3</object_storage_type><metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs:11121/pool/shared_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id><secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <!-- LAB-ONLY: production runs 600 s; 5 s gives many rounds within minutes. -->
+                <cas_gc_interval_sec>5</cas_gc_interval_sec>
+            </shared_s3>
+        </disks>
+    </storage_configuration>
+    <merge_tree>
+        <!-- LAB-ONLY: production keeps the default 480 s. Small, so a DROP PARTITION is due within the rehearsal. -->
+        <old_parts_lifetime>30</old_parts_lifetime>
+    </merge_tree>
+</clickhouse>

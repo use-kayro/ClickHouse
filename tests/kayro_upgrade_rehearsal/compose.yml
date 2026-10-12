@@ -1,0 +1,73 @@
+# Upgrade rehearsal of the CAS pool: one Keeper, one RustFS pool, a writer and two readers.
+# Each ClickHouse service takes its image from the environment, so a node "restarts on image X" is
+# `WRITER_IMAGE=X docker compose up -d writer`: the container is replaced, its /var/lib/clickhouse volume,
+# the pool and Keeper stay, as on a production node. rehearse.py drives it.
+x-clickhouse: &clickhouse
+  depends_on: [keeper, rustfs]
+  stop_grace_period: 60s
+  ulimits:
+    nofile: { soft: 262144, hard: 262144 }
+  environment:
+    CLICKHOUSE_SKIP_USER_SETUP: "1"
+
+services:
+  rustfs:
+    # The image tests/integration uses: RustFS enforces the conditional PUT/DELETE the CAS mount probe needs
+    # (MinIO does not).
+    image: rustfs/rustfs:1.0.0-rc.3
+    environment:
+      RUSTFS_ACCESS_KEY: clickhouse
+      RUSTFS_SECRET_KEY: clickhouse
+      RUSTFS_SCANNER_ENABLED: "false"
+      RUSTFS_HEAL_ENABLED: "false"
+    command: server --address 0.0.0.0:11121 /data
+    volumes: [rustfs:/data]
+    ports: ["127.0.0.1:11121:11121"]
+
+  keeper:
+    # Production's standalone Keeper (kayro-infra clickhouse-shared main.tf), default feature flags; not upgraded.
+    image: clickhouse/clickhouse-server:26.2.19.43@sha256:c2f2605585899d5103a0447daadbc0005f362200d5f0fcca7f40db3ca0dd36dd
+    entrypoint: ["/usr/bin/clickhouse", "keeper", "--config-file=/etc/keeper.xml"]
+    volumes:
+      - ./configs/keeper.xml:/etc/keeper.xml:ro
+      - keeper:/var/lib/clickhouse-keeper
+
+  writer:
+    <<: *clickhouse
+    image: ${WRITER_IMAGE:?}
+    hostname: writer
+    volumes:
+      - ./configs/common.xml:/etc/clickhouse-server/config.d/common.xml:ro
+      - ./configs/writer.xml:/etc/clickhouse-server/config.d/node.xml:ro
+      - writer:/var/lib/clickhouse
+      - ./logs/writer:/var/log/clickhouse-server
+    ports: ["127.0.0.1:18123:8123"]
+
+  reader:
+    <<: *clickhouse
+    image: ${READER_IMAGE:?}
+    hostname: reader
+    volumes:
+      - ./configs/common.xml:/etc/clickhouse-server/config.d/common.xml:ro
+      - ./configs/reader.xml:/etc/clickhouse-server/config.d/node.xml:ro
+      - reader:/var/lib/clickhouse
+      - ./logs/reader:/var/log/clickhouse-server
+    ports: ["127.0.0.1:18124:8123"]
+
+  reader-mdb:
+    <<: *clickhouse
+    image: ${READER_MDB_IMAGE:?}
+    hostname: reader-mdb
+    volumes:
+      - ./configs/common.xml:/etc/clickhouse-server/config.d/common.xml:ro
+      - ./configs/reader-mdb.xml:/etc/clickhouse-server/config.d/node.xml:ro
+      - reader-mdb:/var/lib/clickhouse
+      - ./logs/reader-mdb:/var/log/clickhouse-server
+    ports: ["127.0.0.1:18125:8123"]
+
+volumes:
+  rustfs:
+  keeper:
+  writer:
+  reader:
+  reader-mdb:
