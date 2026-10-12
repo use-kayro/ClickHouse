@@ -4,11 +4,13 @@ Corrige uma pausa do GC do CAS no writer: depois do primeiro DROP de uma tabela 
 
 | Campo | Valor |
 |---|---|
-| PR | https://github.com/use-kayro/ClickHouse/pull/12 (branch `kayro/gc-loaded-tables`), head `1550abe87523a982a589ea04890f006e45ef3c27`, depois da revisão `/enxuto`. Aberto quando isto foi escrito |
+| PR | https://github.com/use-kayro/ClickHouse/pull/12 (branch `kayro/gc-loaded-tables`), head `1550abe87523a982a589ea04890f006e45ef3c27`, depois da revisão `/enxuto` |
+| Merge | `703cb49f4ed74d16ac166138cf1671c4abec3992` em `kayro/26.6-cas-load-recovery` (head `1550abe8` preservado) |
 | Base | passo 2b (`a6355a99`) |
-| Imagem | `TODO` |
+| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:6dcd83ffb0cc11258fe279e4f166e248926391446cb3208535efdc6cb6a8db02` |
+| Tag da imagem | `kayro/clickhouse:1550abe87523a982a589ea04890f006e45ef3c27` (head do PR #12) |
 | Linear | TEC-850 |
-| Em produção | `TODO` |
+| Em produção | deploy previsto para ~17:10Z de 12/10 (writer → reader-mdb → reader compartilhado); horários `TODO` |
 
 ## Incidente (12/10)
 
@@ -40,7 +42,13 @@ Corrige uma pausa do GC do CAS no writer: depois do primeiro DROP de uma tabela 
 
 `test_cas_gc_s3::test_gc_after_drop_of_boot_table`: cria uma tabela replicada descartável, reinicia o servidor e faz DROP dela; depois insere numa tabela CAS, faz DROP PARTITION e exige que os blobs e os `cas_parts` sumam na rodada seguinte. Sem a correção, nenhuma rodada apaga e o teste falha.
 
-Portão do builder: `TODO`.
+### Portão do builder (`gcfix`, imagem de `1550abe8`)
+
+| Verificação | Resultado |
+|---|---|
+| Gtests CAS | **1.946/1.946** passaram, 0 falhas (2 desabilitados) |
+| `test_cas_gc_s3` | **2/2**: `test_gc_reclaims_dropped_blobs` e `test_gc_after_drop_of_boot_table`. Rodado duas vezes: em paralelo (14:34–14:38Z) e na receita (15:25–15:26Z) |
+| Harness fault/RLS (`test_cas_load_recovery`) | OK: `loading_fault_observed`, `loading_recovered_without_restart`, `shutdown_during_fault` exit 0 |
 
 ## Upstream
 
@@ -54,8 +62,14 @@ Sem mudança de protocolo: qualquer ordem, um nó por vez. Só o writer roda rod
 
 ## Imagem de release
 
-Digest: `TODO`.
+`474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:6dcd83ffb0cc11258fe279e4f166e248926391446cb3208535efdc6cb6a8db02`, construída do head `1550abe87523a982a589ea04890f006e45ef3c27` no builder `gcfix`:
+
+- início 13:19:21Z;
+- push 14:33:52Z;
+- `BUILD_COMPLETE` 15:26:45Z.
+
+Paridade de features: não registrada.
 
 ## Deploy
 
-`TODO`.
+Previsto para ~17:10Z de 12/10, na ordem writer → reader-mdb → reader compartilhado. Rollback preparado: passo 2b, `sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`. Horários e resultado: `TODO`.
