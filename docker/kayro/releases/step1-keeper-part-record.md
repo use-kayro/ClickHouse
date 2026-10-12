@@ -8,13 +8,13 @@ A metadata de uma parte num disco CAS passa a existir também no Keeper, num reg
 
 | Campo | Valor |
 |---|---|
-| PR | https://github.com/use-kayro/ClickHouse/pull/2, aberto, não mergeado |
+| PR | https://github.com/use-kayro/ClickHouse/pull/2, mergeado em 12/10 como `b71585e` |
 | Branch | `kayro/keeper-part-manifest` |
 | Head | `283ca09658a4c0e405106342362c0c3b864ed4b8` (11/10 22:17Z), sobre o RC3 (`9700e6e`) |
 | Commit com portão verde | `1df4e77c7357a2bd25475fa574a3713d1b74e5a5`, sobre o RC2 (`294ea1e`), **sem** o RC3 |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`, de `283ca096`. Gate verde 12/10 00:46Z (início exato do build não registrado) |
 | Linear | TEC-849 (In Review); perguntas e decisões cruzadas em TEC-850 e TEC-851 |
-| Em produção | writer: 3a iniciado 12/10 ~01:10Z. Readers no RC3 |
+| Em produção | writer de 12/10 ~01:10Z (3a) até 03:00Z, quando o writer passou ao [passo 2](step2-keeper-gc.md). Readers nunca rodaram esta imagem |
 
 Os quatro primeiros commits são o patch do portão rebaseado sobre o RC3: `git diff 294ea1e 1df4e77` e `git diff 9700e6e 33ae72d4` dão o mesmo `git patch-id --stable` (`6672380d…`), 33 arquivos, +1851/−136. O quinto, `283ca096`, veio depois desse portão; a imagem de release de `283ca096` (RC3 + passo 1) passou no portão próprio em 12/10 00:46Z.
 
