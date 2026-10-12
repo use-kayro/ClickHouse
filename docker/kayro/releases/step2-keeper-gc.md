@@ -10,7 +10,7 @@ O GC do pool deixa de listar o S3 e de reler os ref logs para saber o que está 
 | Base | passo 1 (PR #2, merge `b71585e`), sobre o RC3 |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, de `023e6c4`, push 12/10 02:52Z |
 | Linear | TEC-850 |
-| Em produção | Deploy iniciado 12/10 ~03:00Z, writer → reader-mdb → reader. |
+| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); aceite em verificação (checklist de +30 min até ~03:40Z) |
 
 Commits:
 - `7c6c4c8` teste `test_cas_reader_pin`;
@@ -141,6 +141,18 @@ Builder `tec850`, RelWithDebInfo sem LTO, `ENABLE_TESTS=ON`. Árvore idêntica �
 **Linha de base no binário do #2** (só o passo 1, GC antigo): `test_cas_reader_pin[drop]` **falhou**. O GC antigo apagou 12 blobs que as partes do reader, anexadas pelo registro, serviam no meio da query. É a lacuna que este passo fecha.
 
 **O que este portão não cobre:** o build ThinLTO de release, a paridade de features e a imagem no ECR. Isso entrou na imagem de release (abaixo).
+
+## Deploy (12/10)
+
+Antes: readers no RC3 (`sha256:6469a0c1…`), writer no passo 1 (`sha256:250b6ed9…`). A sequência começou logo depois da rodada do GC antigo do reader-mdb às 03:00:19Z: em produção era o reader-mdb, não o writer, quem segurava o lease do GC antigo.
+
+| Nó | Apply | Rodando | Saudável | Aceite |
+|---|---|---|---|---|
+| Writer `i-02e3809e0b416b25e` | 03:00:30Z | 03:00:38Z | 03:03:10Z (3.948 queries ok) | em verificação |
+| Reader-mdb `i-0bc5ccb44d4141059` | 03:03:10Z | 03:03:17Z | 03:03:34Z | em verificação |
+| Reader compartilhado `i-02369cef982eb67d2` | 03:03:34Z | não registrado | 03:09:48Z | em verificação |
+
+Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dentro dos 10 min da regra. Checklist de +30 min em andamento até ~03:40Z.
 
 ## Imagem de release
 
