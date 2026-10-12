@@ -445,7 +445,7 @@ def test_reader_removes_outdated_record_parts():
         return set(
             reader.query(
                 "SELECT DISTINCT splitByChar('/', local_path)[4] FROM system.remote_data_paths "
-                "WHERE disk_name = '{}' AND local_path LIKE '%/{}/%'".format(CA_DISK, uuid)
+                "WHERE disk_name = '{}' AND local_path LIKE '%/{}/%/%'".format(CA_DISK, uuid)
             ).split()
         )
 
