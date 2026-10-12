@@ -128,10 +128,10 @@ std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRec
     std::vector<std::shared_ptr<ICasKeeperRecordSource>> sources;
     for (const auto & [database_name, database] : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false, .with_remote_databases = false}))
     {
-        size_t loaded = 0;
-        for (auto it = database->getTablesIterator(context, {}, /*skip_not_loaded=*/ true); it->isValid(); it->next())
+        /// `skip_not_loaded=false`: a table still loading or starting up would otherwise be missing from the
+        /// snapshot, and its records unread.
+        for (auto it = database->getTablesIterator(context, {}, /*skip_not_loaded=*/ false); it->isValid(); it->next())
         {
-            ++loaded;
             const auto table = it->table();
             const auto * data = dynamic_cast<const MergeTreeData *>(table.get());
             if (!data || std::ranges::none_of(data->getDisks(), [&](const DiskPtr & d) { return tryGetContentAddressedExchange(d) == &disk; }))
@@ -141,11 +141,10 @@ std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRec
                 return std::nullopt;
             sources.push_back(std::move(replicated));
         }
-        /// Not loaded yet, or detached: its parts may still reference blobs, but its records are not read. (A
-        /// table out of the catalog for a moment -- a reload -- needs no guard: a blob goes only after rounds of
-        /// its condemnation and of its deletion both found no record referencing it.)
-        if (loaded < database->getAllTableNames(context).size()
-            || database->getDetachedTablesIterator(context, {}, /*skip_not_loaded=*/ true)->isValid())
+        /// Detached: its parts may still reference blobs, but its records are not read. (A table out of the
+        /// catalog for a moment -- a reload -- needs no guard: a blob goes only after rounds of its condemnation
+        /// and of its deletion both found no record referencing it.)
+        if (database->getDetachedTablesIterator(context, {}, /*skip_not_loaded=*/ true)->isValid())
             return std::nullopt;
     }
     return sources;

@@ -51,6 +51,42 @@ def gc_log_scalar(node, query):
     return int(node.query(query).strip())
 
 
+def create_table(node, table):
+    node.query(
+        """
+        CREATE TABLE {table} (
+            p UInt8,
+            id Int64,
+            data String
+        ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{table}', '{{replica}}')
+        PARTITION BY p
+        ORDER BY id
+        SETTINGS storage_policy = '{policy}', old_parts_lifetime = 1, cleanup_delay_period = 1, max_cleanup_delay_period = 1
+        """.format(
+            table=table, policy=STORAGE_POLICY
+        )
+    )
+
+
+def assert_reclaimed(node, table, inserted):
+    """
+    Every blob in `inserted` (written by the inserts, and the merges of their parts, into a partition dropped since)
+    goes, and so do the table's records. DROP's empty covering part is a local part with no record: its blob (the one
+    every empty file hashes to) is not the GC's to reclaim.
+    """
+    assert inserted, "the inserts wrote no blob"
+    left = inserted & blob_keys()
+    for _ in range(RECLAIM_RETRIES):
+        if not left:
+            break
+        time.sleep(RECLAIM_SLEEP)
+        left = inserted & blob_keys()
+    assert not left, "{} of the {} blobs of the dropped partition were not reclaimed".format(len(left), len(inserted))
+    assert node.query(
+        "SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables/{}/cas_parts'".format(table)
+    ).strip() == "0"
+
+
 def test_gc_reclaims_dropped_blobs():
     """
     The background GC reclaims the blobs of a dropped partition, from the parts' Keeper records alone: the
@@ -61,20 +97,7 @@ def test_gc_reclaims_dropped_blobs():
     node.query("DROP TABLE IF EXISTS cas_gc_test SYNC")
     baseline = blob_keys()
 
-    node.query(
-        """
-        CREATE TABLE cas_gc_test (
-            p UInt8,
-            id Int64,
-            data String
-        ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/cas_gc_test', '{{replica}}')
-        PARTITION BY p
-        ORDER BY id
-        SETTINGS storage_policy = '{}', old_parts_lifetime = 1, cleanup_delay_period = 1, max_cleanup_delay_period = 1
-        """.format(
-            STORAGE_POLICY
-        )
-    )
+    create_table(node, "cas_gc_test")
     since = node.query("SELECT toString(now())").strip()
 
     for i in range(NUM_INSERTS):
@@ -85,22 +108,9 @@ def test_gc_reclaims_dropped_blobs():
         )
     assert int(node.query("SELECT count() FROM cas_gc_test")) == NUM_INSERTS * NUM_ROWS
     inserted = blob_keys() - baseline
-    assert inserted, "the inserts wrote no blob"
 
     node.query("ALTER TABLE cas_gc_test DROP PARTITION 1")
-
-    # Every blob the inserts (and the merges of their parts) wrote goes. DROP's empty covering part is a local
-    # part with no record: its blob (the one every empty file hashes to) is not the GC's to reclaim.
-    left = inserted & blob_keys()
-    for _ in range(RECLAIM_RETRIES):
-        if not left:
-            break
-        time.sleep(RECLAIM_SLEEP)
-        left = inserted & blob_keys()
-    assert not left, "{} of the {} blobs of the dropped partition were not reclaimed".format(len(left), len(inserted))
-    assert node.query(
-        "SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables/cas_gc_test/cas_parts'"
-    ).strip() == "0"
+    assert_reclaimed(node, "cas_gc_test", inserted)
 
     assert gc_log_scalar(
         node,
@@ -121,5 +131,26 @@ def test_gc_reclaims_dropped_blobs():
         """.format(since)
     )
     assert not over_budget.strip(), over_budget
+
+    node.query("DROP TABLE cas_gc_test SYNC")
+
+
+def test_gc_after_drop_of_boot_table():
+    """
+    A table that existed at boot and is dropped afterwards keeps its name in the database's startup tasks; the GC
+    still reads the tables on the disk and reclaims.
+    """
+    node = cluster.instances["node"]
+
+    create_table(node, "cas_gc_boot")
+    node.restart_clickhouse()
+    node.query("DROP TABLE cas_gc_boot SYNC")
+
+    create_table(node, "cas_gc_test")
+    baseline = blob_keys()
+    node.query("INSERT INTO cas_gc_test SELECT 1, number, toString(number) FROM numbers({})".format(NUM_ROWS))
+    inserted = blob_keys() - baseline
+    node.query("ALTER TABLE cas_gc_test DROP PARTITION 1")
+    assert_reclaimed(node, "cas_gc_test", inserted)
 
     node.query("DROP TABLE cas_gc_test SYNC")
