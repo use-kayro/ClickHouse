@@ -5114,50 +5114,27 @@ void StorageReplicatedMergeTree::backfillCasPartRecords()
         LOG_INFO(log, "Backfilled {} Keeper part records ({} already present)", created, futures.size() - created);
 }
 
-void StorageReplicatedMergeTree::registerCasKeeperRecordSource()
-{
-    for (const auto & disk : casRecordDisks(getDisks()))
-    {
-        auto * ca = tryGetContentAddressedExchange(disk);
-        ca->unregisterKeeperRecordSource(this);
-        ca->registerKeeperRecordSource(std::static_pointer_cast<StorageReplicatedMergeTree>(shared_from_this()));
-    }
-}
-
-void StorageReplicatedMergeTree::unregisterCasKeeperRecordSource()
-{
-    for (const auto & disk : casRecordDisks(getDisks()))
-        tryGetContentAddressedExchange(disk)->unregisterKeeperRecordSource(this);
-}
-
-CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const String & pool_uuid)
+CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const IContentAddressedExchange & disk)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::snapshotCasRecords");
-    IContentAddressedExchange * ca = nullptr;
-    for (const auto & disk : casRecordDisks(getDisks()))
-        if (auto * candidate = tryGetContentAddressedExchange(disk); candidate->getPoolUUID() == pool_uuid)
-            ca = candidate;
-
     CasKeeperRecordSnapshot snapshot;
+    /// A table that failed to start (or lost its session) is read-only: the round does not run.
     snapshot.writer = is_leader && !is_readonly;
     snapshot.retention_ms = (*getSettings())[MergeTreeSetting::old_parts_lifetime].totalMilliseconds();
-    if (!ca)
-        return snapshot;
+    if (!snapshot.writer)
+        return snapshot;   /// the round stops here: only the writer reads the records
 
     auto zookeeper = getZooKeeper();
-    if (snapshot.writer)
+    Coordination::Stat is_active_stat;
+    Coordination::Stat host_stat;
+    if (!zookeeper->exists(fs::path(replica_path) / "is_active", &is_active_stat)
+        || !zookeeper->exists(fs::path(replica_path) / "host", &host_stat))
     {
-        Coordination::Stat is_active_stat;
-        Coordination::Stat host_stat;
-        if (!zookeeper->exists(fs::path(replica_path) / "is_active", &is_active_stat)
-            || !zookeeper->exists(fs::path(replica_path) / "host", &host_stat))
-        {
-            snapshot.writer = false;
-            return snapshot;
-        }
-        snapshot.is_active_version = is_active_stat.version;
-        snapshot.host_version = host_stat.version;
+        snapshot.writer = false;
+        return snapshot;
     }
+    snapshot.is_active_version = is_active_stat.version;
+    snapshot.host_version = host_stat.version;
 
     const String records_path = casPartRecordsPath(zookeeper_path);
     Strings names;
@@ -5188,42 +5165,47 @@ CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const Str
                                    .version = got[i].stat.version, .mtime_ms = got[i].stat.mtime};
         try
         {
-            const CasKeeperPartRecord decoded = ca->decodeKeeperPartRecord(state.data);
-            if (decoded.pool_uuid != pool_uuid)
-                continue;   /// a record of another pool of the policy
+            const CasKeeperPartRecord decoded = disk.decodeKeeperPartRecord(state.data);
+            recorded.insert(names[i]);   /// a part of another pool of the policy is that pool's GC's business
+            if (decoded.pool_uuid != disk.getPoolUUID())
+                continue;
             state.blobs = casRecordBlobFiles(decoded);
         }
         catch (const Exception & e)
         {
             /// Blobs unknown: never removed, and while its part is listed, nothing is deleted.
+            recorded.erase(names[i]);
             LOG_WARNING(log, "Cannot read the Keeper record of part {}: {}", names[i], e.message());
             continue;
         }
-        recorded.insert(names[i]);
         snapshot.records.push_back(std::move(state));
     }
 
-    /// A listed part without a record: its blobs are unknown unless this replica holds it on a disk that
-    /// is not content-addressed.
+    /// A listed part without a record: its blobs are unknown unless this replica holds it on a disk that is
+    /// not content-addressed. (One another replica lists on such a disk, and this replica does not hold, counts
+    /// until this replica fetches it or no replica lists it any more.)
     for (const auto & name : listed)
     {
         if (recorded.contains(name))
             continue;
         const auto part = getPartIfExists(name, {MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-        if (part && !tryGetContentAddressedExchange(getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName())))
+        if (part && !part->getDataPartStorage().isContentAddressed())
             continue;
         ++snapshot.unrecorded_listed;
     }
     return snapshot;
 }
 
-void StorageReplicatedMergeTree::markCasRecords(const std::vector<const CasKeeperRecordState *> & records)
+Strings StorageReplicatedMergeTree::markCasRecords(const std::vector<const CasKeeperRecordState *> & records)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::markCasRecords");
     auto zookeeper = getZooKeeper();
     const String records_path = casPartRecordsPath(zookeeper_path);
+    Strings marked;
     for (const auto * record : records)
-        (void)zookeeper->trySet(fs::path(records_path) / record->part, record->data, record->version);   /// a lost race: next round
+        if (zookeeper->trySet(fs::path(records_path) / record->part, record->data, record->version) == Coordination::Error::ZOK)
+            marked.push_back(record->part);
+    return marked;
 }
 
 Strings StorageReplicatedMergeTree::removeCasRecords(
@@ -6397,8 +6379,6 @@ void StorageReplicatedMergeTree::startupImpl(bool from_attach_thread, const ZooK
 
         part_moves_between_shards_orchestrator.start();
 
-        registerCasKeeperRecordSource();
-
         /// After finishing startup() create_query_zk_retries_info won't be used anymore.
         clearCreateQueryZooKeeperRetriesInfo();
     }
@@ -6524,8 +6504,6 @@ void StorageReplicatedMergeTree::shutdown(bool)
         return;
 
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::shutdown");
-
-    unregisterCasKeeperRecordSource();
 
     LOG_TRACE(log, "Shutdown started");
 

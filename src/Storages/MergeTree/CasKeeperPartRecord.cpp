@@ -7,6 +7,10 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
+#include <Storages/StorageReplicatedMergeTree.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Databases/IDatabase.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
@@ -116,6 +120,35 @@ void addCasPartRecordOps(
         ops.emplace_back(zkutil::makeCheckRequest(path, -1));
     else
         ops.emplace_back(zkutil::makeCheckRequest(fs::path(*copied_from_replica_path) / "parts" / part.name, -1));
+}
+
+std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRecordSourcesOnDisk(const IContentAddressedExchange & disk)
+{
+    const auto context = Context::getGlobalContextInstance();
+    std::vector<std::shared_ptr<ICasKeeperRecordSource>> sources;
+    for (const auto & [database_name, database] : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false, .with_remote_databases = false}))
+    {
+        size_t loaded = 0;
+        for (auto it = database->getTablesIterator(context, {}, /*skip_not_loaded=*/ true); it->isValid(); it->next())
+        {
+            ++loaded;
+            const auto table = it->table();
+            const auto * data = dynamic_cast<const MergeTreeData *>(table.get());
+            if (!data || std::ranges::none_of(data->getDisks(), [&](const DiskPtr & d) { return tryGetContentAddressedExchange(d) == &disk; }))
+                continue;
+            auto replicated = std::dynamic_pointer_cast<StorageReplicatedMergeTree>(table);
+            if (!replicated)
+                return std::nullopt;
+            sources.push_back(std::move(replicated));
+        }
+        /// Not loaded yet, or detached: its parts may still reference blobs, but its records are not read. (A
+        /// table out of the catalog for a moment -- a reload -- needs no guard: a blob goes only after rounds of
+        /// its condemnation and of its deletion both found no record referencing it.)
+        if (loaded < database->getAllTableNames(context).size()
+            || database->getDetachedTablesIterator(context, {}, /*skip_not_loaded=*/ true)->isValid())
+            return std::nullopt;
+    }
+    return sources;
 }
 
 Coordination::Requests casRecordRemovalOps(

@@ -171,7 +171,7 @@ struct CasKeeperRecordState
     Int64 mtime_ms = 0;                      /// znode mtime: when the GC marked it (or it was created)
 };
 
-/// One table's records on one pool, read by its replica on this server.
+/// One table's records on one disk's pool, read by its replica on this server.
 struct CasKeeperRecordSnapshot
 {
     bool writer = false;          /// this replica is the table's writer: the only one whose GC deletes
@@ -182,17 +182,21 @@ struct CasKeeperRecordSnapshot
     Int32 host_version = -1;
 };
 
-/// A table whose parts live on a content-addressed disk: it owns the Keeper client and its records
-/// (`<zookeeper_path>/cas_parts`), the disk owns the pool. The pool's GC reads every source's records each
-/// round: a blob is live while some record references it, and a record goes only after its part has been
-/// unlisted by every replica for `retention_ms` since the GC marked it.
+class IContentAddressedExchange;
+
+/// A replicated table whose parts live on a content-addressed disk: it owns the Keeper client and its
+/// records (`<zookeeper_path>/cas_parts`), the disk owns the pool. The pool's GC reads every such table's
+/// records each round: a blob is live while some record references it, and a record goes only after its part
+/// has been unlisted by every replica for `retention_ms` since the GC marked it.
 class ICasKeeperRecordSource
 {
 public:
     virtual ~ICasKeeperRecordSource() = default;
-    virtual CasKeeperRecordSnapshot snapshotCasRecords(const String & pool_uuid) = 0;
-    /// Re-`set`s each record with its own bytes, checked against its version: the mark.
-    virtual void markCasRecords(const std::vector<const CasKeeperRecordState *> & records) = 0;
+    /// Its records on the pool of `disk` (one of its disks).
+    virtual CasKeeperRecordSnapshot snapshotCasRecords(const IContentAddressedExchange & disk) = 0;
+    /// Re-`set`s each record with its own bytes, checked against its version: the mark. Returns the parts
+    /// whose record was marked.
+    virtual Strings markCasRecords(const std::vector<const CasKeeperRecordState *> & records) = 0;
     /// Removes each record in one multi-op that checks no replica lists its part and the writer epoch of
     /// `snapshot` still holds. Returns the parts whose record was removed.
     virtual Strings removeCasRecords(
@@ -326,11 +330,6 @@ public:
     /// than from this server's ref table.
     virtual bool isHeldFromKeeper(const String & part_path) const = 0;
 
-    /// The tables whose Keeper records the pool's GC reads. A table registers once it is active and
-    /// unregisters on shutdown; an expired source is skipped.
-    virtual void registerKeeperRecordSource(std::weak_ptr<ICasKeeperRecordSource> source) = 0;
-    virtual void unregisterKeeperRecordSource(const ICasKeeperRecordSource * source) = 0;
-
     /// ==== `DiskObjectStorage::prepareRead` hooks ====
     /// The two CA-only reads `DiskObjectStorage::prepareRead` needs before it composes the standard
     /// object-storage pipeline. Exposed on this narrow seam (rather than only on the concrete
@@ -360,5 +359,13 @@ public:
     /// in-manifest, loose, directory, or otherwise unresolved paths.
     virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
+
+/// The tables on `disk` whose Keeper records its pool's GC reads, or nullopt when some table on it cannot be
+/// read this round (not loaded yet, or not replicated: its blobs are unknown). Storages installs it once at
+/// startup (it walks `DatabaseCatalog`); until then, and in tools without tables, a disk's GC does nothing.
+using CasKeeperRecordSourcesProvider
+    = std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> (*)(const IContentAddressedExchange & disk);
+void setCasKeeperRecordSourcesProvider(CasKeeperRecordSourcesProvider provider);
+CasKeeperRecordSourcesProvider getCasKeeperRecordSourcesProvider();
 
 }

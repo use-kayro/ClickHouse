@@ -698,16 +698,11 @@ private:
     /// LIST. Idempotent: a record another replica created meanwhile is left as it is.
     void backfillCasPartRecords();
 
-    /// At the end of `startupImpl`: registers the table with its content-addressed disks as a source of Keeper
-    /// records for the pool's GC (`ICasKeeperRecordSource`); `shutdown` unregisters it.
-    void registerCasKeeperRecordSource();
-    void unregisterCasKeeperRecordSource();
-
-    /// `ICasKeeperRecordSource`: this table's records on the pool `pool_uuid`, whether some replica lists each
+    /// `ICasKeeperRecordSource`: this table's records on the pool of `disk`, whether some replica lists each
     /// record's part, and -- when this replica is the writer (a merge leader, `replicated_can_become_leader`)
     /// -- the epoch the removals check.
-    CasKeeperRecordSnapshot snapshotCasRecords(const String & pool_uuid) override;
-    void markCasRecords(const std::vector<const CasKeeperRecordState *> & records) override;
+    CasKeeperRecordSnapshot snapshotCasRecords(const IContentAddressedExchange & disk) override;
+    Strings markCasRecords(const std::vector<const CasKeeperRecordState *> & records) override;
     Strings removeCasRecords(
         const CasKeeperRecordSnapshot & snapshot, const std::vector<const CasKeeperRecordState *> & records) override;
 

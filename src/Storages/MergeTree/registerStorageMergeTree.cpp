@@ -1,3 +1,4 @@
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Databases/DatabaseReplicatedHelpers.h>
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
@@ -1092,6 +1093,9 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 void registerStorageMergeTree(StorageFactory & factory);
 void registerStorageMergeTree(StorageFactory & factory)
 {
+    /// The tables the pool's GC of each content-addressed disk reads (TEC-850).
+    setCasKeeperRecordSourcesProvider(&casKeeperRecordSourcesOnDisk);
+
     StorageFactory::StorageFeatures features{
         .supports_settings = true,
         .supports_skipping_indices = true,

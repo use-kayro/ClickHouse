@@ -21,7 +21,6 @@
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
 
 #include <Disks/StoragePolicy.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Common/SimpleIncrement.h>
 
 
@@ -33,7 +32,7 @@ using PreparedSetsCachePtr = std::shared_ptr<PreparedSetsCache>;
 
 /** See the description of the data structure in MergeTreeData.
   */
-class StorageMergeTree final : public MergeTreeData, public ICasKeeperRecordSource
+class StorageMergeTree final : public MergeTreeData
 {
 public:
     /** Attach the table with the appropriate name, along the appropriate path (with / at the end),
@@ -55,13 +54,6 @@ public:
     void startup() override;
     void flushAndPrepareForShutdown() override;
     void shutdown(bool is_drop) override;
-
-    /// `ICasKeeperRecordSource`: a table that is not replicated has no Keeper records, so the pool's GC cannot
-    /// know which blobs its parts on a content-addressed disk reference. It reports them as listed parts
-    /// without a record, and the GC removes nothing while it has any.
-    CasKeeperRecordSnapshot snapshotCasRecords(const String & pool_uuid) override;
-    void markCasRecords(const std::vector<const CasKeeperRecordState *> &) override {}
-    Strings removeCasRecords(const CasKeeperRecordSnapshot &, const std::vector<const CasKeeperRecordState *> &) override { return {}; }
 
     ~StorageMergeTree() override;
 

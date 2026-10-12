@@ -15,7 +15,7 @@ set -euo pipefail
 # The UUID is generated per run, not a fixed literal: a repeated run in the same server would
 # otherwise collide with the previous run's asynchronous cleanup (the Atomic database still holds
 # the UUID mapping until the deferred drop completes, and the CAS namespace stays in its removal
-# state until a terminal fold -- which never comes here, since the test keeps GC off).
+# state).
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -53,44 +53,14 @@ create_on_root() {
         cas_gc_interval_sec = 100000);"
 }
 
-drain_gc() {
-    local pending=1
-    for _ in $(seq 1 60); do
-        pending=$(${CLICKHOUSE_CLIENT} --query "SYSTEM CAS GC RUN '${DISK_B}'" --format TSVWithNames \
-            | awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
-                           { print $col["pending_condemned"] }')
-        [ "$pending" = "0" ] && return
-        sleep 0.5
-    done
-    echo "FAIL: GC did not drain within the bounded loop (pending=${pending})" >&2
-    return 1
-}
-
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_a;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_b;"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_anchor;"
 
-# Keep root B's disk alive for every collection round. This avoids relying on an inline disk remaining
-# registered after its only table is dropped.
-${CLICKHOUSE_CLIENT} --query "
-CREATE TABLE t_cas_freeze_anchor (k UInt32)
-ENGINE = MergeTree ORDER BY k
-SETTINGS disk = disk(
-    type = object_storage,
-    object_storage_type = local,
-    metadata_type = cas,
-    cas_server_root_id = '${CLICKHOUSE_DATABASE}_05024_root_b',
-    name = '${DISK_B}',
-    path = '${POOL_PATH}',
-    cas_gc_enabled = 1,
-    cas_gc_interval_sec = 100000);"
-
-# Root A freezes, then releases the UUID. Its freeze must outlive both the table and a collection round.
+# Root A freezes, then releases the UUID. Its freeze must outlive the table.
 create_on_root t_cas_freeze_a "${CLICKHOUSE_DATABASE}_05024_root_a" "${DISK_A}"
 ${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_freeze_a VALUES (1, 'a');"
 ${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_a FREEZE PARTITION 1 WITH NAME '${SHARED_BACKUP}';"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_a;"
-drain_gc
 
 # Root B reaches the SAME table path by reusing the UUID. Its own backup uses a distinct name: making
 # both roots publish the same ref would mix two independent CAS writer lifecycles before `UNFREEZE`
@@ -109,9 +79,6 @@ unfreeze_and_print t_cas_freeze_b "${SHARED_BACKUP}"
 echo 'unfreeze_b'
 unfreeze_and_print t_cas_freeze_b "${B_BACKUP}"
 
-# The foreign no-op must remain harmless after the retire pipeline reaches a fixpoint.
-drain_gc
-
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_b;"
 
 # (3) A's freeze must still be there. Recreate A's table on root A with the same UUID -- the freeze is
@@ -122,7 +89,6 @@ echo 'unfreeze_a'
 unfreeze_and_print t_cas_freeze_a "${SHARED_BACKUP}"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_a;"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_anchor;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
 
 # FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would

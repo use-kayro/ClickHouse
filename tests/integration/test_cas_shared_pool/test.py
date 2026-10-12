@@ -51,13 +51,13 @@ def blob_keys():
     return {o.object_name for o in objects if not o.object_name.endswith(".meta")}
 
 
-def _gc_bookkeeping(node, outcome, since):
-    """(rounds with `outcome`, objects deleted by any round) of `node`'s CA GC since `since`: rounds are
-    Success on the writer, NotALeader elsewhere."""
+def _gc_bookkeeping(node, writer, since):
+    """(successful rounds that ran as the writer or not, objects deleted by any round) of `node`'s CA GC since
+    `since`."""
     node.query("SYSTEM FLUSH LOGS")
     rounds, deleted = node.query(
-        "SELECT countIf(outcome = '{}'), sum(objects_deleted) FROM system.cas_gc_log "
-        "WHERE event_type = 'Finish' AND event_time >= '{}' FORMAT TSV".format(outcome, since)
+        "SELECT countIf(outcome = 'Success' AND writer = {}), sum(objects_deleted) FROM system.cas_gc_log "
+        "WHERE event_type = 'Finish' AND event_time >= '{}' FORMAT TSV".format(int(writer), since)
     ).split("\t")
     return int(rounds), int(deleted)
 
@@ -120,10 +120,10 @@ def test_two_servers_share_one_pool():
     #     live parts share their blobs: no round may reclaim a blob a live part on either replica references.
     mutated_at = node1.query("SELECT toString(now())").strip()
     for _ in range(RECLAIM_RETRIES):
-        if _gc_bookkeeping(node1, "Success", mutated_at)[0] >= 5:
+        if _gc_bookkeeping(node1, True, mutated_at)[0] >= 5:
             break
         time.sleep(RECLAIM_SLEEP)
-    assert _gc_bookkeeping(node1, "Success", mutated_at)[0] >= 5, "the writer's GC did not run five rounds"
+    assert _gc_bookkeeping(node1, True, mutated_at)[0] >= 5, "the writer's GC did not run five rounds"
 
     for node in (node1, node2):
         assert int(node.query("SELECT count() FROM t")) == count_after_mut
@@ -149,11 +149,11 @@ def test_two_servers_share_one_pool():
         "SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables/t/cas_parts'"
     ).strip() == "0"
 
-    rounds, deleted = _gc_bookkeeping(node1, "Success", since)
+    rounds, deleted = _gc_bookkeeping(node1, True, since)
     assert rounds > 0, "no GC round led by the writer"
     assert deleted > 0, "the blobs went but the writer's GC reports no deletion"
     # Only the writer deletes.
-    assert _gc_bookkeeping(node2, "NotALeader", since)[1] == 0
+    assert _gc_bookkeeping(node2, False, since)[1] == 0
 
     # DROP TABLE removes the records with the table's Keeper path: its blobs are not the GC's to reclaim.
     for node in (node1, node2):
@@ -216,10 +216,10 @@ def test_pool_survives_node_crash():
     #     so every blob the writer wrote stays.
     killed_at = node2.query("SELECT toString(now())").strip()
     for _ in range(RECLAIM_RETRIES):
-        if _gc_bookkeeping(node2, "NotALeader", killed_at)[0] >= 5:
+        if _gc_bookkeeping(node2, False, killed_at)[0] >= 5:
             break
         time.sleep(RECLAIM_SLEEP)
-    rounds, deleted = _gc_bookkeeping(node2, "NotALeader", killed_at)
+    rounds, deleted = _gc_bookkeeping(node2, False, killed_at)
     assert rounds >= 5, "node2's GC did not run five rounds"
     assert deleted == 0
 
@@ -265,11 +265,11 @@ def test_pool_survives_node_crash():
         "SELECT count() FROM system.zookeeper WHERE path = '/clickhouse/tables/crash/cas_parts'"
     ).strip() == "0"
 
-    rounds, deleted = _gc_bookkeeping(node1, "Success", restarted_at)
+    rounds, deleted = _gc_bookkeeping(node1, True, restarted_at)
     assert rounds > 0, "no GC round led by the writer"
     assert deleted > 0, "the blobs went but the writer's GC reports no deletion"
     # Only the writer deletes.
-    assert _gc_bookkeeping(node2, "NotALeader", restarted_at)[1] == 0
+    assert _gc_bookkeeping(node2, False, restarted_at)[1] == 0
 
     # DROP TABLE removes the records with the table's Keeper path: its blobs are not the GC's to reclaim.
     for node in (node1, node2):

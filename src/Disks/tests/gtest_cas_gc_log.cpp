@@ -15,7 +15,7 @@
 /// `system.cas_gc_log`). The scheduler emits a Start + Finish
 /// `GcRoundLogRecord` per round through the injected `GcRoundLogger`; here we capture the records in
 /// a vector and assert their shape over a real (in-memory) Pool. The rounds run with no Keeper record
-/// source, so they never act as the writer (`NotALeader`); a source function that throws drives the
+/// source, so they never act as the writer (`writer = false`); a source function that throws drives the
 /// failure-classification paths.
 ///
 /// NOTE on ProfileEvents: `runOneRoundNow` runs on THIS (bare gtest) thread, which has no attached
@@ -67,15 +67,15 @@ std::map<String, UInt64> metricsOf(const std::vector<Rec> & rows, size_t from, c
 }
 
 /// No table on the disk: a round reads no record and does not act as the writer.
-KeeperRecordSourcesFn noSources()
+KeeperRecordTablesFn noSources()
 {
-    return [] { return KeeperRecordSources{}; };
+    return [] { return std::optional<KeeperRecordTables>(KeeperRecordTables{}); };
 }
 
 /// A source function that fails the round with `code`, after `before_throw` ran.
-KeeperRecordSourcesFn throwingSources(int code, std::function<void()> before_throw = {})
+KeeperRecordTablesFn throwingSources(int code, std::function<void()> before_throw = {})
 {
-    return [code, before_throw]() -> KeeperRecordSources
+    return [code, before_throw]() -> std::optional<KeeperRecordTables>
     {
         if (before_throw)
             before_throw();
@@ -85,10 +85,10 @@ KeeperRecordSourcesFn throwingSources(int code, std::function<void()> before_thr
 }
 
 /// A round with no record source emits exactly a Start, the one phase it reached, and a Finish, with
-/// the identity fields set on every row and `NotALeader` on the Finish. `round` does not exist for
+/// the identity fields set on every row and `writer = false` on the Finish. `round` does not exist for
 /// such a round, so `round_id` is the only thing tying its rows together -- which is why it is the
 /// correlator.
-TEST(CASGCLog, NotALeaderRoundEmitsOnlyTheRecordsPhase)
+TEST(CASGCLog, NonWriterRoundEmitsOnlyTheRecordsPhase)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -97,19 +97,19 @@ TEST(CASGCLog, NotALeaderRoundEmitsOnlyTheRecordsPhase)
     DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca", noSources(),
         [&](const Rec & r) { rows.push_back(r); });
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).writer);
 
     EXPECT_EQ(phaseNames(rows, 0), (std::vector<String>{"keeper_records"}));
-    EXPECT_EQ(metricsOf(rows, 0, "keeper_records").at("sources"), 0u);
+    EXPECT_EQ(metricsOf(rows, 0, "keeper_records").at("tables"), 0u);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows.front().event_type, Rec::EventType::Start);
     EXPECT_EQ(rows.back().event_type, Rec::EventType::Finish);
-    EXPECT_EQ(rows.back().outcome, Rec::Outcome::NotALeader);
+    EXPECT_EQ(rows.back().outcome, Rec::Outcome::Success);
+    EXPECT_FALSE(rows.back().writer);
     for (const Rec & r : rows)
     {
         EXPECT_EQ(r.round_id, rows.front().round_id);
         EXPECT_EQ(r.disk_name, "ca");
-        EXPECT_FALSE(r.gc_id.empty());
         EXPECT_EQ(r.trigger, Rec::Trigger::Manual);
     }
 }
@@ -139,7 +139,6 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
         << "the Finish row must carry the structured exception code, not only the message text";
     EXPECT_FALSE(round_rows[1].error.empty()) << "a failed Finish must carry the exception text";
     EXPECT_EQ(round_rows[1].disk_name, "ca");
-    EXPECT_FALSE(round_rows[1].gc_id.empty());
     EXPECT_FALSE(round_rows[1].round_id.empty());
     for (const Rec & r : rows)
         EXPECT_EQ(r.round_id, round_rows[0].round_id)
@@ -182,7 +181,7 @@ TEST(CASGCLog, TransientErrorClassifierFailsClosed)
 
 /// Every row of one round -- its Start, each of its Phase rows, and its Finish -- carries the SAME
 /// non-empty `round_id`, and two rounds carry DIFFERENT ones. That is the property the column exists
-/// for: `round` is 0 on Start and absent on a round that never led, so it cannot serve as the correlator.
+/// for: `round` is 0 on Start and on a round that did not run as the writer, so it cannot serve as the correlator.
 TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -227,7 +226,7 @@ TEST(CASGCHealth, NonWriterRoundLeavesHealthIdle)
     EXPECT_EQ(h0.wedged_namespace_count, 0u);
 
     const RoundReport rep = sched.runOneRoundNow(Rec::Trigger::Manual);
-    ASSERT_FALSE(rep.acquired_lease);
+    ASSERT_FALSE(rep.writer);
 
     const auto h1 = sched.gcHealth();
     EXPECT_FALSE(h1.is_leader);

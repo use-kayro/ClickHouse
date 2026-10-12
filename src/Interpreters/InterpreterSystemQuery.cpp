@@ -1046,10 +1046,7 @@ BlockIO InterpreterSystemQuery::execute()
         {
             /// A manual GC RUN executes REGARDLESS of SYSTEM CAS GC STOP: STOP pauses only the
             /// background PACER, not the GC engine, so an explicit operator round still runs (explicit intent
-            /// wins). A round that acquires the lease sets the disk's in-process is_leader=true, which its
-            /// introspection can surface transiently even while the background scheduler stays stopped —
-            /// until a peer mounter steals the lease or GC START resumes pacing. This is truthful (the round
-            /// DID lead) and harmless (no background thread acts on it while stopped).
+            /// wins).
             getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_RUN);
             result = runContentAddressedGcRun(query.disk);
             break;
@@ -2354,26 +2351,14 @@ ColumnsDescription contentAddressedGcRoundColumns()
 {
     return ColumnsDescription{NamesAndTypesList{
         {"disk", std::make_shared<DataTypeString>()},
-        {"acquired_lease", std::make_shared<DataTypeUInt8>()},
-        {"deferred", std::make_shared<DataTypeUInt8>()},
+        {"writer", std::make_shared<DataTypeUInt8>()},
         {"round", std::make_shared<DataTypeUInt64>()},
-        {"candidates_marked", std::make_shared<DataTypeUInt64>()},
+        {"objects_condemned", std::make_shared<DataTypeUInt64>()},
         {"objects_deleted", std::make_shared<DataTypeUInt64>()},
         {"objects_absent", std::make_shared<DataTypeUInt64>()},
         {"objects_replaced", std::make_shared<DataTypeUInt64>()},
         {"objects_spared", std::make_shared<DataTypeUInt64>()},
-        {"manifests_deleted", std::make_shared<DataTypeUInt64>()},
-        {"entries_condemned", std::make_shared<DataTypeUInt64>()},
-        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
-        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
-        {"anomalies", std::make_shared<DataTypeUInt64>()},
-        /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
-        /// this round's single CAS just published -- see `Cas::RoundReport`'s field comments. Zero on a
-        /// non-authoritative row (!acquired_lease or deferred), same as every other counter above.
-        {"pending_candidates", std::make_shared<DataTypeUInt64>()},
-        {"pending_condemned", std::make_shared<DataTypeUInt64>()},
-        {"pending_retired", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2381,23 +2366,14 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
 {
     size_t i = 0;
     res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.acquired_lease));
-    res_columns[i++]->insert(static_cast<UInt8>(rep.deferred));
+    res_columns[i++]->insert(static_cast<UInt8>(rep.writer));
     res_columns[i++]->insert(rep.round);
-    res_columns[i++]->insert(rep.candidates);
+    res_columns[i++]->insert(rep.condemned);
     res_columns[i++]->insert(rep.deleted);
     res_columns[i++]->insert(rep.absent);
     res_columns[i++]->insert(rep.replaced);
     res_columns[i++]->insert(rep.spared);
-    res_columns[i++]->insert(rep.manifests_deleted);
-    res_columns[i++]->insert(rep.condemned);
-    res_columns[i++]->insert(rep.graduated);
-    res_columns[i++]->insert(rep.redeleted);
     res_columns[i++]->insert(rep.fence_outs);
-    res_columns[i++]->insert(rep.anomalies.size());
-    res_columns[i++]->insert(rep.pending_candidates);
-    res_columns[i++]->insert(rep.pending_condemned);
-    res_columns[i++]->insert(rep.pending_retired);
 }
 
 /// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
