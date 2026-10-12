@@ -34,7 +34,7 @@ from botocore.config import Config
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "state.json")
 RESULTS = os.path.join(HERE, "results.jsonl")
-PORTS = {"writer": 18123, "reader": 18124, "reader-mdb": 18125}
+PORTS = {"writer": 39123, "reader": 39124, "reader-mdb": 39125}
 NODES = list(PORTS)
 READERS = ["reader", "reader-mdb"]
 IMAGE_VARS = {"writer": "WRITER_IMAGE", "reader": "READER_IMAGE", "reader-mdb": "READER_MDB_IMAGE"}
@@ -67,8 +67,8 @@ def q(node, sql, timeout=120):
         return r.read().decode()
 
 
-def q1(node, sql):
-    return q(node, sql).strip()
+def q1(node, sql, timeout=120):
+    return q(node, sql, timeout).strip()
 
 
 def load_state():
@@ -158,7 +158,7 @@ _s3 = None
 def s3():
     global _s3
     if _s3 is None:
-        _s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:11121", aws_access_key_id="clickhouse",
+        _s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:39121", aws_access_key_id="clickhouse",
                            aws_secret_access_key="clickhouse", region_name="us-east-1",
                            config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
     return _s3
@@ -258,6 +258,17 @@ def gc_rounds(node, since):
         res[o] = {"rounds": int(n), "deleted": int(deleted), "absent": int(absent), "condemned": int(condemned), "last": last}
         if int(writer) >= 0:
             res[o]["as_writer"] = int(writer)
+    return res
+
+
+def gc_leaders():
+    """Each up node's own view of the old GC lease (system.cas_mounts.is_leader of its own mount)."""
+    res = {}
+    for n in NODES:
+        try:
+            res[n] = q1(n, "SELECT toString(is_leader) FROM system.cas_mounts WHERE disk = '{}' AND server_root_id = '{}'".format(DISK, n), timeout=10)
+        except Exception as e:
+            res[n] = "n/a: " + str(e)[:80]
     return res
 
 
@@ -404,14 +415,16 @@ def phase_up():
 def phase_a():
     ph = "a"
     since = {n: server_now(n) for n in NODES}
-    q("writer", "SYSTEM STOP MERGES {}".format(TABLE))
+    # Background merges stay on (as in production): the partitions keep several parts each while the merges
+    # leave outdated parts behind for the old GC.
     for p in range(8):
         for _ in range(8):
             insert(p)
     sync()
+    q("writer", "SYSTEM FLUSH LOGS")
+    created = int(q1("writer", "SELECT count() FROM system.part_log WHERE table = '{}' AND event_type IN ('NewPart', 'MergeParts')".format(TABLE)))
     parts0 = active_parts("writer")
-    record(ph, "parts loaded (merges stopped)", len(parts0) >= 48, {"active_parts": len(parts0), "partitions": 8})
-    q("writer", "SYSTEM START MERGES {}".format(TABLE))
+    record(ph, "parts loaded", created >= 64, {"parts_created": created, "active_parts": len(parts0), "partitions": 8})
     for p in (0, 1, 2):
         q("writer", "OPTIMIZE TABLE {} PARTITION {} FINAL".format(TABLE, p), timeout=600)
     q("writer", "ALTER TABLE {} DROP PARTITION 7".format(TABLE))
@@ -499,6 +512,7 @@ def phase_b():
     leader = [n for n, r in rounds.items() if r.get("Success", {}).get("deleted", 0) > 0]
     record(ph, "old GC reclaims a fresh DROP PARTITION", True,
            {"blobs": len(p12), "reclaimed_after_s": round(time.time() - dropped), "deleting_nodes": leader, "rounds": rounds})
+    record(ph, "old GC lease holder after b", None, gc_leaders())
     record(ph, "pool inventory after b", None, pool_inventory())
 
 
@@ -531,6 +545,7 @@ def phase_c():
                    60 * GC_INTERVAL, "six writer rounds", step=3)
         first = keeper_gc_rounds("writer", t_boot)[:10]
         record(ph, "first step-2 writer rounds", None, first)
+        record(ph, "old GC lease right after the step-2 writer boots", None, {"leaders": gc_leaders(), "old_gc_rounds": old_gc_activity(READERS, since)})
         unrec = [r for r in first if r["metrics"].get("unrecorded_listed", 0) > 0]
         record(ph, "first rounds: no round deletes while a listed part is unrecorded",
                all(r["deleted"] == 0 for r in unrec), {"rounds_with_unrecorded": len(unrec),
@@ -586,6 +601,10 @@ def phase_c():
                {"blobs": len(p14), "reclaimed_after_s": round(took, 1),
                 "rounds": [(r["t"], r["metrics"].get("marked"), r["metrics"].get("due"), r["metrics"].get("records_removed"), r["deleted"], r["absent"]) for r in rounds if r["writer"]],
                 "old_gc_on_RC3_readers": old})
+        record(ph, "who runs deleting GC rounds while the readers are on RC3 (cas_gc_enabled=1 as production)", None,
+               {"leaders": gc_leaders(), "old_gc_rounds_on_readers": old_gc_activity(READERS, since),
+                "step2_writer_rounds": {"rounds": len(keeper_gc_rounds("writer", t_boot)),
+                                        "deleted": sum(r["deleted"] for r in keeper_gc_rounds("writer", t_boot))}})
         consistent(ph, "step-2 writer, RC3 readers")
     finally:
         for l in loops:
@@ -670,8 +689,33 @@ def phase_e():
     record(ph, "no reader-mdb query failed during the rollbacks", not loop.failures, {"ok": loop.ok, "failures": loop.failures[:5]})
 
 
+def phase_lease():
+    """How long a reader on the old GC takes to take over the lease once the writer stops heartbeating."""
+    ph = "lease"
+    since = {n: server_now(n) for n in READERS}
+    leaders0 = gc_leaders()
+    compose("stop", "-t", "60", "writer")
+    t0 = time.time()
+    taken = None
+    while time.time() - t0 < 60 * GC_INTERVAL:
+        lead = {n: gc_leaders()[n] for n in READERS}
+        if "1" in lead.values():
+            taken = time.time() - t0
+            break
+        time.sleep(0.5)
+    rounds = {n: gc_rounds(n, since[n]) for n in READERS}
+    record(ph, "old-GC lease takeover by an RC3 reader after the writer stops", taken is not None,
+           {"before": leaders0, "takeover_s": round(taken, 1) if taken else None, "gc_interval_s": GC_INTERVAL,
+            "takeover_in_intervals": round(taken / GC_INTERVAL, 1) if taken else None, "reader_rounds": rounds,
+            "after": {n: gc_leaders()[n] for n in READERS}})
+    compose("up", "-d", "--no-deps", "writer")
+    wait_until(lambda: node_up("writer"), 300, "writer back")
+    time.sleep(6 * GC_INTERVAL)
+    record(ph, "lease holder once the writer is back (RC3)", None, gc_leaders())
+
+
 def main():
-    {"up": phase_up, "a": phase_a, "b": phase_b, "c": phase_c, "d": phase_d, "e": phase_e}[sys.argv[1]]()
+    {"up": phase_up, "a": phase_a, "lease": phase_lease, "b": phase_b, "c": phase_c, "d": phase_d, "e": phase_e}[sys.argv[1]]()
 
 
 if __name__ == "__main__":

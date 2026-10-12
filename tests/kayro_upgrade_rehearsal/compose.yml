@@ -22,7 +22,7 @@ services:
       RUSTFS_HEAL_ENABLED: "false"
     command: server --address 0.0.0.0:11121 /data
     volumes: [rustfs:/data]
-    ports: ["127.0.0.1:11121:11121"]
+    ports: ["127.0.0.1:39121:11121"]
 
   keeper:
     # Production's standalone Keeper (kayro-infra clickhouse-shared main.tf), default feature flags; not upgraded.
@@ -41,7 +41,7 @@ services:
       - ./configs/writer.xml:/etc/clickhouse-server/config.d/node.xml:ro
       - writer:/var/lib/clickhouse
       - ./logs/writer:/var/log/clickhouse-server
-    ports: ["127.0.0.1:18123:8123"]
+    ports: ["127.0.0.1:39123:8123"]
 
   reader:
     <<: *clickhouse
@@ -52,7 +52,7 @@ services:
       - ./configs/reader.xml:/etc/clickhouse-server/config.d/node.xml:ro
       - reader:/var/lib/clickhouse
       - ./logs/reader:/var/log/clickhouse-server
-    ports: ["127.0.0.1:18124:8123"]
+    ports: ["127.0.0.1:39124:8123"]
 
   reader-mdb:
     <<: *clickhouse
@@ -63,7 +63,7 @@ services:
       - ./configs/reader-mdb.xml:/etc/clickhouse-server/config.d/node.xml:ro
       - reader-mdb:/var/lib/clickhouse
       - ./logs/reader-mdb:/var/log/clickhouse-server
-    ports: ["127.0.0.1:18125:8123"]
+    ports: ["127.0.0.1:39125:8123"]
 
 volumes:
   rustfs:
