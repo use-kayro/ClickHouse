@@ -2,7 +2,7 @@
 
 A metadata de uma parte num disco CAS passa a existir também no Keeper, num registro por parte. Uma réplica consegue anexar a parte a partir desse registro e dos blobs do pool, sem buscar nada do writer e sem escrever ou listar no S3. O writer continua gravando toda a metadata S3 de hoje: nada sai do caminho S3 neste passo.
 
-**Ainda não é uma imagem.** O PR está aberto e a imagem não foi construída. O último commit (`283ca096`) corrige um bug P0 e uma lacuna achados depois do portão, e ainda não passou por portão nenhum (abaixo).
+**A imagem de release existe; o portão dela está em andamento.** Ela foi construída do head do PR #2, `283ca096`, que corrige um bug P0 e uma lacuna achados depois do portão de `1df4e77` (abaixo). O PR continua aberto. A imagem só é candidata depois do `BUILD_COMPLETE` com todos os passos verdes.
 
 | Campo | Valor |
 |---|---|
@@ -10,7 +10,7 @@ A metadata de uma parte num disco CAS passa a existir também no Keeper, num reg
 | Branch | `kayro/keeper-part-manifest` |
 | Head | `283ca09658a4c0e405106342362c0c3b864ed4b8` (11/10 22:17Z), sobre o RC3 (`9700e6e`) |
 | Commit com portão verde | `1df4e77c7357a2bd25475fa574a3713d1b74e5a5`, sobre o RC2 (`294ea1e`), **sem** o RC3 |
-| Imagem | **pendente** |
+| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`, de `283ca096`. Portão: em andamento quando isto foi escrito |
 | Linear | TEC-849 (In Review); perguntas e decisões cruzadas em TEC-850 e TEC-851 |
 | Em produção | nenhum nó |
 
@@ -26,7 +26,7 @@ Os quatro primeiros commits são o patch do portão rebaseado sobre o RC3: `git 
 
 ## Regra de produção
 
-**Esta imagem só vai para o writer até o passo 2 (TEC-850) entrar.**
+**Esta imagem só vai para o writer até o passo 2 (PR #4, TEC-850) entrar em produção. Os readers ficam no RC3, `sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`.**
 
 Um reader com esta imagem anexa partes pelo registro. Essas partes não têm ref no ref table S3 de nenhum nó, e o GC atual do pool (RC2/RC3) não as enxerga: ele apaga os blobs que a query do reader ainda lê. O `test_cas_reader_pin [drop]` contra o binário do passo 1 reproduziu isso: "GC deleted 12 blobs the reader's query still reads" (TEC-850, 11/10 22:00Z). O teste de integração do próprio passo 1 roda com GC desligado por esse motivo.
 
@@ -162,6 +162,8 @@ Scripts somente leitura em `/tmp/cost-plan-600-20261010/tec-849/canary/` (`snaps
 
 Aceite do 3a (TEC-851): 100 % das partes ativas com `<zk>/cas_parts/<p>`; PUT e LIST por classe iguais à linha de base (escrita dupla). Ponto sem volta: nenhum; rollback é a imagem anterior.
 
-## Para construir
+## Imagem de release
 
-`build-image.sh <head do #2>` num workspace próprio, portão completo do builder (paridade, fault/RLS, gtests CAS, `test_cas_gc_s3`) mais os módulos de integração da tabela de portão acima, registrar o digest aqui e na tabela do [README](README.md).
+`build-image.sh 283ca09658a4c0e405106342362c0c3b864ed4b8` produziu `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`. Portão do builder (paridade, fault/RLS, gtests CAS, `test_cas_gc_s3`): em andamento quando isto foi escrito. Se o portão falhar, esta imagem é descartada e o digest muda.
+
+Rollout: só no writer (`i-02e3809e0b416b25e`), com `configure-image.py` e a guarda de INSERT. Rollback: RC3 `sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`.
