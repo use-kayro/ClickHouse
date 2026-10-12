@@ -28,11 +28,9 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Keeper, not S3: `<zookeeper_path>/cas_parts/<part>` (one copy per part) | descriptor `pool`; the part's Inline entries (entry `path`, `place`=`inline`, `size`, then the payload zone); Blob entries are derived from the inline `checksums.txt` | `CasPartManifestFormat` (`encodePartFiles`) | `ReplicatedMergeTree` part commit |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
-| `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
-| `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log (`kind`, `outcome`) | `CasGcOutcomesFormat` (`.zst`) | GC |
-| `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | GC |
-| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | GC |
+| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
+| `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
+| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
@@ -75,8 +73,7 @@ use the corresponding `old_*` and `new_*` key bundles.
   until the pool floor rises (an old writer's fresh re-encode drops it).
 - Breaking change = `v` bump + `changePoints` + write-down-to-floor; the floor raise is what
   fences old builds out (mount gates: `min_reader_generation` forward, pool-meta `v` backward).
-- Deterministic formats (`cas_fold_seal`, `cas_run`): strict keys, pinned raw, and the adoption
-  pin — on a `putDeterministicArtifact` conflict, re-encode at the `v` of the EXISTING object.
+- Deterministic formats (`cas_fold_seal`, `cas_run`): strict keys, pinned raw.
 - A key prefixed `!` is critical: a reader that does not understand it fails closed.
 - Padding zones (blob header pad, manifest banners) are deterministic and verified — no
   unaccounted bytes in any object.

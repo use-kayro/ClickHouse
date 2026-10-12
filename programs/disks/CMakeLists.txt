@@ -19,8 +19,6 @@ set (CLICKHOUSE_DISKS_SOURCES
     CommandHelp.cpp
     CommandTouch.cpp
     CommandFsck.cpp
-    CommandCaGcDryRun.cpp
-    CommandCaGcRebuild.cpp
     CommandCaInspect.cpp
     CommandCaDropMember.cpp
     CommandGetCurrentDiskAndPath.cpp

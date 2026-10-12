@@ -79,106 +79,14 @@ struct PoolConfig
     /// the cache and every catalog write reads first. 16 MiB: the catalog is under 1 MiB, and the
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
-    /// How many superseded snapshot generations to retain. After committing
-    /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
-    /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
-    /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
-    /// has lost its lease; its round-commit CAS fails).
-    uint64_t gc_snapshot_generations_to_keep = 3;
     /// Blob target shards for GC. Default 1 (a single shard, i.e. no fan-out). Creation-time only;
     /// the pool is authoritative on reopen. This is the BLOB-HASH-prefix reducer axis.
     uint64_t gc_shards = 1;
-    /// Cursor-paced orphan part-manifest sweep. The LIST budget bounds cold-prefix enumeration
-    /// per completed GC round; the delete budget separately bounds exact-token destructive work.
-    uint64_t manifest_sweep_list_budget_keys = 1000;
-    uint64_t manifest_sweep_delete_budget_keys = 100;
-    /// Keys per batch delete request for the write-once families; tests lower it to exercise chunk boundaries.
-    uint64_t gc_bulk_delete_chunk_keys = 1000;
-    /// Per-round blob-deletion work envelope: caps how many entries the fold's graduation
-    /// (condemned -> delete_pending) and redelete (exact-token delete of a prior delete_pending row)
-    /// arms move out of the durable retired pipeline in one round. Excess entries are carried
-    /// unchanged in `still_retired` and retried next round (never dropped). 0 = unbounded.
-    /// Default UNBOUNDED. A count cap here is not backpressure: it throttles the consumer while the
-    /// producer (inserts, merges) is unaware of it, and the excess is carried in `still_retired`, which
-    /// the next round reads in full -- so a round's cost grows with the debt while its useful work stays
-    /// capped. Under sustained load that is a feedback loop, not a delay.
-    uint64_t gc_round_graduation_budget = 0;
-    uint64_t gc_round_redelete_budget = 0;
-    /// Orphan-manifest sweep: caps on the expensive step the LIST/nomination budgets never covered —
-    /// building a namespace's protection view (catalog-authoritative table recovery + committed-tail
-    /// walk). `sweep_namespace_budget` bounds how many DISTINCT namespaces one page may build a view
-    /// for; `sweep_recovery_op_budget` bounds the total ref-log GET/decode ops the committed-tail walk
-    /// may spend across every namespace, cumulative for the round. Exhausting either retains every
-    /// remaining candidate of the affected namespace on this page (fail-closed; retention is always
-    /// safe) rather than deciding it without a complete protection view.
-    uint64_t gc_round_sweep_namespace_budget = 20;
-    uint64_t gc_round_sweep_recovery_op_budget = 5000;
-    /// Ref-object cleanup (covered log/snapshot exact deletes) and generation-prefix wholesale delete
-    /// (superseded-generation prune) caps, cumulative for the round. `prefix_wholesale_budget` is the
-    /// round's shared remainder every prune `deletePrefixWholesale` call draws from, so no single call
-    /// passes an unbounded `bounded_remaining`.
-    uint64_t gc_round_ref_cleanup_budget = 5000;
-    uint64_t gc_round_prefix_wholesale_budget = 20000;
-    /// The post-CAS hand-off reclaim draws from its OWN reserve, never from `prefix_wholesale_budget`
-    /// above: the prune safely under-serves and retries next round via its cursor, but the hand-off is a
-    /// one-shot event with no reclaimer besides `fsck`, so a prune-heavy round must never be able to
-    /// starve it to zero.
-    /// Default UNBOUNDED, and this one is not a tuning choice. The hand-off is one-shot: a generation it
-    /// cannot fully reclaim in its round is never revisited, because the parent-seal difference that
-    /// triggers it does not recur. A cap on work that has no second chance does not defer the work, it
-    /// leaks it -- the same shape as the manifest-cleanup cap that was removed outright.
-    uint64_t gc_round_handoff_prefix_wholesale_budget = 0;
-    /// `GcOutcomes` per-round entry cap across the redelete/spared audit log, cumulative for the round.
-    /// Bounds only the audit-log write -- the settlement decision it records already happened
-    /// unconditionally in the fold. 0 = unbounded.
-    /// Default UNBOUNDED: nothing is retried on exhaustion because there is nothing left to retry -- the
-    /// decision already happened -- so the only thing a cap drops is the audit row explaining it, and it
-    /// drops exactly the rows of the busiest rounds, which are the ones an investigation needs.
-    uint64_t gc_round_outcome_entry_budget = 0;
-    /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
-    /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
-    /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec
-    /// §5), so this bounds only the extra exact `GET`s the universe union introduced -- normally zero,
-    /// because ordinary active namespaces normally remain hinted. Running out is NOT an error: the
-    /// unprobed namespaces are simply unproven, which
-    /// suppresses all destruction for the round. 0 => probe none (the exhaustion path, which tests
-    /// drive directly).
-    ///
-    /// Default effectively unbounded, and it must be spelled as a huge number rather than `0`: unlike
-    /// every other budget here, `0` means "probe nothing", not "no cap" -- the tests drive that path
-    /// deliberately, so the sentinel cannot simply be redefined. Exhaustion is the worst failure shape
-    /// of any budget in this struct, because it does not defer work: unprobed namespaces are unproven,
-    /// and one unproven namespace suppresses ALL destruction for the round. A count that is fine for ten
-    /// namespaces silently becomes a permanent GC stop for a pool with enough tables.
-    /// The cost of removing the cap is round LENGTH (extra exact `GET`s, normally zero because active
-    /// namespaces stay hinted) -- which is bounded by nothing today, since rounds have no time deadline.
-    uint64_t gc_frontier_probe_budget = std::numeric_limits<uint64_t>::max();
-    /// skip-unchanged: a GC round may DEFER
-    /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
-    /// shards changed since the last fold AND no destructive decision is due. Default 1 = fold as soon
-    /// as anything changed (batching off; only idle rounds defer). > 1 batches small deltas.
-    uint64_t gc_fold_threshold = 1;
-    /// Liveness bound for batching: force a FOLD after this many consecutive DEFER rounds even below
-    /// the threshold. Inert at gc_fold_threshold == 1 (an idle defer has nothing to fold). Default 8.
-    uint64_t gc_fold_max_defer_rounds = 8;
-    /// Diagnostic-only threshold for a `Removing` catalog life whose terminal cleanup evidence has
-    /// not appeared. Test/config struct seam only; no user-facing setting is registered.
-    uint64_t gc_stuck_removal_rounds = 10;
-    /// gc-rebuild: max in-memory edges per gc-shard batch during rebuildBaseline
-    /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
-    /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
-    uint64_t rebuild_edge_budget = 8000000;
     /// Bounded pool size for the per-hash freshness
     /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
     /// take hours sequential). Every job internally catches its own exceptions (never wedges the round;
-    /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
-    /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
+    /// feedback_ca_gc_never_throw_on_404) and `KeeperGc::runRound` drains the batch before it acts on it.
     uint64_t gc_meta_pool_size = 16;
-    /// Bounded pool size for the fold's read-ahead of checkpoints, ref logs, manifest bodies and
-    /// zero-candidate HEADs. Every decision stays on the round thread, in the order it always ran;
-    /// only the fetch overlaps. `1` issues no read-ahead at all and is the sequential round, request
-    /// for request.
-    uint64_t gc_read_concurrency = 16;
     /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.

@@ -190,7 +190,7 @@ struct CasFoldSeal
 {
     uint64_t generation = 0;
     uint64_t parent_generation = 0;
-    /// Exactly one row per `Live` or `Removing` catalog life admitted by `buildRefWalkPlan`.
+    /// Exactly one row per `Live` or `Removing` catalog life.
     std::map<UInt128, RefLifeFoldState> ref_lives;
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
     std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards

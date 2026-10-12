@@ -1015,7 +1015,7 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
             objects.emplace_back(key.str());
         /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- this layer never
         /// substitutes a per-key loop of its own (that would run under a single admission for up to
-        /// 1000 keys). The caller in CasGc.cpp catches it and retries one key per admitted request.
+        /// 1000 keys).
         object_storage->removeObjectsIfExistUnderProfile(objects, controlRequest(access.attemptNo()));
         return;
     }

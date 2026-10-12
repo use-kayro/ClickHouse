@@ -1,12 +1,8 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -18,21 +14,9 @@
 #include <string>
 #include <vector>
 
-/// REBUILD CONDEMNS NOTHING, AND fsck WALKS STREAMS BY ARITHMETIC (spec 2026-07-27 "ref chain complete
-/// cut" §7).
+/// fsck WALKS STREAMS BY ARITHMETIC (spec 2026-07-27 "ref chain complete cut" §7).
 ///
-/// REBUILD used to end with a LIST of `blobs/` and condemn every listed body its traversal had not
-/// reached. That is the r5-finding-4 data-loss vector: the traversal itself is listing-driven, so a
-/// store that omits a durable ref-log or manifest key from a LIST hides a LIVE owner, and the very same
-/// pass then condemns the blob that owner pins. One lying enumeration, and acked data is scheduled for
-/// deletion. The condemnation is GONE — REBUILD rebuilds cursors and edges and reclaims nothing.
-///
-/// The NAMED residual that removal creates (Stage-A staging contract, register R4): a blob whose
-/// manifest no longer exists anywhere is unreclaimable until the build/upload registry can enumerate
-/// in-flight uploads. No substitute reclamation is added in its place — a quiet one would be the same
-/// vector wearing a different hat (Constraint 3: no fallback).
-///
-/// fsck's half is the other side of the same rule: it may not rest a verdict on a listing either. It
+/// fsck may not rest a verdict on a listing. It
 /// walks each namespace's ref stream by ARITHMETIC from `_ckpt.checkpoint` upward, reading every id by
 /// exact key, and reports one verdict per namespace — `chain-broken` (a 404 below a CONFIRMED durable
 /// same-epoch id: a hole, fatal in the summary AND in the exit code), `unchecked` (could not prove it
@@ -45,111 +29,13 @@ using namespace DB::Cas::tests;
 namespace
 {
 
-const UInt128 kGc = hexToU128("00000000000000000000000000000001");
-
 const RootNamespace kNsA{"00/aa@cas@"};
 const RootNamespace kNsB{"00/zz@cas@"};
-
-/// Makes a second REBUILD catalog GET observe a different authority set. The command must take one
-/// immutable cut at entry, so a correct implementation never triggers the mutation.
-class CatalogChangesOnSecondReadBackend : public CountingBackend
-{
-public:
-    void armCatalogMutation(const String & key)
-    {
-        catalog_key = key;
-        catalog_reads = 0;
-        armed = true;
-    }
-
-    size_t catalogReads() const { return catalog_reads; }
-
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        auto got = CountingBackend::read(key, access);
-        if (!armed || key != catalog_key)
-            return got;
-
-        ++catalog_reads;
-        if (catalog_reads != 2)
-            return got;
-        if (!got)
-            throw std::runtime_error("catalog mutation fixture: second catalog read found absence");
-
-        if (!CountingBackend::write(key, encodeRefCatalog(RefCatalog{}), got->value, access))
-            throw std::runtime_error("catalog mutation fixture: catalog rewrite conflicted");
-        return CountingBackend::read(key, access);
-    }
-
-private:
-    String catalog_key;
-    size_t catalog_reads = 0;
-    bool armed = false;
-};
-
-BlobRef blobRefOf(const DB::UInt128 & hash)
-{
-    return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)};
-}
 
 std::optional<DB::Cas::Object> readOf(Backend & backend, const String & key)
 {
     OperationForTest op(backend);
     return (*op).read(key, Retry::standard());
-}
-
-bool headExists(Backend & backend, const String & key)
-{
-    OperationForTest op(backend);
-    return (*op).head(key, Retry::standard()).has_value();
-}
-
-bool blobPresent(Backend & backend, const Layout & layout, const DB::UInt128 & hash)
-{
-    return headExists(backend, layout.blobKey(blobRefOf(hash)));
-}
-
-/// Whether ANY run the newest fold seal references carries a `RunMarker::Condemned` row for `hash`. This is where
-/// a rebuild used to put its zero-edge condemnations, so "nothing was condemned" is checked HERE rather
-/// than by watching for a deletion several rounds later.
-bool condemnedInSealedRuns(Backend & backend, const Layout & layout, const DB::UInt128 & hash)
-{
-    DB::Cas::tests::OperationForTest operation(backend);
-    const GcState st = decodeGcState((*operation).read(layout.gcStateKey(), Retry::standard())->bytes);
-    const auto sealed = (*operation).read(layout.foldSealKey(st.snap_generation, st.snap_attempt), Retry::standard());
-    if (!sealed)
-        return false;
-    const CasFoldSeal seal = decodeFoldSeal(sealed->bytes);
-    for (const RunRef & r : seal.blob_target_runs)
-    {
-        auto reader = openSourceEdgeRun(*operation, r.key);
-        String k;
-        String p;
-        while (reader.next(k, p))
-        {
-            BlobRef ref;
-            UInt128 sid;
-            SourceEdgeKeyCodec::parse(k, ref, sid);
-            if (p.empty() || runMarkerFromByte(p[0], "CAS test source-edge run") != RunMarker::Condemned)
-                continue;
-            if (ref.digest.toU128() == hash)
-                return true;
-        }
-    }
-    return false;
-}
-
-/// Publish `ref_name` -> a fresh manifest pinning `blob` at exactly `id`, and return the manifest's key
-/// so a test can hide it from the listing.
-String publishAtReturningManifestKey(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id,
-    const String & ref_name, uint64_t build_sequence, const DB::UInt128 & blob, bool birth = false,
-    std::optional<RefTxnId> prev_epoch_seal = std::nullopt)
-{
-    publishAt(backend, layout, ns, id, ref_name, build_sequence, blob, birth, prev_epoch_seal);
-    return layout.manifestKey(ManifestId{ns, ManifestRef{.writer_epoch = id.writer_epoch,
-                                                         .build_sequence = build_sequence,
-                                                         .manifest_ordinal = 1}});
 }
 
 /// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers go through
@@ -209,253 +95,6 @@ size_t rowsMentioning(const FsckReport & rep, FsckClass cls, const String & need
 
 /// ---- REBUILD condemns nothing ----
 
-/// THE REGRESSION TEST FOR r5-finding-4. A blob pinned by a COMMITTED ref, whose ref-log record and
-/// whose manifest body the store both omit from every LIST while serving them perfectly by exact key.
-/// The catalog row plus `_ckpt` frontier make the ref-log record authoritative, so REBUILD must recover
-/// both owners despite the lying hint. The hidden manifest LIST still cannot justify condemnation: an
-/// omitted object costs retention and never data.
-TEST(CASRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
-{
-    auto backend = std::make_shared<HintHoleBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    /// Visible owner: ref_a pins blob 1.
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
-    /// HIDDEN owner: ref_b pins blob 2, and neither its record nor its manifest is ever listed.
-    const String hidden_manifest =
-        publishAtReturningManifestKey(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", /*build_sequence=*/2, DB::UInt128(2));
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 2},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-    backend->hide(layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2}));
-    backend->hide(hidden_manifest);
-
-    /// Precondition: both objects really are durable and really are hidden.
-    ASSERT_TRUE(readOf(*backend, layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2})).has_value());
-    ASSERT_TRUE(readOf(*backend, hidden_manifest).has_value());
-
-    Gc gc(store, kGc);
-    const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-    ASSERT_GT(backend->holesServed(), 0u) << "the hidden keys were never actually omitted from a LIST";
-    EXPECT_EQ(rep.committed_refs, 2u)
-        << "the immutable checkpoint frontier, not the lying LIST, defines both committed owners";
-
-    EXPECT_FALSE(condemnedInSealedRuns(*backend, layout, DB::UInt128(2)))
-        << "the hidden owner's blob was condemned — that is acked data scheduled for deletion";
-    EXPECT_FALSE(loadMetaForTest(*backend, layout, DB::UInt128(2)).has_value())
-        << "a rebuild condemns nothing, so it publishes no condemn marker";
-
-    /// And it survives the pipeline: rounds run, nothing reclaims it.
-    for (int i = 0; i < 4; ++i)
-    {
-        gc.runRegularRound();
-        store->renewWatermarkOnce();
-    }
-    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "acked data was deleted after a rebuild";
-    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(1)));
-}
-
-/// An ORPHAN blob — one no manifest anywhere names — is likewise left alone. This is the NAMED residual
-/// (register R4) stated as a test rather than as prose: until the build/upload registry can enumerate
-/// in-flight uploads, a manifest-less blob is unreclaimable, and the rebuild does NOT get to guess. The
-/// blob a live ref pins and the blob nothing pins are indistinguishable from a LIST, which is exactly
-/// why the old pass could not tell them apart either.
-TEST(CASRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-    writeBlobBody(*backend, layout, DB::UInt128(2));   /// orphan: present, named by nothing
-
-    Gc gc(store, kGc);
-    const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-
-    EXPECT_FALSE(condemnedInSealedRuns(*backend, layout, DB::UInt128(2)));
-    const GcState st = decodeGcState(readOf(*backend, layout.gcStateKey())->bytes);
-    const CasFoldSeal seal = decodeFoldSeal(readOf(*backend, layout.foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-    ASSERT_TRUE(seal.condemned_summary.contains(0)) << "the summary stays TOTAL over gc_shards";
-    EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 0u) << "a rebuild condemns nothing";
-
-    for (int i = 0; i < 4; ++i)
-    {
-        gc.runRegularRound();
-        store->renewWatermarkOnce();
-    }
-    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2)))
-        << "the residual is RETENTION: an orphan is kept, not quietly reclaimed by a substitute pass";
-}
-
-/// The rebuild is the `gc/state` disaster-recovery command, so it is the LAST thing that may refuse to
-/// run over a pool holding one bad key. A name-bearing segment under the opaque stream root is not a
-/// canonical physical life id. The key must be skipped -- no catalog entry can claim it -- and the
-/// rebuild must continue over unrelated cataloged lives.
-TEST(CASRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-
-    /// Hand-built: no helper can mint this shape any more.
-    const String noncanonical_life =
-        layout.casRefsPrefix() + kNsA.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-    {
-        OperationForTest op(*backend);
-        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(noncanonical_life, "garbage", Retry::standard())));
-    }
-
-    Gc gc(store, kGc);
-    RebuildReport rep;
-    ASSERT_NO_THROW(rep = gc.rebuildBaseline(/*force=*/true))
-        << "the recovery command must not be taken out by the damage it exists to recover from";
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-
-    /// The live namespace was still discovered and folded -- the bad key was skipped, not the pool.
-    EXPECT_EQ(rep.committed_refs, 1u) << "the malformed key must not hide the live namespace";
-}
-
-/// The SECOND way the same damage can reach the rebuild, and it is a different code path from the one
-/// above: the gen-0 health check LISTs each namespace's own life prefix and groups those keys to decide
-/// whether any table proves cleaned logs. `groupRefKeys` refuses a key that names no life, so a NESTED
-/// shape under the life prefix (`<life_id>/x/_log/<id>.zst`) reaches the refusal there instead of at
-/// `discoverUniverse`, which absorbs it. Same rule, same reason: the recovery command must not be taken
-/// out by the damage it exists to recover from.
-///
-/// A decodable `gc/state` at generation 0 is what makes that branch run at all -- with no state object
-/// the health check never reaches it. The state here comes from one real round (so the lease belongs to
-/// this identity) with `snap_generation` written back to 0.
-TEST(CASRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTheRebuild)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-
-    Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    {
-        const auto got = readOf(*backend, layout.gcStateKey());
-        ASSERT_TRUE(got.has_value());
-        GcState st = decodeGcState(got->bytes);
-        st.snap_generation = 0;
-        OperationForTest op(*backend);
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(layout.gcStateKey(), encodeGcState(st), got->etag, Retry::standard())));
-    }
-
-    /// Hand-built, and planted AFTER the round so the round itself is clean: one segment too deep under
-    /// the life prefix, so the segment where the incarnation belongs holds `x`. No helper mints this.
-    const String nested = layout.namespaceStreamPrefix(fixture::fixtureLife(kNsA))
-        + "x/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-    {
-        OperationForTest op(*backend);
-        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(nested, "garbage", Retry::standard())));
-    }
-
-    RebuildReport rep;
-    ASSERT_NO_THROW(rep = gc.rebuildBaseline(/*force=*/false))
-        << "the recovery command must not be taken out by the damage it exists to recover from";
-    /// FORCE is deliberately NOT passed: a listing the check could not group proves nothing about the ref
-    /// baseline, so the pool cannot be declared healthy, and the un-forced rebuild must therefore RUN
-    /// rather than refuse.
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_EQ(rep.committed_refs, 1u) << "the live namespace must still be folded";
-}
-
-TEST(CASRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
-{
-    auto backend = std::make_shared<CatalogChangesOnSecondReadBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1,
-              DB::UInt128(1), /*birth=*/true);
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-
-    /// A decoded generation-0 state exercises the health check's namespace walk before the rebuild
-    /// universe is consumed. The backend would erase the authority set on a second catalog GET.
-    Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    {
-        const auto got = readOf(*backend, layout.gcStateKey());
-        ASSERT_TRUE(got);
-        GcState state = decodeGcState(got->bytes);
-        state.snap_generation = 0;
-        OperationForTest op(*backend);
-        ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(layout.gcStateKey(), encodeGcState(state), got->etag, Retry::standard())));
-    }
-
-    backend->armCatalogMutation(layout.refCatalogKey());
-    const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
-    EXPECT_EQ(backend->catalogReads(), 1u)
-        << "REBUILD must use its entry cut for both the generation-0 health check and the rebuild";
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_EQ(rep.committed_refs, 1u);
-}
-
-/// Removing the condemnation must not disturb the other thing a rebuild owes: every hold in the prior
-/// seal rides through VERBATIM (Task 8). Asserted together with the condemn-nothing rule because the
-/// two used to be produced by the same pass, and a hold dropped here would hand back a baseline that
-/// claims a frontier proof it does not have.
-TEST(CASRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-    writeBlobBody(*backend, layout, DB::UInt128(2));   /// an orphan alongside the held namespace
-
-    /// One real round first: it establishes the pool's `gc/state` and takes the lease under THIS
-    /// identity, so the rebuild below is the disaster-recovery path and not a lease conflict.
-    Gc gc(store, kGc);
-    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-
-    const RefHold planted{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{4, 9},
-                          .retry_count = 17, .next_retry_round = 23};
-    {
-        const GcState adopted = decodeGcState(readOf(*backend, layout.gcStateKey())->bytes);
-        seedFoldCursorForTest(*backend, layout, kNsA, RefTxnId{1, 1}, planted,
-                              adopted.snap_generation, adopted.snap_attempt);
-    }
-
-    const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
-    ASSERT_TRUE(rep.performed) << rep.refusal;
-
-    const GcState st = decodeGcState(readOf(*backend, layout.gcStateKey())->bytes);
-    const CasFoldSeal seal = decodeFoldSeal(readOf(*backend, layout.foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-    const auto it = seal.ref_lives.find(catalogLifeIdForTest(*backend, layout, kNsA));
-    ASSERT_NE(it, seal.ref_lives.end());
-    EXPECT_EQ(it->second.coverage.classification, CoverageClass::Clamped);
-    ASSERT_TRUE(it->second.coverage.hold.has_value());
-    EXPECT_EQ(*it->second.coverage.hold, planted)
-        << "a rebuild retried nothing, so it rewrites nothing about the hold";
-
-    EXPECT_FALSE(condemnedInSealedRuns(*backend, layout, DB::UInt128(2)));
-}
-
 /// ---- fsck: arithmetic streams ----
 
 /// A pool with nothing wrong reports nothing: no hole, no unproven namespace, a clean bill of health
@@ -463,7 +102,7 @@ TEST(CASRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
 TEST(CASRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
@@ -488,7 +127,7 @@ TEST(CASRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
 TEST(CASRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
@@ -526,7 +165,7 @@ TEST(CASRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
 TEST(CASRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
 {
     auto backend = std::make_shared<HintHoleBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
@@ -560,7 +199,7 @@ TEST(CASRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
 TEST(CASRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     seedSealedTwoEpochStream(*backend, layout, kNsA);
@@ -585,7 +224,7 @@ TEST(CASRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
 TEST(CASRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
@@ -626,7 +265,7 @@ TEST(CASRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChai
 TEST(CASRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     /// `ns_a` sorts FIRST, so a scan that dies on it never reaches `ns_b`.

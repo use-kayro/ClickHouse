@@ -160,6 +160,49 @@ struct CasKeeperPartRecord
     std::vector<CasKeeperInlineFile> files;
 };
 
+/// One Keeper part record as the pool's GC sees it (`ICasKeeperRecordSource`).
+struct CasKeeperRecordState
+{
+    String part;
+    String data;                             /// the record bytes, re-`set` unchanged to mark it
+    std::vector<CasKeeperBlobFile> blobs;    /// the blob-backed files it references
+    bool listed = false;                     /// some replica lists the part in `/replicas/<r>/parts`
+    Int32 version = 0;                       /// znode version: 0 until the GC marks the record
+    Int64 mtime_ms = 0;                      /// znode mtime: when the GC marked it (or it was created)
+};
+
+/// One table's records on one disk's pool, read by its replica on this server.
+struct CasKeeperRecordSnapshot
+{
+    bool writer = false;          /// this replica is the table's writer: the only one whose GC deletes
+    std::vector<CasKeeperRecordState> records;
+    size_t unrecorded_listed = 0; /// parts some replica lists that have no record: their blobs are unknown
+    UInt64 retention_ms = 0;      /// how long an unlisted record is kept after its mark (`old_parts_lifetime`)
+    Int32 is_active_version = -1; /// the writer epoch the removals check (`<replica>/is_active`, `<replica>/host`)
+    Int32 host_version = -1;
+};
+
+class IContentAddressedExchange;
+
+/// A replicated table whose parts live on a content-addressed disk: it owns the Keeper client and its
+/// records (`<zookeeper_path>/cas_parts`), the disk owns the pool. The pool's GC reads every such table's
+/// records each round: a blob is live while some record references it, and a record goes only after its part
+/// has been unlisted by every replica for `retention_ms` since the GC marked it.
+class ICasKeeperRecordSource
+{
+public:
+    virtual ~ICasKeeperRecordSource() = default;
+    /// Its records on the pool of `disk` (one of its disks).
+    virtual CasKeeperRecordSnapshot snapshotCasRecords(const IContentAddressedExchange & disk) = 0;
+    /// Re-`set`s each record with its own bytes, checked against its version: the mark. Returns the parts
+    /// whose record was marked.
+    virtual Strings markCasRecords(const std::vector<const CasKeeperRecordState *> & records) = 0;
+    /// Removes each record in one multi-op that checks no replica lists its part and the writer epoch of
+    /// `snapshot` still holds. Returns the parts whose record was removed.
+    virtual Strings removeCasRecords(
+        const CasKeeperRecordSnapshot & snapshot, const std::vector<const CasKeeperRecordState *> & records) = 0;
+};
+
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
 /// the exchange obtains the interface by casting the disk's `IMetadataStorage` to this interface
@@ -316,5 +359,13 @@ public:
     /// in-manifest, loose, directory, or otherwise unresolved paths.
     virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
+
+/// The tables on `disk` whose Keeper records its pool's GC reads, or nullopt when some table on it cannot be
+/// read this round (not loaded yet, or not replicated: its blobs are unknown). Storages installs it once at
+/// startup (it walks `DatabaseCatalog`); until then, and in tools without tables, a disk's GC does nothing.
+using CasKeeperRecordSourcesProvider
+    = std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> (*)(const IContentAddressedExchange & disk);
+void setCasKeeperRecordSourcesProvider(CasKeeperRecordSourcesProvider provider);
+CasKeeperRecordSourcesProvider getCasKeeperRecordSourcesProvider();
 
 }

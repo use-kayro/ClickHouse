@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
@@ -514,9 +513,7 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
 }
 
 /// The observe-then-cut race: a life admitted between fsck's namespace-tree LIST and the catalog cut
-/// it takes AFTER that listing must NOT be misread as residue. Mirrors
-/// `CASNamespaceJanitor.PostListCatalogCutProtectsConcurrentCreationWithOneGet` -- the same ordering,
-/// the same reason: creation admits `Creating` before writing any life-owned object, so a life visible
+/// it takes AFTER that listing must NOT be misread as residue: creation admits `Creating` before writing any life-owned object, so a life visible
 /// only in the LATER cut cannot have raced this listing.
 namespace
 {
@@ -1104,137 +1101,6 @@ TEST(CASFsck, ReclaimablePrePrecommitBodyIsInfo)
     EXPECT_GE(rep.unreachable, 1u);      // counted as info/unreachable
 }
 
-/// Pipeline classification (2026-07-02): a condemned-but-present blob is PendingGc — an EXPECTED
-/// pipeline state (deletion is scheduled), never the suspicious "unreachable" lump beta testers
-/// read as a leak. clean() is unaffected.
-TEST(CASFsck, CondemnedBlobClassifiesPendingGc)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t publish_sequence = publishCommittedTransition(
-        *backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
-    Gc gc(store, hexToU128("00000000000000000000000000000001"));
-    gc.runRegularRound();
-    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
-    gc.runRegularRound();   /// -1 folds => zero => condemned into the retired list; blob still present
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.pending_gc, 1u);
-    EXPECT_EQ(rep.unaccounted, 0u);
-    bool saw = false;
-    for (const FsckObject & o : rep.objects)
-        if (o.cls == FsckClass::PendingGc)
-        {
-            saw = true;
-            ASSERT_FALSE(o.reachable_from.empty());
-            EXPECT_NE(o.reachable_from[0].find("condemned at round"), String::npos);
-        }
-    EXPECT_TRUE(saw);
-}
-
-/// A drop whose -1 has NOT folded yet: the blob's edges are still in the GC snapshot => AwaitingGc
-/// (expected), not Unaccounted.
-TEST(CASFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t publish_sequence = publishCommittedTransition(
-        *backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
-    Gc gc(store, hexToU128("00000000000000000000000000000001"));
-    gc.runRegularRound();                                        /// +1 folded into the snapshot
-    const uint64_t drop_sequence = dropRefTransition(
-        *backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded (no round)
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.awaiting_gc, 1u);
-    EXPECT_EQ(rep.unaccounted, 0u);
-}
-
-/// Stale-edge cross-check, NEGATIVE side: the residual edge's source manifest body is still PRESENT in
-/// the pool, so its removal still has a `-1` to fold (and the orphan sweep still has a body to reclaim).
-/// That is a genuine mid-pipeline backlog and must keep the `AwaitingGc` verdict — the new check may
-/// never turn an ordinary unfolded drop into a hard finding.
-TEST(CASFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t publish_sequence = publishCommittedTransition(
-        *backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
-    Gc gc(store, hexToU128("00000000000000000000000000000001"));
-    gc.runRegularRound();                                        /// +1 folded into the snapshot
-    const uint64_t drop_sequence = dropRefTransition(
-        *backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded; the BODY survives
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.awaiting_gc, 1u);
-    EXPECT_EQ(rep.stale_edge, 0u);
-    bool saw = false;
-    for (const FsckObject & o : rep.objects)
-        if (o.cls == FsckClass::AwaitingGc)
-            saw = true;
-    EXPECT_TRUE(saw);
-}
-
-/// Stale-edge cross-check, POSITIVE side: the blob's only residual `+1` names a manifest that no longer
-/// exists anywhere in the pool, so no `-1` is left to fold — the in-degree stays at 1 for every future
-/// round and the incremental GC can never nominate the blob. It must NOT be labeled `AwaitingGc`
-/// ("expected, no action needed", the sentence that hid 56 permanently retained blobs); it is the hard
-/// `StaleEdge` finding and the report is not `clean()`.
-TEST(CASFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t publish_sequence = publishCommittedTransition(
-        *backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
-    Gc gc(store, hexToU128("00000000000000000000000000000001"));
-    gc.runRegularRound();                                        /// +1 folded into the snapshot
-    const uint64_t drop_sequence = dropRefTransition(
-        *backend, store->layout(), ns, "tbl", r);  /// the owner is gone ...
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
-    deleteManifestBody(*backend, store->layout(), id);           /// ... and so is the body, un-folded
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_EQ(rep.stale_edge, 1u);
-    EXPECT_EQ(rep.awaiting_gc, 0u);
-    EXPECT_EQ(rep.dangling, 0u) << "no committed ref names the manifest any more — this is not a dangle";
-    EXPECT_FALSE(rep.clean());
-    bool saw = false;
-    for (const FsckObject & o : rep.objects)
-        if (o.cls == FsckClass::StaleEdge)
-        {
-            saw = true;
-            ASSERT_FALSE(o.reachable_from.empty());
-            EXPECT_NE(o.reachable_from[0].find("no longer exist"), String::npos);
-        }
-    EXPECT_TRUE(saw);
-}
-
 /// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
 /// is AwaitingGc ("GC has not run yet"), never a false Unaccounted alarm.
 TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
@@ -1247,29 +1113,6 @@ TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.awaiting_gc, 1u);
     EXPECT_EQ(rep.unaccounted, 0u);
-}
-
-/// A blob outside the WHOLE GC view on a pool where GC runs: Unaccounted — expected only as a
-/// transient (fast create+drop between rounds); persistent occurrences violate INV-2.
-TEST(CASFsck, ForeignBlobClassifiesUnaccounted)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
-    Gc gc(store, hexToU128("00000000000000000000000000000001"));
-    gc.runRegularRound();
-
-    writeBlobBody(*backend, store->layout(), DB::UInt128(0xF0F0));   /// never referenced anywhere
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.unaccounted, 1u);
-    EXPECT_EQ(rep.pending_gc, 0u);
 }
 
 /// A `.meta` descriptor whose body is missing is ADVISORY (meta_without_body), NOT a hard finding:

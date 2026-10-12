@@ -6,7 +6,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CUR_DIR"/../shell_config.sh
 
 # Intent: `SYSTEM CAS DROP POOL MEMBER` checks access BEFORE resolving the disk (same
-# pattern as the GC/GC REBUILD verbs covered by 05011_cas_gc_rebuild_access.sh), so this needs no
+# pattern as the GC RUN verb covered by 05011_cas_gc_rebuild_access.sh), so this needs no
 # CA disk at all:
 #  1) A user with ZERO grants is refused with ACCESS_DENIED, even though the named disk does not
 #     exist (it would otherwise be UNKNOWN_DISK once past the access check).

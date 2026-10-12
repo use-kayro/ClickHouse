@@ -35,6 +35,7 @@
 #include <Storages/MergeTree/ReplicatedTableStatus.h>
 #include <Storages/RenamingRestrictions.h>
 #include <Storages/TableZnodeInfo.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <Common/EventNotifier.h>
 #include <Common/MultiVersion.h>
@@ -103,7 +104,7 @@ using ZooKeeperWithFaultInjectionPtr = std::shared_ptr<ZooKeeperWithFaultInjecti
 
 struct ReplicatedPartitionExportInfo;
 
-class StorageReplicatedMergeTree final : public MergeTreeData
+class StorageReplicatedMergeTree final : public MergeTreeData, public ICasKeeperRecordSource
 {
 public:
     /** For the system table replicas. */
@@ -696,6 +697,14 @@ private:
     /// same bytes a commit writes -- from the part views the load already read, so no object-store write or
     /// LIST. Idempotent: a record another replica created meanwhile is left as it is.
     void backfillCasPartRecords();
+
+    /// `ICasKeeperRecordSource`: this table's records on the pool of `disk`, whether some replica lists each
+    /// record's part, and -- when this replica is the writer (a merge leader, `replicated_can_become_leader`)
+    /// -- the epoch the removals check.
+    CasKeeperRecordSnapshot snapshotCasRecords(const IContentAddressedExchange & disk) override;
+    Strings markCasRecords(const std::vector<const CasKeeperRecordState *> & records) override;
+    Strings removeCasRecords(
+        const CasKeeperRecordSnapshot & snapshot, const std::vector<const CasKeeperRecordState *> & records) override;
 
     /// Adds actions to `ops` that remove a part from ZooKeeper.
     /// Set has_children to true for "old-style" parts (those with /columns and /checksums child znodes).

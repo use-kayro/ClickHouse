@@ -323,12 +323,6 @@ public:
         return prefix + "/gc/state";
     }
 
-    /// Leak-only namespace-janitor cursor. It is deliberately separate from GC authority state.
-    String gcMaintenanceStateKey() const
-    {
-        return prefix + "/gc/maintenance_state";
-    }
-
     /// GC heartbeat (advisory liveness pulse): `<prefix>/gc/hb`.
     String gcHbKey() const
     {
@@ -373,15 +367,6 @@ public:
     /// and parsing helpers remain together.
     std::optional<ParsedBlobTargetRunKey> parseBlobTargetRunKey(std::string_view key) const;
 
-    /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>.zst
-    /// The `.zst` suffix comes from the traits table (cas_gc_outcomes is the one Always-compressed
-    /// control object): a constructed key names the compressed object deterministically, no body sniff.
-    String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "outcomes/" + std::to_string(round) + "/" + std::to_string(shard)
-            + String(storedSuffix(FormatId::GcOutcomes));
-    }
-
     /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).
     String rootsPrefix() const
     {
@@ -392,13 +377,13 @@ public:
     /// `<prefix>/blobs/` (no algo segment) even though `blobKey` nests one level deeper under
     /// `blobs/<algo>/S/ID`: a recursive LIST of this prefix still returns every blob object across all
     /// algos in one sweep. Any code that PARSES a listed key back to a hash must take the LAST path
-    /// component (the hex digest), which stays correct regardless of the algo segment (`CasGc.cpp` /
-    /// `CasFsck.cpp` already do this via `rfind('/')`).
+    /// component (the hex digest), which stays correct regardless of the algo segment (`CasFsck.cpp`
+    /// already does this via `rfind('/')`).
     ///
     /// The S3-staging area lives under `<prefix>/staging/<mount_id>/` — a distinct top-level sibling of
     /// `blobs/`, `cas/ns/`, and
-    /// `cas/manifests/`, never a sub-path of any of them. Every GC blob-discovery LIST (`CasGc.cpp`,
-    /// `CasFsck.cpp`) enumerates ONLY this `blobsPrefix()`, so a `staging/` object can never be listed,
+    /// `cas/manifests/`, never a sub-path of any of them. Every blob-discovery LIST (`CasFsck.cpp`)
+    /// enumerates ONLY this `blobsPrefix()`, so a `staging/` object can never be listed,
     /// HEAD'd, or condemned as an orphan blob — `Cas::sweepOwnMountStaging` (`CasStagingSweeper.h`) is
     /// the sole reclaimer of `staging/` debris.
     String blobsPrefix() const { return prefix + "/blobs/"; }

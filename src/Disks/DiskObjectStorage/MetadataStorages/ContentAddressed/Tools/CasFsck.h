@@ -44,8 +44,8 @@ enum class FsckClass : uint8_t
                    /// backlog, which is exactly the label that used to hide it.
     CorruptedRun,  /// a GC source-edge run's whole-file seal checksum (`RunRef::checksum`) disagrees with
                    /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
-                   /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
-                   /// fail closed on the same mismatch. ERROR
+                   /// pass; the deletion-deriving consumer (`zeroInDegree`) still
+                   /// fails closed on the same mismatch. ERROR
     /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
     /// object; the row's `key` identifies the exact log where the walk stopped or the checkpoint-named
     /// snapshot base whose required triple could not be validated.
@@ -64,8 +64,8 @@ enum class FsckClass : uint8_t
     JanitorPending,/// a COMPLETE, canonical namespace-life key (parses via the exact writer grammar,
                    /// nonzero 32-hex life id) whose life is simply absent from a catalog cut taken AFTER
                    /// the physical listing. This is the protocol-produced interval between a fenced GC
-                   /// exact-deleting a `Removing` catalog row and the perpetual `NamespaceJanitor`
-                   /// reaching this key on a later bounded page -- inert debris, not damage. Reported
+                   /// exact-deleting a `Removing` catalog row and a later reclaim
+                   /// reaching this key -- inert debris, not damage. Reported
                    /// as a soft finding: NOT in `kFsckHardFindings`, does not fail the report.
 };
 

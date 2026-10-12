@@ -64,10 +64,10 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
 {
     /// Completeness: every FormatId except the reserved Roster has traits.
     const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
-                            FormatId::GcOutcomes, FormatId::PartManifest, FormatId::RunFile,
+                            FormatId::PartManifest, FormatId::RunFile,
                             FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
                             FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat,
-                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::GcMaintenanceState, FormatId::PartFiles};
+                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::PartFiles};
     std::set<std::string_view> types;
     for (FormatId id : all)
     {
@@ -93,7 +93,6 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
     EXPECT_EQ(storedSuffix(FormatId::RefSnapshot), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::RefLog), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::PartManifest), ".zst");
-    EXPECT_EQ(storedSuffix(FormatId::GcOutcomes), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::PoolMeta), "");
     EXPECT_EQ(storedSuffix(FormatId::FoldSeal), "");
     EXPECT_EQ(storedSuffix(FormatId::RunFile), "");

@@ -7,6 +7,10 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
+#include <Storages/StorageReplicatedMergeTree.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Databases/IDatabase.h>
 #include <Common/Exception.h>
 #include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
@@ -118,6 +122,70 @@ void addCasPartRecordOps(
         ops.emplace_back(zkutil::makeCheckRequest(fs::path(*copied_from_replica_path) / "parts" / part.name, -1));
 }
 
+std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRecordSourcesOnDisk(const IContentAddressedExchange & disk)
+{
+    const auto context = Context::getGlobalContextInstance();
+    std::vector<std::shared_ptr<ICasKeeperRecordSource>> sources;
+    for (const auto & [database_name, database] : DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false, .with_remote_databases = false}))
+    {
+        size_t loaded = 0;
+        for (auto it = database->getTablesIterator(context, {}, /*skip_not_loaded=*/ true); it->isValid(); it->next())
+        {
+            ++loaded;
+            const auto table = it->table();
+            const auto * data = dynamic_cast<const MergeTreeData *>(table.get());
+            if (!data || std::ranges::none_of(data->getDisks(), [&](const DiskPtr & d) { return tryGetContentAddressedExchange(d) == &disk; }))
+                continue;
+            auto replicated = std::dynamic_pointer_cast<StorageReplicatedMergeTree>(table);
+            if (!replicated)
+                return std::nullopt;
+            sources.push_back(std::move(replicated));
+        }
+        /// Not loaded yet, or detached: its parts may still reference blobs, but its records are not read. (A
+        /// table out of the catalog for a moment -- a reload -- needs no guard: a blob goes only after rounds of
+        /// its condemnation and of its deletion both found no record referencing it.)
+        if (loaded < database->getAllTableNames(context).size()
+            || database->getDetachedTablesIterator(context, {}, /*skip_not_loaded=*/ true)->isValid())
+            return std::nullopt;
+    }
+    return sources;
+}
+
+Coordination::Requests casRecordRemovalOps(
+    const zkutil::ZooKeeper & zookeeper, const String & zookeeper_path, const String & replica_path, const Strings & replicas,
+    const String & part, Int32 record_version, Int32 is_active_version, Int32 host_version)
+{
+    Coordination::Requests ops;
+    for (const auto & replica : replicas)
+        zkutil::addCheckNotExistsRequest(ops, zookeeper, fs::path(zookeeper_path) / "replicas" / replica / "parts" / part);
+    ops.emplace_back(zkutil::makeCheckRequest(fs::path(replica_path) / "is_active", is_active_version));
+    ops.emplace_back(zkutil::makeCheckRequest(fs::path(replica_path) / "host", host_version));
+    ops.emplace_back(zkutil::makeRemoveRequest(fs::path(casPartRecordsPath(zookeeper_path)) / part, record_version));
+    return ops;
+}
+
+std::vector<CasKeeperBlobFile> casRecordBlobFiles(const CasKeeperPartRecord & decoded)
+{
+    std::vector<CasKeeperBlobFile> blobs;
+    std::unordered_set<std::string_view> inline_paths;
+    bool has_checksums = false;
+    for (const auto & f : decoded.files)
+    {
+        inline_paths.insert(f.path);
+        if (f.path != "checksums.txt" && !f.path.ends_with("/checksums.txt"))
+            continue;
+        has_checksums |= f.path == "checksums.txt";
+        MergeTreeDataPartChecksums checksums;
+        ReadBufferFromString in(f.bytes);
+        checksums.read(in);
+        appendChecksummedFiles(f.path.substr(0, f.path.size() - std::string_view("checksums.txt").size()), checksums, blobs);
+    }
+    if (!has_checksums)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "no checksums.txt");
+    std::erase_if(blobs, [&](const CasKeeperBlobFile & f) { return inline_paths.contains(f.path); });
+    return blobs;
+}
+
 DiskPtr holdPartFromCasRecord(const Disks & candidates, const String & part_path, std::string_view record)
 {
     for (const auto & disk : candidates)
@@ -133,22 +201,7 @@ DiskPtr holdPartFromCasRecord(const Disks & candidates, const String & part_path
             decoded = ca->decodeKeeperPartRecord(record);
             if (decoded.pool_uuid != ca->getPoolUUID())
                 continue;
-            std::unordered_set<std::string_view> inline_paths;
-            bool has_checksums = false;
-            for (const auto & f : decoded.files)
-            {
-                inline_paths.insert(f.path);
-                if (f.path != "checksums.txt" && !f.path.ends_with("/checksums.txt"))
-                    continue;
-                has_checksums |= f.path == "checksums.txt";
-                MergeTreeDataPartChecksums checksums;
-                ReadBufferFromString in(f.bytes);
-                checksums.read(in);
-                appendChecksummedFiles(f.path.substr(0, f.path.size() - std::string_view("checksums.txt").size()), checksums, blobs);
-            }
-            if (!has_checksums)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "no checksums.txt");
-            std::erase_if(blobs, [&](const CasKeeperBlobFile & f) { return inline_paths.contains(f.path); });
+            blobs = casRecordBlobFiles(decoded);
         }
         catch (const Exception & e)
         {

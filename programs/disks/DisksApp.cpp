@@ -343,8 +343,6 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("current_disk_with_path", makeCommandGetCurrentDiskAndPath());
     command_descriptions.emplace("touch", makeCommandTouch());
     command_descriptions.emplace("cas-fsck", makeCommandFsck());
-    command_descriptions.emplace("cas-gc-dryrun", makeCommandCaGcDryRun());
-    command_descriptions.emplace("cas-gc-rebuild", makeCommandCaGcRebuild());
     command_descriptions.emplace("cas-inspect", makeCommandCaInspect());
     command_descriptions.emplace("cas-drop-member", makeCommandCaDropMember());
     command_descriptions.emplace("read-checksums", makeCommandReadChecksums());

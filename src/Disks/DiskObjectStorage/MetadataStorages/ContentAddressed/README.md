@@ -38,13 +38,7 @@ mutable state with immutable, hash-addressed objects plus a small CAS
   single-writer mount slot with lease + writer-epoch fencing
   (`gc/server-roots/<srid>/{owner,epoch,mount}`). A fenced (expired or stolen)
   writer can never mutate the pool again with stale state.
-- **GC records** — round-based garbage collection state under `gc/...`:
-  leader lease/state, per-generation source-edge runs (which manifests
-  reference which blobs), fold seals, and outcome logs. GC computes blob
-  in-degrees from the edges, *condemns* zero-in-degree blobs, and later
-  deletes them with **exact-token** conditional deletes, so a concurrent
-  writer publishing the same content under a fresh envelope always wins (revival is
-  publication from the writer's own source — never a read of a condemned object).
+- **GC** — derived from the Keeper part records of the tables on the pool; see `Gc/CasKeeperGc.h`.
 
 Everything persisted is a text format with a versioned header line; see
 `Formats/README.md` for the registry, key map, and evolution rules.
@@ -65,10 +59,7 @@ Everything persisted is a text format with a versioned header line; see
   blobs by hash in its own namespace (no payload transfer) and publishes a
   fresh manifest. Any decode or promote failure just falls back to the
   ordinary byte fetch.
-- **GC round** (`Gc/CasGc`, paced by `Gc/CasGcScheduler`): take/renew the
-  leader lease, collect source edges, fold per-shard in-degrees, condemn new
-  zero-in-degree blobs, exact-token-delete blobs condemned earlier whose
-  state did not change, and seal the round with one CAS on `gc/state`.
+- **GC round** (`Gc/CasKeeperGc`, paced by `Gc/CasGcScheduler`): see `Gc/CasKeeperGc.h`.
 
 ## Source layout
 
@@ -106,9 +97,8 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   single-writer slot + staging sweeper), `CasPoolMeta`, `CasBlobMeta`,
   `CasManifestReader`, `CasPlainObjects` (the `roots/...` verbatim
   passthrough), `CasMountRuntime` (fence state shared with lanes).
-- **`Gc/`** — garbage collection: `CasGcScheduler` (pacing thread), `CasGc`
-  (the round engine), `CasGcShardPlan` (sharding math), `CasBlobInDegree`,
-  `CasOrphanManifestSweep`.
+- **`Gc/`** — garbage collection: `CasGcScheduler` (pacing thread), `CasKeeperGc`
+  (the round, see `Gc/CasKeeperGc.h`), `CasBlobInDegree`, `CasOrphanManifestSweep`.
 - **`Tools/`** — operator verbs (`clickhouse-disks`): `CasFsck`,
   `CasDecommission`, `CasInspect`.
 - **`Parts/`** — part semantics over the pool: `PartPathParser` (the
@@ -169,9 +159,7 @@ not to multipart-capable blob publication.
 
 - `clickhouse-disks` verbs (all require the disk opened read-only): `fsck`
   (independent reachability audit of refs → manifests → blobs), `cas-inspect`
-  (decode one pool object by its raw key to JSON), `cas-gc-dryrun` (preview the
-  next GC round's deletes), `cas-gc-rebuild` (disaster-recovery rebuild of the
-  `gc/state` baseline), `cas-drop-member` (decommission a dead pool member).
+  (decode one pool object by its raw key to JSON), `cas-drop-member` (decommission a dead pool member).
 - `system.cas_log` — one row per CAS protocol event
   (uploads, adopts, promotes, condemns, deletes, mount-slot writes, ...);
   the primary audit trail when investigating pool state.
@@ -203,4 +191,4 @@ To understand a request end to end, read in this order:
 2. `Parts/PartFolderAccess` (`PartRefKey` → the folder view / cache).
 3. `Pool/CasPool` — the pool composition root and `open` protocol.
 4. `Pool/CasPartWriteTxn` — one-part write transaction.
-5. `Gc/CasGc` — the GC round engine.
+5. `Gc/CasKeeperGc` — the GC round.

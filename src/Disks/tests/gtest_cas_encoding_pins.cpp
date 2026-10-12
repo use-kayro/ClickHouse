@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -206,14 +205,6 @@ TEST(CASWireCutDeltas, InlinePartManifestEntry)
     /// This literal is the pre-cut baseline this delta is measured against.
     const String old_banner = "==> \"a\" il=1 <==\n";
     expectDelta(old_banner, lineAt(text, 4), 2);
-}
-
-TEST(CASWireCutDeltas, GcOutcomesRow)
-{
-    OutcomeLog log{{OutcomeEntry{ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, PersistedEtag{"etag", "t"}, OutcomeKind::Deleted}}};
-    /// This literal is the pre-cut baseline this delta is measured against.
-    const String old_bytes = "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00000000000000000000000000000004\",\"tt\":\"etag\",\"tv\":\"t\",\"oc\":\"deleted\"}\n";
-    expectDelta(old_bytes, lineAt(encodeOutcomeLog(log), 1), 26);
 }
 
 /// The ref-log's own op rows: the highest-cardinality record of the format and, for

@@ -510,8 +510,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     /// Physical life-owned keys carry no logical name. Classify each COMPLETE, canonical key against a
     /// catalog cut taken AFTER this physical listing finishes (observe-then-cut), not the earlier
-    /// `catalog_cut` above: `NamespaceJanitor::runOnePage` (the only real deleter of this debris) uses
-    /// the identical ordering, and it is what makes "life absent from a LATER cut" sound -- creation
+    /// `catalog_cut` above: this ordering is what makes "life absent from a LATER cut" sound -- creation
     /// always admits a `Creating` catalog row before writing any life-owned object (spec §2), so a life
     /// that is absent from a cut taken after the listing cannot be a concurrent birth this listing raced.
     /// A malformed shape (the parser refuses, or the reserved segment names no clean relative file) is
@@ -873,8 +872,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     /// checksum to the seal's `RunRef::checksum`. Fsck is a read-only auditor — instead of
                     /// throwing (which would abort the whole scan on the first corrupt run), catalogue the
                     /// mismatch as a `CorruptedRun` finding (with the run key) and continue so the audit
-                    /// enumerates every problem in one pass. The deletion-deriving consumers
-                    /// (`fold`/`zeroInDegree`/`previewDeletes`) still fail closed on the same mismatch.
+                    /// enumerates every problem in one pass. The deletion-deriving consumer
+                    /// (`zeroInDegree`) still fails closed on the same mismatch.
                     if (reader.accumulatedChecksum() != run.checksum)
                     {
                         ++report.corrupted_runs;
@@ -993,7 +992,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             {
                 cls = FsckClass::StaleEdge;
                 note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
-                       "exist — unreclaimable by the incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
+                       "exist — unreclaimable by the incremental GC; NOT expected, investigate";
             }
             else
             {

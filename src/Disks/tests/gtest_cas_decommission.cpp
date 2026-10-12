@@ -1,7 +1,6 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <algorithm>
 #include <atomic>
@@ -25,19 +24,6 @@ namespace
 PoolPtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 {
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
-}
-
-void drainCompletedNamespaceRemovals(const std::shared_ptr<InMemoryBackend> & backend)
-{
-    PoolConfig config{
-        .pool_prefix = "p",
-        .server_root_id = "gc",
-        .gc_fold_threshold = 1,
-        .gc_fold_max_defer_rounds = 0};
-    auto store = Pool::open(backend, config);
-    Gc gc(store, UInt128{991});
-    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
-    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
 }
 
 /// Fails a delete for one or two designated keys -- either by throwing (a transient backend hiccup) or
@@ -403,7 +389,7 @@ private:
 
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
-/// via the raw ref-log seeding helpers (fixture idiom of e.g. `gtest_cas_gc_fold.cpp`: `writeManifestRaw`
+/// via the raw ref-log seeding helpers (fixture idiom: `writeManifestRaw`
 /// + `publishCommittedTransition`/`addPrecommitTransition` against `victim`'s own backend/layout) -- this
 /// fixture only needs the ref-table SHAPE `dropNamespace` erases, not a real build. Precommit bindings
 /// are seeded at an artificially high `writer_epoch` so the writer's own stale-precommit sweep (armed
@@ -767,16 +753,10 @@ TEST(CASDecommission, ErasesAllVictimNamespaces)
     EXPECT_EQ(report.precommits_removed, 1u);
     EXPECT_EQ(report.edge_deltas_emitted, 4u);
 
-    /// Terminal publication is writer work; exact catalog-row deletion remains GC work. The first
-    /// command therefore keeps the slot as an ownership anchor, and a retry may retire it only after
-    /// GC's next invocation drains the completed `Removing` rows.
+    /// Terminal publication is writer work; exact catalog-row deletion is not. The command therefore
+    /// keeps the slot as an ownership anchor while the completed `Removing` rows remain.
     EXPECT_FALSE(report.warnings.empty());
     EXPECT_FALSE(report.slot_removed);
-    drainCompletedNamespaceRemovals(backend);
-    const auto retired = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
-    EXPECT_TRUE(retired.warnings.empty());
-    EXPECT_TRUE(retired.slot_removed);
 }
 
 /// Task 2 review finding 1: `makeTableWithRefs`'s precommit seed uses an artificially high
@@ -1065,35 +1045,6 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 
 /// GC owns the completed catalog-row deletion. Once it drains the row, a clean decommission retry
 /// removes the mutable slot objects and tombstones the owner anchor.
-TEST(CASDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    {
-        auto victim = openVictim(backend);
-        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
-    }
-    const auto pending = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-    EXPECT_FALSE(pending.slot_removed);
-    EXPECT_FALSE(pending.warnings.empty());
-    drainCompletedNamespaceRemovals(backend);
-    const auto report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
-    EXPECT_TRUE(report.slot_removed);
-    EXPECT_TRUE(report.warnings.empty());
-    OperationForTest raw_op(*backend);
-    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value());
-    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
-    ASSERT_TRUE(owner.has_value());
-    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
-    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/epoch", Retry::once()).has_value());
-
-    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
-    });
-}
-
 /// Triage #9: a successor may reclaim the same UUID immediately after the decommission admin writes
 /// its farewell. The retirement tail must use the farewell/claimed-epoch tokens captured around that
 /// release, delete `mount` first, and stop on its `TokenMismatch`; re-reading current tokens would
@@ -1209,19 +1160,6 @@ TEST(CASDecommission, RunsOnAnOpenFence)
     EXPECT_EQ(pending.namespaces_removed, 1u);
     EXPECT_FALSE(pending.slot_removed);
     EXPECT_FALSE(pending.warnings.empty());
-
-    drainCompletedNamespaceRemovals(backend);
-
-    const auto report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
-    EXPECT_TRUE(report.warnings.empty());
-    EXPECT_TRUE(report.slot_removed);
-    OperationForTest raw_op(*backend);
-    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value());
-    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/epoch", Retry::once()).has_value());
-    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
-    ASSERT_TRUE(owner.has_value());
-    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
 TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
@@ -1392,12 +1330,6 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
     EXPECT_FALSE(second.slot_removed);
     EXPECT_EQ(second.namespaces_already_removed, 1u);
     EXPECT_EQ(second.mountpoint_objects_removed, 1u);
-
-    drainCompletedNamespaceRemovals(inner);
-    const auto third = decommissionPoolMember(
-        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a3"}, "victim");
-    EXPECT_TRUE(third.warnings.empty());
-    EXPECT_TRUE(third.slot_removed);
 }
 
 /// Task 4 fail-close, manifest-debris variant (review follow-up: the plan's own example only exercises

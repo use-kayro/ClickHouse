@@ -158,7 +158,7 @@ public:
                 "`chain-broken` rows under --detail)", report.chain_broken);
         /// A term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
         /// nonzero — so a corrupt run was invisible twice over. A seal-checksum mismatch is not debris:
-        /// `fold`/`zeroInDegree`/`previewDeletes` all fail closed on the same run, so GC cannot make
+        /// `zeroInDegree` fails closed on the same run, so a consumer of it cannot make
         /// progress past it, and the audit deliberately continues only so ONE pass enumerates them all.
         if (report.corrupted_runs > 0)
             throw Exception(

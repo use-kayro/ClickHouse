@@ -51,9 +51,6 @@ enum class SweepRetainClass : uint8_t
                          /// rather than decided without a complete view (fail-closed, never a partial one)
 };
 
-/// The class as a short stable word, for log lines and metric names.
-std::string_view sweepRetainClassName(SweepRetainClass c);
-
 /// The durable per-namespace fold state the §6 deletion premise reads. It is taken from the ADOPTED
 /// fold seal — the `gc/state` -> `fold_seal` pair the sweep already read to learn its cursor, kept
 /// whole instead of reduced to that one field.
@@ -105,61 +102,6 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
 NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns);
 
 
-
-/// Counters returned by one bounded cursor page. `listed` counts keys in the backend page, `skipped`
-/// counts malformed, protected, ineligible, budget-exhausted, or race-spared keys, and `deleted` counts
-/// only successful exact-token deletions. `next_cursor` and `wrapped` describe the backend cursor; the
-/// cursor is a cleanup-progress hint and is never used as reachability authority.
-///
-/// THE `retained_*` COUNTERS ARE THIS PATH'S ONLY VOICE. They break the §6 premise's share of
-/// `skipped` out by reason class. Unlike `sweepNamespace`, the cursor page has no `warnings`
-/// out-param and nothing downstream of it reads a per-object sentence, so without these a background
-/// sweep retaining every manifest in the pool is indistinguishable, at any production log level, from
-/// a sweep that had nothing to do. In Stage A that is not an edge case: rule (1) is satisfiable only
-/// for a closed-and-folded epoch, so retention is the NORMAL outcome and these counters are very
-/// nearly the whole story of what the sweep did and why.
-struct ManifestSweepResult
-{
-    String next_cursor;
-    bool wrapped = false;
-    uint64_t listed = 0;
-    uint64_t deleted = 0;
-    uint64_t skipped = 0;
-    /// A non-zero value is an operator signal rather than a transient: each body was retained instead
-    /// of being deleted because the sweep could not decode it well enough to prove deletion safe.
-    uint64_t undecodable = 0;
-    uint64_t retained_no_coverage = 0;
-    uint64_t retained_hold = 0;
-    uint64_t retained_unconsumed_seal = 0;
-    uint64_t retained_tail_removal = 0;
-    uint64_t retained_work_budget = 0;
-
-    /// The floor a namespace's builds are judged against is one mount body per server root. A page
-    /// resolves it once per namespace (`floor_lookups`); each lookup reads the mount key of every
-    /// `/`-prefix of the namespace that the round's LIST of `gc/server-roots/` names, longest first,
-    /// until one answers (`floor_reads`) -- one read for a namespace whose root is listed, none for one
-    /// whose root is not.
-    uint64_t floor_lookups = 0;
-    uint64_t floor_reads = 0;
-
-    /// Exact-GET/decode candidates. The reducer must adopt every `source_retirements` entry before the
-    /// caller may delete `key`, and only after re-observing `token` at it: a key whose incarnation
-    /// moved on belongs to a fresh owner and must be left alone.
-    struct Nomination
-    {
-        ManifestId id;
-        String key;
-        PersistedEtag token;
-        std::vector<BlobSourceRetirement> source_retirements;
-    };
-    std::vector<Nomination> nominations;
-
-    /// The reason class that retained the most manifests on this page and how many — the rollup that
-    /// answers "why is manifest debris not shrinking?". `{None, 0}` means the premise retained nothing.
-    /// Ties resolve to the first class in enum order, which is stable across passes so an unchanged
-    /// pool reports an unchanged verdict.
-    std::pair<SweepRetainClass, uint64_t> topRetainReason() const;
-};
 
 /// Per-namespace pre-precommit orphan sweep. Deletes
 /// manifest bodies written before `PrecommitAdd` and never named by any live owner, scoped to ONE
@@ -213,43 +155,5 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
 /// an admission derived from any observation stays true afterwards, which is what lets a page judge
 /// every build of a namespace against one read.
 bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
-
-/// Plan one cursor page without deleting. A key is decided from key-derived facts first; only a
-/// candidate's body is read, after the catalog cut, then decoded and identity-validated; its exact
-/// manifest-source edges are returned for accounting-neutral retirement in the next fold.
-/// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its
-/// frozen catalog cut and the exact `_ckpt` frontier of the life named there.
-///
-/// `nomination_budget` is a candidate budget: the page stops deciding once it has that many
-/// candidates, and reads exactly that many bodies at most. `work_budget`, when set, additionally
-/// caps how many DISTINCT namespaces this page may build a fresh protection view for, and caps the
-/// committed-tail recovery walk's ref-log GET
-/// count cumulatively across the round (shared with every other destructive-work family via the same
-/// `GcRoundWorkBudget` instance). Exhausting either cap retains every remaining candidate belonging to
-/// the affected namespace on THIS page rather than deciding it without a complete protection view;
-/// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
-///
-/// `listed_server_roots` and `listed_ref_logs` are what the round's own LISTs already returned: the
-/// server-root ids under `gc/server-roots/` that have a `/mount` key (phase 3), and the log ids under
-/// `cas/ns/stream/` per physical life (phase 4). The page asks neither listing for completeness. The
-/// first chooses which mount keys a floor lookup reads; the second chooses which ref-log ids a walk may
-/// hint, so a walk never prefetches the positions past an epoch's seal that do not exist.
-///
-/// `read_pool` and `read_concurrency` (default `nullptr`/1, i.e. every read inline on the caller's
-/// operation) drive the page's read-ahead: with a pool and a concurrency above one, the candidates'
-/// bodies and the catalog-recovery/committed-tail ref-log walks overlap their round trips on `read_pool`
-/// instead of serializing request by request. Every decision this function makes is unchanged by that
-/// choice; see `GcReadAhead` for what may be fetched early and why.
-ManifestSweepResult planManifestCursorPage(
-    Pool & store,
-    const String & cursor,
-    uint64_t list_budget,
-    uint64_t nomination_budget,
-    bool catalog_recovery_authoritative,
-    const std::set<String> & listed_server_roots,
-    const std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> & listed_ref_logs,
-    GcRoundWorkBudget * work_budget = nullptr,
-    ThreadPool * read_pool = nullptr,
-    size_t read_concurrency = 1);
 
 }

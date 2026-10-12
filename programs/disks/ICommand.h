@@ -134,8 +134,6 @@ DB::CommandPtr makeCommandGetCurrentDiskAndPath();
 DB::CommandPtr makeCommandHelp(const DisksApp & disks_app);
 DB::CommandPtr makeCommandTouch();
 DB::CommandPtr makeCommandFsck();
-DB::CommandPtr makeCommandCaGcDryRun();
-DB::CommandPtr makeCommandCaGcRebuild();
 DB::CommandPtr makeCommandCaInspect();
 DB::CommandPtr makeCommandCaDropMember();
 DB::CommandPtr makeCommandReadChecksums();

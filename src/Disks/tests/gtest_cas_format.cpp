@@ -21,10 +21,10 @@ TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
 {
     const std::set<std::string_view> expected{
         "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
-        "cas_ref_ckpt", "cas_ref_catalog", "cas_gc_maintenance_state", "cas_part_manifest",
-        "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb", "cas_gc_outcomes",
+        "cas_ref_ckpt", "cas_ref_catalog", "cas_part_manifest",
+        "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb",
         "cas_owner", "cas_epoch", "cas_mount_lease", "cas_part_files"};
-    ASSERT_EQ(expected.size(), 18u);
+    ASSERT_EQ(expected.size(), 16u);
 
     std::set<std::string_view> actual;
     for (const auto id : allRegisteredFormatIds())

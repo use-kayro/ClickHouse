@@ -324,7 +324,7 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 /// applies everywhere at once -- but the callers deliberately pass DIFFERENT `cadence_ms` values, so
 /// the resulting thresholds are close, not identical: the startup reopen wait below passes half the
 /// renewal period (`max(1, floor(mount_renew_period_ms / 2))`), while GC's heartbeat fence-out
-/// (`Gc/CasGc.cpp`) passes the full renewal period. `cadence_ms` is the caller's own poll or
+/// (`Gc/CasKeeperGc.cpp`) passes the full renewal period. `cadence_ms` is the caller's own poll or
 /// heartbeat interval; the additional interval accounts for observation discreteness, while
 /// `ttl_ms / 20` allows for a five-percent clock-rate difference.
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
@@ -346,7 +346,7 @@ MountClaimResult claimMountAwaitingExpiry(
     const CasEventSink & sink = {});
 
 /// One `server_root_id`'s cross-round incarnation-stability observation,
-/// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
+/// owned by the GC leader instance (`Cas::KeeperGc::mount_obs`) and threaded through consecutive
 /// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
 /// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
 /// tight poll loop.
@@ -389,7 +389,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
 /// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
 /// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
-/// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
+/// leader instance, `Cas::KeeperGc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails

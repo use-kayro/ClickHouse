@@ -262,19 +262,6 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
 
             break;
         }
-        case Type::CAS_GC_REBUILD:
-        {
-            /// FORCE precedes the required disk name: SYSTEM CAS GC REBUILD
-            /// [FORCE] <disk>.
-            if (cas_gc_rebuild_force)
-                print_keyword(" FORCE");
-            if (!disk.empty())
-            {
-                ostr << ' ';
-                print_identifier(disk);
-            }
-            break;
-        }
         case Type::CAS_DROP_POOL_MEMBER:
         {
             /// SYSTEM CAS DROP POOL MEMBER <srid> FROM DISK <disk> -- both required, both

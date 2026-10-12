@@ -1611,7 +1611,7 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
-/// fix-round F7 (author-review: `Gc::mount_obs` not pruned for srids gone from LIST -> slow unbounded
+/// fix-round F7 (author-review: `KeeperGc::mount_obs` not pruned for srids gone from LIST -> slow unbounded
 /// growth on a long-lived leader, worsened by pool-member decommission). A srid whose `/mount` key is
 /// removed ENTIRELY (not merely fenced/terminated -- those already `obs.erase` themselves mid-loop) is
 /// never visited by a later LIST pass again, so its observation entry must be pruned at end-of-round,

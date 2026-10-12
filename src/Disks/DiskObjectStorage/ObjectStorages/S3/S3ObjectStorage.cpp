@@ -690,7 +690,7 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     /// GCS has no `DeleteObjects`: a capability the config declared false, or that an earlier batch
     /// attempt on this same storage already learned false, must not be retried here. This storage never
     /// loops over `objects` itself to work around it -- a CAS caller admits one request per physical
-    /// delete (see `ObjectStorageBackend::removeManyWriteOnce` and its own caller in CasGc.cpp), which an
+    /// delete (see `ObjectStorageBackend::removeManyWriteOnce`), which an
     /// internal loop over more than one object, running under a SINGLE admission, cannot be. Report the
     /// absence of the capability instead, and let that caller decide how to retry.
     if (auto support_batch_delete = s3_capabilities.isBatchDeleteSupported();

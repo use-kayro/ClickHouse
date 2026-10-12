@@ -38,13 +38,11 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::RefSnapshot:
         case FormatId::RefCkpt:
         case FormatId::RefCatalog:
-        case FormatId::GcMaintenanceState:
         case FormatId::PoolMeta:
         case FormatId::MountLease:
         case FormatId::Blob:
         case FormatId::GcState:
         case FormatId::Roster:
-        case FormatId::GcOutcomes:
         case FormatId::PartManifest:
         case FormatId::PartFiles:
         case FormatId::RunFile:
@@ -124,7 +122,6 @@ constexpr FormatTraits TRAITS[] =
     /// 4 KiB, and `encodeRefCatalog` REFUSES that entry (`LIMIT_EXCEEDED`, `CasRefCatalogFormat.cpp`'s
     /// `checkLineBytes`) rather than writing an object no reader could later decode.
     {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
-    {FormatId::GcMaintenanceState, "cas_gc_maintenance_state", TextFamily::Control, KeyStrictness::Strict, CompressionPolicy::Never, 512 * kKiB, 512 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`). The caps only bound
     /// decoding (the manifest's); what bounds a record in practice is Keeper's request size.
@@ -133,7 +130,6 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},
     {FormatId::GcState,      "cas_gc_state",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::GcHeartbeat,  "cas_gc_hb",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::GcOutcomes,   "cas_gc_outcomes",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::Owner,        "cas_owner",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},

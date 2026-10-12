@@ -1046,18 +1046,9 @@ BlockIO InterpreterSystemQuery::execute()
         {
             /// A manual GC RUN executes REGARDLESS of SYSTEM CAS GC STOP: STOP pauses only the
             /// background PACER, not the GC engine, so an explicit operator round still runs (explicit intent
-            /// wins). A round that acquires the lease sets the disk's in-process is_leader=true, which its
-            /// introspection can surface transiently even while the background scheduler stays stopped —
-            /// until a peer mounter steals the lease or GC START resumes pacing. This is truthful (the round
-            /// DID lead) and harmless (no background thread acts on it while stopped).
+            /// wins).
             getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_RUN);
             result = runContentAddressedGcRun(query.disk);
-            break;
-        }
-        case Type::CAS_GC_REBUILD:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_REBUILD);
-            result = runContentAddressedGcRebuild(query.disk, query.cas_gc_rebuild_force);
             break;
         }
         case Type::CAS_FSCK:
@@ -2360,26 +2351,14 @@ ColumnsDescription contentAddressedGcRoundColumns()
 {
     return ColumnsDescription{NamesAndTypesList{
         {"disk", std::make_shared<DataTypeString>()},
-        {"acquired_lease", std::make_shared<DataTypeUInt8>()},
-        {"deferred", std::make_shared<DataTypeUInt8>()},
+        {"writer", std::make_shared<DataTypeUInt8>()},
         {"round", std::make_shared<DataTypeUInt64>()},
-        {"candidates_marked", std::make_shared<DataTypeUInt64>()},
+        {"objects_condemned", std::make_shared<DataTypeUInt64>()},
         {"objects_deleted", std::make_shared<DataTypeUInt64>()},
         {"objects_absent", std::make_shared<DataTypeUInt64>()},
         {"objects_replaced", std::make_shared<DataTypeUInt64>()},
         {"objects_spared", std::make_shared<DataTypeUInt64>()},
-        {"manifests_deleted", std::make_shared<DataTypeUInt64>()},
-        {"entries_condemned", std::make_shared<DataTypeUInt64>()},
-        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
-        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
-        {"anomalies", std::make_shared<DataTypeUInt64>()},
-        /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
-        /// this round's single CAS just published -- see `Cas::RoundReport`'s field comments. Zero on a
-        /// non-authoritative row (!acquired_lease or deferred), same as every other counter above.
-        {"pending_candidates", std::make_shared<DataTypeUInt64>()},
-        {"pending_condemned", std::make_shared<DataTypeUInt64>()},
-        {"pending_retired", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2387,64 +2366,14 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
 {
     size_t i = 0;
     res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.acquired_lease));
-    res_columns[i++]->insert(static_cast<UInt8>(rep.deferred));
+    res_columns[i++]->insert(static_cast<UInt8>(rep.writer));
     res_columns[i++]->insert(rep.round);
-    res_columns[i++]->insert(rep.candidates);
+    res_columns[i++]->insert(rep.condemned);
     res_columns[i++]->insert(rep.deleted);
     res_columns[i++]->insert(rep.absent);
     res_columns[i++]->insert(rep.replaced);
     res_columns[i++]->insert(rep.spared);
-    res_columns[i++]->insert(rep.manifests_deleted);
-    res_columns[i++]->insert(rep.condemned);
-    res_columns[i++]->insert(rep.graduated);
-    res_columns[i++]->insert(rep.redeleted);
     res_columns[i++]->insert(rep.fence_outs);
-    res_columns[i++]->insert(rep.anomalies.size());
-    res_columns[i++]->insert(rep.pending_candidates);
-    res_columns[i++]->insert(rep.pending_condemned);
-    res_columns[i++]->insert(rep.pending_retired);
-}
-
-ColumnsDescription contentAddressedGcRebuildColumns()
-{
-    return ColumnsDescription{NamesAndTypesList{
-        {"disk", std::make_shared<DataTypeString>()},
-        {"performed", std::make_shared<DataTypeUInt8>()},
-        {"round", std::make_shared<DataTypeUInt64>()},
-        {"generation", std::make_shared<DataTypeUInt64>()},
-        {"namespaces", std::make_shared<DataTypeUInt64>()},
-        {"shards", std::make_shared<DataTypeUInt64>()},
-        {"committed_refs", std::make_shared<DataTypeUInt64>()},
-        {"live_precommits", std::make_shared<DataTypeUInt64>()},
-        {"unowned_alive_manifests", std::make_shared<DataTypeUInt64>()},
-        {"edges", std::make_shared<DataTypeUInt64>()},
-        {"clamped_shards", std::make_shared<DataTypeUInt64>()},
-        /// 1 => the rebuild found no fold seal at all and carried NO durable hold forward, having
-        /// concluded from enumeration alone that the pool never sealed a baseline. On a pool that has
-        /// ever completed a GC round this means the object listing lied.
-        {"virgin_by_enumeration", std::make_shared<DataTypeUInt8>()},
-        /// Which generation's fold seal the rebuild carried holds from; 0 when it carried none.
-        {"adopted_seal_generation", std::make_shared<DataTypeUInt64>()},
-    }};
-}
-
-void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const String & disk_name, const Cas::RebuildReport & rep)
-{
-    size_t i = 0;
-    res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.performed));
-    res_columns[i++]->insert(rep.round);
-    res_columns[i++]->insert(rep.generation);
-    res_columns[i++]->insert(rep.namespaces);
-    res_columns[i++]->insert(rep.shards);
-    res_columns[i++]->insert(rep.committed_refs);
-    res_columns[i++]->insert(rep.live_precommits);
-    res_columns[i++]->insert(rep.unowned_alive_manifests);
-    res_columns[i++]->insert(rep.edges);
-    res_columns[i++]->insert(rep.clamped_shards);
-    res_columns[i++]->insert(static_cast<UInt8>(rep.virgin_by_enumeration));
-    res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
 /// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
@@ -2560,45 +2489,6 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRun(const String & disk_nam
         if (ran == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
     }
-
-    size_t num_rows = res_columns[0]->size();
-    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
-    BlockIO result;
-    result.pipeline = QueryPipeline(std::move(source));
-    return result;
-}
-
-BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
-{
-    /// REBUILD requires an EXPLICIT disk (E1): the destructive baseline rebuild must never fan out
-    /// across every content-addressed disk on the node. The parser enforces this syntactically; this is
-    /// the fail-closed backstop for a directly-constructed AST.
-    if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "SYSTEM CAS GC REBUILD requires an explicit disk name");
-
-    auto disk = getContext()->getDisk(disk_name);
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-
-    Cas::RebuildReport rep = ca->runGcRebuildNow(force);   /// synchronous, one rebuild
-    if (!rep.performed)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
-    LOG_INFO(log,
-        "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
-        "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={} "
-        "virgin_by_enumeration={} adopted_seal_generation={}",
-        disk_name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
-        rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards,
-        rep.virgin_by_enumeration, rep.adopted_seal_generation);
-
-    ColumnsDescription columns = contentAddressedGcRebuildColumns();
-    Block sample_block;
-    for (const auto & column : columns)
-        sample_block.insert({column.type->createColumn(), column.type, column.name});
-    MutableColumns res_columns = sample_block.cloneEmptyColumns();
-    appendContentAddressedGcRebuildRow(res_columns, disk_name, rep);
 
     size_t num_rows = res_columns[0]->size();
     auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
@@ -3276,11 +3166,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CAS_GC_RUN:
         {
             required_access.emplace_back(AccessType::SYSTEM_CAS_GC_RUN);
-            break;
-        }
-        case Type::CAS_GC_REBUILD:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_REBUILD);
             break;
         }
         case Type::CAS_DROP_POOL_MEMBER:

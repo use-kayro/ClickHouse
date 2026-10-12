@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <base/scope_guard.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -6,14 +7,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
-#include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
-#include <Common/ThreadPool.h>
 
 #include <atomic>
 #include <chrono>
@@ -35,13 +33,6 @@
 namespace DB::ErrorCodes
 {
 extern const int NETWORK_ERROR;
-}
-
-namespace CurrentMetrics
-{
-extern const Metric LocalThread;
-extern const Metric LocalThreadActive;
-extern const Metric LocalThreadScheduled;
 }
 
 using namespace DB::Cas;
@@ -104,38 +95,45 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage()
     return storage;
 }
 
-/// Completes the first read of `key`, then withholds its return until released, so the round that
-/// issued it is parked with that request already accounted at the backend.
-class ParkFirstReadBackend : public CountingBackend
+/// The record source of one table this server writes, with no part on the disk: a round reads it and
+/// runs as the writer, so it goes on to issue requests after its `keeper_records` phase.
+class WriterWithNoRecords : public DB::ICasKeeperRecordSource
 {
 public:
-    void armParkFirstRead(String key_, std::shared_ptr<Gate> entered_, std::shared_ptr<Gate> release_)
+    DB::CasKeeperRecordSnapshot snapshotCasRecords(const DB::IContentAddressedExchange &) override
     {
-        key = std::move(key_);
-        entered = std::move(entered_);
-        release = std::move(release_);
-        armed.store(true);
+        DB::CasKeeperRecordSnapshot snapshot;
+        snapshot.writer = true;
+        return snapshot;
     }
-
-    std::optional<Raw> read(const String & read_key, TransportAccess & access) override
+    DB::Strings markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override { return {}; }
+    DB::Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> &) override
     {
-        auto result = CountingBackend::read(read_key, access);
-        if (read_key == key && armed.exchange(false))
-        {
-            entered->open();
-            release->wait("release");
-        }
-        return result;
+        return {};
     }
-
-    uint64_t requestsTotal() const { return getTotal() + headTotal() + listTotal() + writeTotal(); }
-
-private:
-    String key;
-    std::shared_ptr<Gate> entered;
-    std::shared_ptr<Gate> release;
-    std::atomic<bool> armed{false};
 };
+
+KeeperRecordTablesFn writerSources()
+{
+    return [source = std::make_shared<WriterWithNoRecords>()]
+    {
+        DB::CasKeeperRecordSnapshot snapshot;
+        snapshot.writer = true;
+        return std::optional<KeeperRecordTables>(KeeperRecordTables{{source, snapshot}});
+    };
+}
+
+/// The disk's tables, as a provider: one table this server writes, with no part on the disk.
+std::optional<std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>> oneWriterTable(const DB::IContentAddressedExchange &)
+{
+    static const auto source = std::make_shared<WriterWithNoRecords>();
+    return std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>{source};
+}
+
+uint64_t requestsTotal(const CountingBackend & backend)
+{
+    return backend.getTotal() + backend.headTotal() + backend.listTotal() + backend.writeTotal();
+}
 
 /// A thread-safe sink for the scheduler's rows, with a wait that never sleeps.
 class RoundLogSink
@@ -290,30 +288,6 @@ TEST(CASGCTeardownStop, OpenPlaneSleepReturnsAtOnceOnceTeardownBegan)
         << "resetting the retry-sleep seam left the open plane on the plain sleep";
 }
 
-/// A read-ahead worker resumes under the plane's generation and is refused at its first gate; the
-/// fold learns it at the take site. An unconsumed future has its exception dropped by the read-ahead's
-/// destructor, so the test consumes it.
-TEST(CASGCTeardownStop, ReadAheadWorkerIsRefusedAndTheTakeSiteSeesIt)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPlainPool(backend);
-    {
-        CasOperation op = store->openRequests().admit();
-        orThrow(op.create("p/k1", "one", Retry::once()), "create");
-    }
-    ThreadPool pool{CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
-                    CurrentMetrics::LocalThreadScheduled,
-                    /*max_threads*/ 2, /*max_free_threads*/ 2, /*queue_size*/ 0};
-    CasOperation op = store->openRequests().admit();
-    GcReadAhead reads(op, store->openRequests(), pool, /*concurrency=*/2);
-
-    store->beginTeardown();
-    backend->resetCounts();
-    reads.hintRead("p/k1");
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)reads.takeRead("p/k1"); });
-    EXPECT_EQ(backend->getTotal(), 0u) << "the worker was refused before it reached the backend";
-}
-
 /// The defect itself: `shutdown` waits behind `gc_scheduler_mutex`, which a synchronous round holds
 /// for its whole duration. After the fix it arms the pool first, the parked round is refused at its
 /// next request, and `shutdown` returns. On the old code the arm never lands while the round is
@@ -323,6 +297,8 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
     auto storage = openTestStorage();
     auto pool = storage->poolForTest();
     ASSERT_TRUE(pool);
+    DB::setCasKeeperRecordSourcesProvider(&oneWriterTable);
+    SCOPE_EXIT({ DB::setCasKeeperRecordSourcesProvider(nullptr); });
 
     auto parked = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
@@ -335,9 +311,9 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
             std::lock_guard lock(rows_mutex);
             rows.push_back(r);
         }
-        /// Park on the `lease` phase row: the round holds `gc_scheduler_mutex` and has more
-        /// requests ahead of it.
-        if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "lease")
+        /// Park on the `keeper_records` phase row: the round holds `gc_scheduler_mutex` and, as the
+        /// writer, has requests ahead of it.
+        if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records")
         {
             parked->open();
             release->wait("release");
@@ -375,20 +351,29 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
 /// the backend after the arm, the Finish row is `Stopped`, and `stop` returns with nothing in flight.
 TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
 {
-    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPlainPool(backend);
     RoundLogSink sink;
-    CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", sink.logger());
-
     auto entered = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
-    backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
+    std::atomic<bool> park{true};
+    CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", writerSources(),
+        [log = sink.logger(), &park, entered, release](const GcRoundLogRecord & r)
+        {
+            log(r);
+            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && park.exchange(false))
+            {
+                entered->open();
+                release->wait("release");
+            }
+        });
+
     sched.start();
     entered->wait("entered");
 
     store->beginTeardown();
-    const uint64_t requests_at_arm = backend->requestsTotal();
+    const uint64_t requests_at_arm = requestsTotal(*backend);
     release->open();
 
     const auto finish = sink.waitForFinish(/*from=*/0, std::chrono::seconds(30));
@@ -396,7 +381,7 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
     EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped);
     sched.stop();
     EXPECT_TRUE(sched.isQuiescent());
-    EXPECT_EQ(backend->requestsTotal(), requests_at_arm)
+    EXPECT_EQ(requestsTotal(*backend), requests_at_arm)
         << "after the arm no request may reach the backend: the round unwinds at the next gate";
     EXPECT_EQ(countStarts(sink.all()), 1u) << "no further round started after the arm";
 }
@@ -405,17 +390,26 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
 /// flag once it holds the round mutex, before it logs anything.
 TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
 {
-    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPlainPool(backend);
     RoundLogSink sink;
-    /// An hour-long interval: the loop ticks only when asked.
-    CasGcScheduler sched(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
-    sched.start();
-
     auto entered = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
-    backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
+    std::atomic<bool> park{true};
+    /// An hour-long interval: the loop ticks only when asked.
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "test::gc", "ca", writerSources(),
+        [log = sink.logger(), &park, entered, release](const GcRoundLogRecord & r)
+        {
+            log(r);
+            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && park.exchange(false))
+            {
+                entered->open();
+                release->wait("release");
+            }
+        });
+    sched.start();
+
     auto manual = std::async(std::launch::async,
                              [&sched] { return sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual); });
     entered->wait("entered");
@@ -429,56 +423,4 @@ TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
     sched.stop();
     const auto rows = sink.all();
     EXPECT_EQ(countStarts(rows), 1u) << "the queued tick minted a Start row after teardown began";
-}
-
-namespace
-{
-
-/// Arms the pool's teardown the first time a chosen prefix is listed, so the stop lands inside the
-/// namespace janitor's page rather than in the round's own request chain.
-class ArmOnJanitorListBackend : public CountingBackend
-{
-public:
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
-    {
-        auto page = CountingBackend::list(prefix, cursor, limit, access);
-        if (!arm_prefix.empty() && prefix == arm_prefix && on_list)
-        {
-            on_list();
-            on_list = {};
-        }
-        return page;
-    }
-
-    String arm_prefix;
-    std::function<void()> on_list;
-};
-
-}
-
-/// A stop that lands inside advisory work the round swallows is not `Stopped`: the deferred path
-/// runs the namespace janitor's page and returns normally, and the janitor turns a refused request
-/// into an anomaly. The row is `Deferred`; the round did finish. Pinned so a later change to this
-/// behaviour is made on purpose.
-TEST(CASGCTeardownStop, AStopInsideTheJanitorPageIsSwallowedAsDeferred)
-{
-    auto backend = std::make_shared<ArmOnJanitorListBackend>();
-    auto store = DB::Cas::tests::openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
-    DB::Cas::tests::writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    DB::Cas::tests::writeManifestRaw(*backend, store->layout(), ns, r,
-                                     {DB::Cas::tests::blobEntryFor("a", DB::UInt128(1))});
-    DB::Cas::tests::publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-
-    Gc gc(store, DB::UInt128(0xAB));
-    const RoundReport fold_rep = gc.runRegularRound();
-    ASSERT_FALSE(fold_rep.deferred) << "the first round folds";
-
-    backend->arm_prefix = store->layout().namespaceRootPrefix();
-    backend->on_list = [&store] { store->beginTeardown(); };
-    RoundReport rep;
-    EXPECT_NO_THROW(rep = gc.runRegularRound()) << "the janitor page swallows the refusal";
-    EXPECT_TRUE(store->teardownBegun()) << "sanity: the arm landed inside the round";
-    EXPECT_TRUE(rep.deferred) << "an idle second round defers; the stop inside its janitor page is advisory";
 }

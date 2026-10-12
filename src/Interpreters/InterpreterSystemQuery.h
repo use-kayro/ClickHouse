@@ -75,7 +75,6 @@ private:
     void syncMerges();
 
     BlockIO runContentAddressedGcRun(const String & disk_name);
-    BlockIO runContentAddressedGcRebuild(const String & disk_name, bool force);
 
     BlockIO runContentAddressedFsck(const String & disk_name);
     void contentAddressedForget(const String & disk_name);
