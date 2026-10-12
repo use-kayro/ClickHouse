@@ -69,7 +69,8 @@ void addCasPartRecordOps(
 
 /// `CasKeeperRecordSourcesProvider` (installed by `registerStorageMergeTree`): the replicated tables in
 /// `DatabaseCatalog` with a disk that is `disk`; nullopt when a table on `disk` is not replicated (no records:
-/// its blobs are unknown), or some table is not loaded yet or detached (its records are not read).
+/// its blobs are unknown), or some table is detached (its records are not read). Waits for the tables still
+/// loading or starting up.
 std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRecordSourcesOnDisk(const IContentAddressedExchange & disk);
 
 /// The one multi-op that removes the record of `part` (at `<zookeeper_path>/cas_parts/<part>`, at
