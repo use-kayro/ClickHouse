@@ -190,7 +190,7 @@ Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dent
 
 `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, construída de `023e6c4` em 12/10 e enviada ao ECR às 02:52Z.
 
-- Link ThinLTO: 79 min a 3.000 IOPS, limitado pelo swap (precisou de 96 GB num host de 61 GB).
+- Link ThinLTO: ~79 min a 3.000 IOPS, com outra carga (containers do ensaio) no mesmo host; precisou de 96 GB de memória num host de 61 GB.
 - `compare-features.py`: idêntico ao build do passo 1.
 - Harness fault/RLS: passou.
 

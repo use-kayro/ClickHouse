@@ -12,7 +12,7 @@ Algumas remoções do PR #6 mudam o que o operador vê e o que sobe (abaixo). A 
 | PR #6 | https://github.com/use-kayro/ClickHouse/pull/6 (branch `kayro/keeper-gc-dead`), head `cc9ed8dc`; commits `84a60480` e `cc9ed8dc` (revisão `/enxuto`) |
 | PR #8 | https://github.com/use-kayro/ClickHouse/pull/8 (branch `kayro/record-part-removal`), merge `7bcf86c`, 12/10 04:14:44Z; C++ em `fe7ed58`, testes em `7dccdf0` |
 | Base | passo 2 (merge `59caa36`, código `023e6c4`) |
-| Imagem | `TODO` |
+| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`, de `a6355a99` |
 | Linear | TEC-850 (PR #6), TEC-849 (PR #8) |
 | Em produção | nenhum nó |
 
@@ -107,4 +107,10 @@ O build ThinLTO de release, a paridade de features, o harness fault/RLS na image
 
 ## Imagem de release
 
-Digest: `TODO`.
+`474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`, construída do commit `a6355a9986b8c9caaef7829a8873168e89859c2a`.
+
+- `compare-features.py`: idêntico ao build do passo 2 (`023e6c4`): 76 build_options, 1.842 funções, 114 formatos, 81 engines, 91 table functions, 1.713 settings.
+- Link ThinLTO: ~57 min a 16.000 IOPS num host sem outra carga (primeira fase ~50 min em uma thread, ~58 GB de RSS; segunda fase ~6 min multi-thread com swap, pico de 45,8 GB de swap). O build do passo 2 levou ~79 min a 3.000 IOPS com outra carga no host. A diferença não é atribuída ao IOPS: na fase de swap o disco leu só ~1.600/s.
+- Harness fault/RLS nesta imagem: não registrado.
+
+Deploy: não registrado ainda.
