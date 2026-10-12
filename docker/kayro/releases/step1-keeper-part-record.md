@@ -2,7 +2,9 @@
 
 A metadata de uma parte num disco CAS passa a existir também no Keeper, num registro por parte. Uma réplica consegue anexar a parte a partir desse registro e dos blobs do pool, sem buscar nada do writer e sem escrever ou listar no S3. O writer continua gravando toda a metadata S3 de hoje: nada sai do caminho S3 neste passo.
 
-**A imagem de release existe; o portão dela está em andamento.** Ela foi construída do head do PR #2, `283ca096`, que corrige um bug P0 e uma lacuna achados depois do portão de `1df4e77` (abaixo). O PR continua aberto. A imagem só é candidata depois do `BUILD_COMPLETE` com todos os passos verdes.
+**A imagem de release passou no portão (gate verde 12/10 00:46Z).** Ela foi construída do head do PR #2, `283ca096`, que corrige um bug P0 e uma lacuna achados depois do portão de `1df4e77` (abaixo). O PR continua aberto.
+
+3a (writer only) iniciado 12/10 ~01:10Z; readers permanecem em RC3.
 
 | Campo | Valor |
 |---|---|
@@ -10,11 +12,11 @@ A metadata de uma parte num disco CAS passa a existir também no Keeper, num reg
 | Branch | `kayro/keeper-part-manifest` |
 | Head | `283ca09658a4c0e405106342362c0c3b864ed4b8` (11/10 22:17Z), sobre o RC3 (`9700e6e`) |
 | Commit com portão verde | `1df4e77c7357a2bd25475fa574a3713d1b74e5a5`, sobre o RC2 (`294ea1e`), **sem** o RC3 |
-| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`, de `283ca096`. Portão: em andamento quando isto foi escrito |
+| Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`, de `283ca096`. Gate verde 12/10 00:46Z (início exato do build não registrado) |
 | Linear | TEC-849 (In Review); perguntas e decisões cruzadas em TEC-850 e TEC-851 |
-| Em produção | nenhum nó |
+| Em produção | writer: 3a iniciado 12/10 ~01:10Z. Readers no RC3 |
 
-Os quatro primeiros commits são o patch do portão rebaseado sobre o RC3: `git diff 294ea1e 1df4e77` e `git diff 9700e6e 33ae72d4` dão o mesmo `git patch-id --stable` (`6672380d…`), 33 arquivos, +1851/−136. O quinto, `283ca096`, veio depois do portão. A combinação RC3 + passo 1 nunca foi construída nem testada.
+Os quatro primeiros commits são o patch do portão rebaseado sobre o RC3: `git diff 294ea1e 1df4e77` e `git diff 9700e6e 33ae72d4` dão o mesmo `git patch-id --stable` (`6672380d…`), 33 arquivos, +1851/−136. O quinto, `283ca096`, veio depois desse portão; a imagem de release de `283ca096` (RC3 + passo 1) passou no portão próprio em 12/10 00:46Z.
 
 | Commit (head) | Antes do rebase (base RC2) | O que faz |
 |---|---|---|
@@ -22,7 +24,7 @@ Os quatro primeiros commits são o patch do portão rebaseado sobre o RC3: `git 
 | `93f08d59` | `2b4d64b7` | revisão `/enxuto`: o registro é o manifest publicado da parte |
 | `635347f7` | `5b80492b` | `Fetcher` lê o registro pelo cliente Keeper da tabela, pelo nome |
 | `33ae72d4` | `1df4e77c` | commit de fetch só confere o registro, nunca cria |
-| `283ca096` | não existe (sem portão) | correções do P0 do REPLACE e da lacuna do relink; produtores com create-if-absent (abaixo) |
+| `283ca096` | não existe (portão próprio verde 12/10 00:46Z) | correções do P0 do REPLACE e da lacuna do relink; produtores com create-if-absent (abaixo) |
 
 ## Regra de produção
 
@@ -138,9 +140,9 @@ Números do laboratório:
 
 Custo dos builders do passo 1 em 11/10: cerca de US$ 5 (3,7 h) na primeira rodada e US$ 2 (1,7 h) na final. Evidência na máquina do operador: `/tmp/cost-plan-600-20261010/tec-849/` (`ev2/` é a rodada final).
 
-**O que o portão não cobre:** o build ThinLTO de release, a paridade de features, a imagem no ECR e a combinação com o RC3.
+**O que este portão de `1df4e77` não cobre:** o build ThinLTO de release, a imagem no ECR e a combinação com o RC3. Isso foi coberto pelo portão da imagem de release de `283ca096` (seção "Imagem de release").
 
-## Achados depois do portão, corrigidos em `283ca096` (sem portão)
+## Achados depois do portão de `1df4e77`, corrigidos em `283ca096`
 
 1. **Bug P0 no REPLACE PARTITION** (achado pelo agente do passo 2 com `test_cas_reader_pin [replace]`, TEC-850, 11/10 22:00Z). `ALTER TABLE … REPLACE PARTITION … FROM …` no writer devolve `LOGICAL_ERROR: Unexpected name of log node: 1_4_4_0` em `tryWaitForReplicaToProcessLogEntry`, **depois** de o multi commitar. Causa: `replacePartitionFrom` lê o nó de log em `op_results.back()` (`StorageReplicatedMergeTree.cpp:10062`), mas o passo 1 acrescenta os creates de registro (`addCasPartRecordOps`, `:10019`) depois do `log/log-`. Correção mínima: guardar o índice do create de `log/log-` ou acrescentar os registros antes dele. Sem isso, o refresh REPLACE das 03–04Z falha no cliente com `alter_sync=1`, embora o dado tenha sido commitado. Em 11/10 22:04Z a decisão registrada foi corrigir no #2. `283ca096` lê a entrada de log pelo índice, não por `op_results.back()`, e acrescenta um teste de regressão de REPLACE PARTITION FROM em `test_cas_keeper_part_manifest`.
 2. **Lacuna do relink** (mesma origem). O commit de uma cópia de parte sem registro (relink de parte legada, parte de MOVE PARTITION TO TABLE antes do backfill) não acrescenta check nenhum; um relink pode commitar uma parte cujo registro e blobs o GC do passo 2 já removeu. Proposta: com `how != Produced` e sem registro, `Check(<source_replica_path>/parts/<p>)`. Também decidido corrigir no #2; `283ca096` faz essa checagem.
@@ -164,6 +166,8 @@ Aceite do 3a (TEC-851): 100 % das partes ativas com `<zk>/cas_parts/<p>`; PUT e 
 
 ## Imagem de release
 
-`build-image.sh 283ca09658a4c0e405106342362c0c3b864ed4b8` produziu `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`. Portão do builder (paridade, fault/RLS, gtests CAS, `test_cas_gc_s3`): em andamento quando isto foi escrito. Se o portão falhar, esta imagem é descartada e o digest muda.
+`build-image.sh 283ca09658a4c0e405106342362c0c3b864ed4b8` produziu `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:250b6ed91ef1b83dedaa8e74efaf0222e344f342404827a9e03fdeef45dacb58`. Gate verde 12/10 00:46Z (início exato do build não registrado): gtests CAS 2.538 passaram / 0 falharam; harness fault/RLS na imagem de release passou; `test_cas_gc_s3` 2/2; `test_cas_keeper_part_manifest` 5/5 (inclui REPLACE PARTITION FROM); `test_cas_replicated_relink` 19/19; `test_cas_gcs_relink_liveness` 1/1; `test_cas_gc_sharded` 1/1; `test_cas_insert_fault_recovery` 1/1; `test_cas_lazy_load_recovery` 1/1.
+
+3a (writer only) iniciado 12/10 ~01:10Z; readers permanecem em RC3.
 
 Rollout: só no writer (`i-02e3809e0b416b25e`), com `configure-image.py` e a guarda de INSERT. Rollback: RC3 `sha256:6469a0c1da2508ba2d01cd04c6870861f94df8f80a68e71f7f6751f1eac6acfa`.
