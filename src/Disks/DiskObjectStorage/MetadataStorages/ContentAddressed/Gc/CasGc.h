@@ -12,12 +12,10 @@ struct RoundReport
 {
     bool writer = false;      /// this server writes every table on the disk: the round ran; otherwise it read only records
     uint64_t round = 0;       /// this process's round number (0 when not the writer)
-    uint64_t condemned = 0;   /// blobs condemned this round (`.meta = Condemned`)
     uint64_t deleted = 0;     /// blobs deleted, exact ETag
-    uint64_t absent = 0;      /// condemned blobs already gone when deleted
-    uint64_t replaced = 0;    /// condemned blobs re-uploaded since (ETag changed): spared
-    uint64_t spared = 0;      /// condemned blobs a listed part references again
-    uint64_t fence_outs = 0;  /// expired mounts fenced out by the heartbeat floor
+    uint64_t absent = 0;      /// candidate blobs already gone when deleted
+    uint64_t replaced = 0;    /// candidate blobs re-uploaded since their ETag was read: kept
+    uint64_t spared = 0;      /// candidate blobs a record references again
 };
 
 /// One phase of one GC round. Pure data with no Interpreters dependency -- the same discipline

@@ -38,16 +38,13 @@ struct GcRoundLogRecord
     Outcome outcome = Outcome::Unknown;   /// Unknown until a round finishes
     Trigger trigger = Trigger::Scheduled;
     String disk_name;
-    String srid;          /// server_root_id of the mount that ran this round (this pool's poolConfig())
     /// The `Cas::RoundReport` of a Finish row.
     bool writer = false;
     UInt64 round = 0;
-    UInt64 objects_condemned = 0;
     UInt64 objects_deleted = 0;
     UInt64 objects_absent = 0;
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
-    UInt64 fence_outs = 0;
     UInt64 duration_ms = 0;
     String error;
     /// `getCurrentExceptionCode()` of the failure on an `Aborted`/`Failed` Finish row; 0 otherwise.
@@ -118,39 +115,24 @@ public:
     /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
     Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
 
-    /// Returns per-disk GC health for `system.cas_mounts`. The fields describing
-    /// rounds snapshot this scheduler's state, while `wedged_namespace_count` is read live from the
-    /// store's ref lanes; keeping the state here avoids process-global gauges colliding across disks.
+    /// Returns per-disk GC health for `system.cas_mounts`, a snapshot of this scheduler's state (kept here so
+    /// process-global gauges do not collide across disks).
     struct GcHealth
     {
         bool is_leader = false;
         bool ever_succeeded = false;
-        Int64 pending_reclaim = 0;             /// blobs condemned and not yet deleted or spared (this process)
+        Int64 pending_reclaim = 0;             /// candidate blobs not deleted yet (`KeeperGc::pendingCount`)
         UInt64 last_success_age_seconds = 0;   /// seconds since the last round that ran as the writer (0 if never)
-        UInt64 wedged_namespace_count = 0;
     };
-    /// Takes a consistent-enough atomic snapshot for diagnostics. The returned counters are local
-    /// health indicators rather than durable GC state, and the wedged-namespace count is queried
-    /// directly from the store.
+    /// Takes a consistent-enough atomic snapshot for diagnostics: local health indicators rather than
+    /// durable GC state.
     GcHealth gcHealth() const;
 
     /// Whether GC is quiescent right now: TRUE iff NO round is currently in flight on this scheduler
     /// (`round_in_flight` is held for the WHOLE round body via `SCOPE_EXIT` in `runRoundLogged`, on both the
-    /// success and the exception path). Used by the `SYSTEM CAS FORGET` / `GC STOP` tests to
+    /// success and the exception path). Used by the `GC STOP` tests to
     /// prove the scheduler's worker threads were joined — no round can be mid-flight once `stop()` returned.
     bool isQuiescent() const { return !round_in_flight.load(std::memory_order_acquire); }
-
-    /// Test seam: force the in-flight-round flag `isQuiescent` reads, so a test can drive
-    /// "running round => not quiescent" without spinning up a real round against a live backend.
-    void setRoundInFlightForTest(bool v) { round_in_flight.store(v, std::memory_order_release); }
-
-    /// Test seam (rev.7 §3 [C1]): block up to `timeout` for the pacing loop to have
-    /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
-    /// opposed to exiting through `stop()`'s `stopping` flag. Returns false on timeout. Predicate-based
-    /// wait (no sleeps); the loop sets its flag under `terminal_exit_mutex` before notifying, so there is
-    /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
-    /// delay.
-    bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
 
 private:
     /// Waits for the configured interval, runs scheduled rounds while the scheduler is active, and
@@ -188,16 +170,8 @@ private:
 
     /// Set true for the whole body of one round (`runRoundLogged`, held across the `gc_round_mutex`
     /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
-    /// success AND exception paths. Read by `isQuiescent` (the FORGET / GC-STOP join-completion signal).
+    /// success AND exception paths. Read by `isQuiescent` (the GC-STOP join-completion signal).
     std::atomic<bool> round_in_flight{false};
-
-    /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop` when it
-    /// SELF-EXITS via the terminal-lifecycle check, NOT when `stop()` flips
-    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for it, so a test proves
-    /// the self-exit path fired without any sleep. Purely diagnostic; production behavior never reads them.
-    std::atomic<bool> loop_exited_on_terminal_for_test{false};
-    std::mutex terminal_exit_mutex;
-    std::condition_variable terminal_exit_cv;
 
     /// `KeeperGc::pendingCount` after the last round.
     std::atomic<Int64> pending_reclaim{0};

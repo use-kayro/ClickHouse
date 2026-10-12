@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasKeeperGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Logger.h>
 
@@ -65,7 +63,7 @@ struct FakeTable : public DB::ICasKeeperRecordSource
 struct CASKeeperGc : public ::testing::Test
 {
     std::shared_ptr<InMemoryBackend> backend = std::make_shared<InMemoryBackend>();
-    PoolPtr store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    PoolPtr store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .mint_pool_meta = true});
     std::shared_ptr<FakeTable> table = std::make_shared<FakeTable>();
     KeeperGc gc{store, [this] { return KeeperRecordTables{{table, table->snapshot}}; }, getLogger("CASKeeperGcTest")};
 
@@ -95,13 +93,6 @@ struct CASKeeperGc : public ::testing::Test
         return (*op).head(store->layout().blobKey(idOf(payload)), Retry::standard()).has_value();
     }
 
-    bool condemned(const String & payload)
-    {
-        DB::Cas::tests::OperationForTest op(*backend);
-        const auto meta = loadMeta(*op, store->layout(), idOf(payload));
-        return meta && meta->meta.state == MetaState::Condemned;
-    }
-
     RoundReport round()
     {
         RoundReport report;
@@ -112,16 +103,13 @@ struct CASKeeperGc : public ::testing::Test
 
 }
 
-TEST_F(CASKeeperGc, MarksAnUnlistedRecordAndCondemnsOnlyWhatNoListedPartReferences)
+TEST_F(CASKeeperGc, MarksAnUnlistedRecordAndWritesNothingToThePool)
 {
     addRecord("all_1_1_0", /*listed=*/ false, {"only-dropped", "shared"});
     addRecord("all_2_2_0", /*listed=*/ true, {"shared"});
     const RoundReport report = round();
     EXPECT_TRUE(report.writer);
-    EXPECT_EQ(report.condemned, 1u);
     EXPECT_EQ(table->record("all_1_1_0").version, 1);
-    EXPECT_TRUE(condemned("only-dropped"));
-    EXPECT_FALSE(condemned("shared"));
     EXPECT_TRUE(blobExists("only-dropped"));
 }
 
@@ -151,31 +139,37 @@ TEST_F(CASKeeperGc, KeepsTheBlobsOfARecordItsTableDidNotRemove)
     EXPECT_TRUE(blobExists("both"));
 }
 
-TEST_F(CASKeeperGc, WaitsForEveryBuildThatExistedAtCondemnation)
+/// The delete half of `BlobRefCount`'s invariant: a blob a part this server holds (or builds) references is
+/// not deleted, though no record references it any more; it stays pending until released.
+TEST_F(CASKeeperGc, KeepsABlobThisServerStillHoldsUntilReleased)
 {
-    PartWriteInfo info;
-    info.intended_ref = "test/tbl/all_9_9_0";
-    auto build = store->beginPartWrite(info);   /// may have adopted the blob before its marker
     addRecord("all_1_1_0", /*listed=*/ false, {"dropped"});
+    store->blobRefs()->add({idOf("dropped")});
     round();
-    round();
-    EXPECT_TRUE(table->has("all_1_1_0"));
-    EXPECT_TRUE(blobExists("dropped"));
-
-    build.reset();   /// abandoned: its sequence retires
     round();
     EXPECT_FALSE(table->has("all_1_1_0"));
+    EXPECT_TRUE(blobExists("dropped"));
+    EXPECT_EQ(gc.pendingCount(), 1u);
+
+    store->blobRefs()->release({idOf("dropped")});
+    const RoundReport report = round();
+    EXPECT_EQ(report.deleted, 1u);
     EXPECT_FALSE(blobExists("dropped"));
+    EXPECT_EQ(gc.pendingCount(), 0u);
 }
 
-TEST_F(CASKeeperGc, SparesABlobAListedPartReferencesAgain)
+/// A pending candidate a record references again (a part with the same content committed meanwhile) leaves
+/// the pipeline.
+TEST_F(CASKeeperGc, SparesAPendingBlobARecordReferencesAgain)
 {
     addRecord("all_1_1_0", /*listed=*/ false, {"dropped"});
+    store->blobRefs()->add({idOf("dropped")});
     round();
-    table->record("all_1_1_0").listed = true;   /// a lagging replica attached it
+    round();
+    ASSERT_EQ(gc.pendingCount(), 1u);
+    addRecord("all_3_3_0", /*listed=*/ true, {"dropped"});
     const RoundReport report = round();
     EXPECT_EQ(report.spared, 1u);
     EXPECT_EQ(gc.pendingCount(), 0u);
-    EXPECT_TRUE(table->has("all_1_1_0"));
     EXPECT_TRUE(blobExists("dropped"));
 }

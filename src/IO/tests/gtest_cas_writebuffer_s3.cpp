@@ -1098,17 +1098,6 @@ TEST_F(CASWBS3Test, S3RequestAttemptSeedPutHeadDeleteCarryTheSeed)
         StoredObject("seeded-delete-key"), "etag-1", ObjectStorageControlRequest{.attempt_number = 3});
     ASSERT_EQ(delete_client->attempts_seen.size(), 1u);
     EXPECT_EQ(delete_client->attempts_seen.front(), 3u);
-
-    delete_client->attempts_seen.clear();
-    delete_object_storage->removeObjectsIfExistUnderProfile({StoredObject("unseeded-bulk-key")}, ObjectStorageControlRequest{});
-    ASSERT_EQ(delete_client->attempts_seen.size(), 1u);
-    EXPECT_FALSE(delete_client->attempts_seen.front().has_value());
-
-    delete_client->attempts_seen.clear();
-    delete_object_storage->removeObjectsIfExistUnderProfile(
-        {StoredObject("seeded-bulk-key")}, ObjectStorageControlRequest{.attempt_number = 3});
-    ASSERT_EQ(delete_client->attempts_seen.size(), 1u);
-    EXPECT_EQ(delete_client->attempts_seen.front(), 3u);
 }
 
 TEST_F(CASWBS3Test, S3RequestAttemptSeedListPagesCarryTheSeed)

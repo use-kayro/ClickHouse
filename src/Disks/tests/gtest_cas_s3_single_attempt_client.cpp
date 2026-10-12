@@ -317,8 +317,7 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapSnapshot)
     DB::Cas::CasRequestBudget budget{.attempt_timeout_ms = 5000, .connect_timeout_cap_ms = cap};
     EXPECT_EQ(budget.attemptEnvelopeMs(), 7000u);
 
-    /// A base client with connectTimeoutMs = 0 (Poco "unbounded") and a TTL wide enough for the
-    /// resulting envelope (60000, per the spec's test 6e): the cap normalizes to the attempt timeout
+    /// A base client with connectTimeoutMs = 0 (Poco "unbounded"): the cap normalizes to the attempt timeout
     /// itself, never to "no limit" -- a snapshot computing `min(0, attempt)` would report 0 here.
     auto unbounded_storage = makeStorageForTest(0);
     const auto wide_cap = DB::ContentAddressedMetadataStorage::freezeConnectTimeoutCapMs(unbounded_storage, /*cas_attempt_timeout_ms=*/5000);
@@ -326,8 +325,6 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapSnapshot)
     EXPECT_EQ(*wide_cap, 5000u);
     DB::Cas::CasRequestBudget wide_budget{.attempt_timeout_ms = 5000, .connect_timeout_cap_ms = wide_cap};
     EXPECT_EQ(wide_budget.attemptEnvelopeMs(), 15000u);
-    EXPECT_NO_THROW(DB::Cas::validateCasRequestBudget(wide_budget, /*mount_lease_ttl_ms=*/60000, /*mount_renew_period_ms=*/10000,
-                                                      /*background_renewal=*/false));
 
     /// A storage with no S3 client (not exercised here -- every storage above is S3) freezes `nullopt`;
     /// covered directly by `S3ObjectStorage::tryGetS3StorageClient` returning null for a non-S3 storage
@@ -429,33 +426,6 @@ TEST(CASEnvelopeWiring, ProductionDispatchSelectsTheFrozenSingleAttemptClientPer
         server.resetRequestsSeen();
         EXPECT_THROW(
             storage->removeObjectIfTokenMatches(DB::StoredObject("delete-key"), "\"etag\"", singleAttemptRequest()),
-            DB::Exception);
-        EXPECT_EQ(server.requestsSeen(), 1u);
-    }
-
-    /// Bulk DELETE: removeObjectsIfExistUnderProfile (one DeleteObjects request for the whole batch).
-    {
-        DelayedResponseServer server(server_delay, [](Poco::Net::HTTPServerResponse & response)
-        {
-            static const std::string body =
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-                "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></DeleteResult>";
-            response.setContentType("application/xml");
-            response.setContentLength(body.size());
-            response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
-            auto & out = response.send();
-            out << body;
-            out.flush();
-        });
-        auto storage = makeDispatchStorageForTest(server.getUrl(), base_request_timeout_ms);
-
-        EXPECT_NO_THROW(storage->removeObjectsIfExistUnderProfile(
-            {DB::StoredObject("bulk-delete-key")}, DB::ObjectStorageControlRequest{}));
-        EXPECT_EQ(server.requestsSeen(), 1u);
-
-        server.resetRequestsSeen();
-        EXPECT_THROW(
-            storage->removeObjectsIfExistUnderProfile({DB::StoredObject("bulk-delete-key")}, singleAttemptRequest()),
             DB::Exception);
         EXPECT_EQ(server.requestsSeen(), 1u);
     }

@@ -14,6 +14,8 @@ def start_cluster():
         "node",
         main_configs=["configs/storage_conf.xml"],
         with_rustfs=True,
+        with_zookeeper=True,
+        keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
         stay_alive=True,
     )
     try:
@@ -24,16 +26,14 @@ def start_cluster():
 
 
 def test_cache_over_ca_startup_and_roundtrip():
-    # Before the fix the server fails to register the cache-over-CA disk (NOT_IMPLEMENTED at
-    # checkAccess), so this whole module fails at cluster.start(). After the fix, startup + a
-    # write/read round-trip succeed.
+    # The cache-over-CA disk registers at startup and serves a write/read round trip.
     node = cluster.instances["node"]
 
     node.query("DROP TABLE IF EXISTS cas_cache_test SYNC")
     node.query(
         """
         CREATE TABLE cas_cache_test (id Int64, data String)
-        ENGINE = MergeTree() ORDER BY id
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/cas_cache_test', 'node') ORDER BY id
         SETTINGS storage_policy = '{}'
         """.format(
             STORAGE_POLICY
@@ -69,7 +69,7 @@ def test_cache_hits_on_repeated_reads():
     node.query(
         """
         CREATE TABLE cas_cache_metrics (id Int64, data String)
-        ENGINE = MergeTree() ORDER BY id
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/cas_cache_metrics', 'node') ORDER BY id
         SETTINGS storage_policy = '{}'
         """.format(
             STORAGE_POLICY

@@ -29,6 +29,7 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_remote_fs_zero_copy_replication;
+    extern const MergeTreeSettingsBool always_fetch_merged_part;
     extern const MergeTreeSettingsBool detach_not_byte_identical_parts;
     extern const MergeTreeSettingsSeconds lock_acquire_timeout_for_background_operations;
     extern const MergeTreeSettingsUInt64 prefer_fetch_merged_part_size_threshold;
@@ -73,6 +74,18 @@ ReplicatedMergeMutateTaskBase::PrepareResult MutateFromLogEntryTask::prepare()
             "Either pool for fetches is starving, see background_fetches_pool_size, or none of active replicas has it",
             source_part_name, entry.new_part_name);
 
+        return PrepareResult{
+            .prepared_successfully = false,
+            .need_to_check_missing_part_in_fetch = true,
+            .part_log_writer = part_log_writer,
+        };
+    }
+
+    /// On a content-addressed pool only the writer writes blobs (TEC-851): there a replica that always fetches
+    /// merged parts fetches mutated ones too.
+    if (source_part->getDataPartStorage().isContentAddressed() && (*storage_settings_ptr)[MergeTreeSetting::always_fetch_merged_part])
+    {
+        LOG_INFO(log, "Will fetch part {} because setting 'always_fetch_merged_part' is true", entry.new_part_name);
         return PrepareResult{
             .prepared_successfully = false,
             .need_to_check_missing_part_in_fetch = true,

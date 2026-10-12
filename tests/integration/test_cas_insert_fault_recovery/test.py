@@ -2,6 +2,7 @@ import time
 
 import pytest
 
+from helpers.cas import join_pool_after_writer
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
@@ -23,7 +24,7 @@ def start_cluster():
     )
     cluster.add_instance(
         "node2",
-        main_configs=["configs/storage_conf.xml", "configs/server_root_id_node2.xml"],
+        main_configs=["configs/reader_role.xml"],
         macros={"replica": "node2"},
         with_rustfs=True,
         with_zookeeper=True,
@@ -33,6 +34,9 @@ def start_cluster():
 
     try:
         cluster.start()
+        join_pool_after_writer(
+            cluster.instances["node2"], cluster.base_dir, ["configs/storage_conf.xml", "configs/server_root_id_node2.xml"]
+        )
         yield cluster
     finally:
         cluster.shutdown()

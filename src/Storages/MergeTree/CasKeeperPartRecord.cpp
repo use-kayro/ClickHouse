@@ -12,7 +12,6 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Databases/IDatabase.h>
 #include <Common/Exception.h>
-#include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 
 #include <filesystem>
@@ -27,11 +26,6 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int NOT_IMPLEMENTED;
-}
-
-namespace FailPoints
-{
-    extern const char cas_part_record_omit[];
 }
 
 String casPartRecordsPath(const String & zookeeper_path)
@@ -79,22 +73,6 @@ void appendChecksummedFiles(const String & prefix, const MergeTreeDataPartChecks
 
 }
 
-std::optional<String> makeCasPartRecord(const IMergeTreeDataPart & part)
-{
-    /// Test-only: commit the part as a build without Keeper records did, so the fetch paths that serve
-    /// parts without a record (relink, bytes) stay exercised.
-    fiu_do_on(FailPoints::cas_part_record_omit, { return std::nullopt; });
-    const auto disk = part.storage.getStoragePolicy()->tryGetDiskByName(part.getDataPartStorage().getDiskName());
-    const auto * ca = tryGetContentAddressedExchange(disk);
-    if (!ca)
-        return std::nullopt;
-    std::vector<CasKeeperBlobFile> checksummed;
-    appendChecksummedFiles("", part.checksums, checksummed);
-    for (const auto & [name, projection] : part.getProjectionParts())
-        appendChecksummedFiles(name + ".proj/", projection->checksums, checksummed);
-    return ca->encodeKeeperPartRecord(part.getDataPartStorage().getRelativePath(), checksummed);
-}
-
 void addCasPartRecordOps(
     const ZooKeeperWithFaultInjectionPtr & zookeeper, const String & zookeeper_path, const IMergeTreeDataPart & part,
     const std::optional<String> & copied_from_replica_path, Coordination::Requests & ops)
@@ -102,24 +80,29 @@ void addCasPartRecordOps(
     if (!part.getDataPartStorage().isContentAddressed())
         return;
     const String path = casPartRecordPath(zookeeper_path, part.name);
-    if (!copied_from_replica_path)
+    if (copied_from_replica_path)
     {
-        auto record = makeCasPartRecord(part);
-        if (!record)
-            return;
-        if (!zookeeper->isFeatureEnabled(KeeperFeatureFlag::CREATE_IF_NOT_EXISTS))
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "Keeper server doesn't have the feature flag CREATE_IF_NOT_EXISTS, required by the Keeper part records of "
-                "content-addressed parts");
-        ops.emplace_back(zkutil::makeCreateRequest(path, *record, zkutil::CreateMode::Persistent, /*ignore_if_exists*/ true));
+        ops.emplace_back(zkutil::makeCheckRequest(path, -1));
         return;
     }
+
     const auto disk = part.storage.getStoragePolicy()->tryGetDiskByName(part.getDataPartStorage().getDiskName());
     const auto * ca = tryGetContentAddressedExchange(disk);
-    if (ca && (ca->isHeldFromKeeper(part.getDataPartStorage().getRelativePath()) || zookeeper->exists(path)))
-        ops.emplace_back(zkutil::makeCheckRequest(path, -1));
-    else
-        ops.emplace_back(zkutil::makeCheckRequest(fs::path(*copied_from_replica_path) / "parts" / part.name, -1));
+    std::vector<CasKeeperBlobFile> checksummed;
+    appendChecksummedFiles("", part.checksums, checksummed);
+    for (const auto & [name, projection] : part.getProjectionParts())
+        appendChecksummedFiles(name + ".proj/", projection->checksums, checksummed);
+    auto record = ca ? ca->encodeKeeperPartRecord(part.getDataPartStorage().getRelativePath(), checksummed) : std::nullopt;
+    if (!record)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Part {} on content-addressed disk {} cannot have a Keeper record (a blob-backed file its checksums do not "
+            "name, or no published part), and a part without one would not survive a restart",
+            part.name, part.getDataPartStorage().getDiskName());
+    if (!zookeeper->isFeatureEnabled(KeeperFeatureFlag::CREATE_IF_NOT_EXISTS))
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Keeper server doesn't have the feature flag CREATE_IF_NOT_EXISTS, required by the Keeper part records of "
+            "content-addressed parts");
+    ops.emplace_back(zkutil::makeCreateRequest(path, *record, zkutil::CreateMode::Persistent, /*ignore_if_exists*/ true));
 }
 
 std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> casKeeperRecordSourcesOnDisk(const IContentAddressedExchange & disk)

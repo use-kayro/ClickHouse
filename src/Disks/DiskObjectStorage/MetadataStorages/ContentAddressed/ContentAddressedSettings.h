@@ -67,17 +67,13 @@ struct ContentAddressedSettings
 
     /// Fail-closed checks: `gc_interval_sec` must be >= 1; `server_root_id` must
     /// be present (an ABSENT key throws a typed `NO_ELEMENTS_IN_CONFIG`, distinct from a
-    /// PRESENT-but-invalid value, which throws `Cas::validateServerRootId`'s `BAD_ARGUMENTS`); and the
+    /// PRESENT-but-invalid value, which throws `BAD_ARGUMENTS`); and the
     /// two enum-valued string settings (`blob_hash`, `staging_backend`) must parse. The parsed enum
     /// values are cached for the typed accessors below.
     void validate();
 
     /// Typed accessors for the enum-valued string settings, parsed and cached by `validate`.
     Cas::BlobHashAlgo blobHashAlgo() const;
-    /// Shared with the generic disk layer, which reads the same unprefixed key and ORs it with the
-    /// server-level flag before the generic access check. This one governs the CAS capability probe
-    /// only; the two scopes are deliberately distinct.
-    bool skipAccessCheck() const;
     Cas::StagingBackend stagingBackend() const;
 
 private:

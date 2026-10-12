@@ -25,35 +25,11 @@ constexpr uint32_t G_BUILD = 1;
 /// retired values remain unused so an old object can never be mistaken for a later class.
 enum class FormatId : uint16_t
 {
-    Blob = 1,
-    /// Values 2, 3, and 4 are retired. The former tree and GC-snapshot classes were replaced by the
-    /// root-local part manifest, while the former mutable `cas_ref_shard` class was replaced by the
-    /// immutable `RefSnapshot` and `RefLog` objects. Keep all three values unused.
-    /// Value 5 (`gc/state`) is retired with the S3-listing GC round, and value 6 (the condemned-state
-    /// object) before it. Value 7 is also retired: the build-watermark floor is carried by the
-    /// `MountLease` beat rather than a standalone object. Keep all three unused.
-    PoolMeta = 8,
-    Roster = 9,
-    /// Value 10 is retired: discovery authority is the pool-wide `cas/ref_catalog` object rather
-    /// than a roots registry object or a physical stream listing. Value 11 (the GC outcome log) is
-    /// retired with the S3-listing GC round. Keep both unused.
-    PartManifest = 12,    /// Immutable root-local `cas_part_manifest` payload-hybrid text object.
-    /// Values 13 (the GC source-edge run), 14 (the fold seal) and 15 are retired with the S3-listing
-    /// GC round. Keep them unused. The following three classes are per-server-root mount-safety objects.
-    Owner = 16,           /// `cas_owner` anchor from server-root ID to server UUID.
-    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch`.
-    MountLease = 18,      /// Live `cas_mount_lease` object.
-    /// These identifiers cover objects that were added to the registry after their initial codecs:
-    /// the ref transaction log, complete ref snapshot and blob freshness sidecar. Their values are
-    /// frozen and must never be reused. Value 22 (the GC heartbeat) is retired with the S3-listing GC
-    /// round. Keep it unused.
-    RefLog = 19,          /// cas_ref_log     — ref transaction log object
-    RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
-    BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
-    RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
-    RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
-    /// Value 25 (the namespace-janitor cursor) is retired with the S3-listing GC round. Keep it unused.
-    PartFiles = 26,       /// cas_part_files  — a part's Inline entries, held in Keeper (`<zookeeper_path>/cas_parts/<part>`)
+    Blob = 1,             /// cas_blob        -- the blob envelope
+    PoolMeta = 8,         /// cas_pool_meta   -- `_pool_meta`, the pool's identity object
+    PartFiles = 26,       /// cas_part_files  -- a part's Inline entries, held in Keeper (`<zookeeper_path>/cas_parts/<part>`)
+    /// Every other value up to 26 belonged to a retired class (trees, GC state, ref logs/snapshots/
+    /// checkpoints/catalog, part manifests, mount-safety objects, blob sidecars, the roster). Never reuse one.
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer
@@ -89,7 +65,7 @@ struct FormatChangePoint
 std::span<const FormatChangePoint> changePoints(FormatId id);
 
 /// The text-format registry has one row per decodable persisted object. Each row is the single source
-/// for the header-line `type`, body family, unknown-key policy, compression policy, and fail-closed
+/// for the header-line `type`, body family, unknown-key policy, and fail-closed
 /// size caps. A format missing from this registry cannot be decoded.
 
 /// The shape of a text object body: a materialized control object, or a descriptor followed by raw
@@ -100,38 +76,27 @@ enum class TextFamily : uint8_t { Control = 1, PayloadHybrid = 3 };
 /// are rejected by all families because they signal a required extension.
 enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
 
-/// Deterministic storage policy. `Always` uses whole-object zstd and a `.zst` key suffix; `Never`
-/// remains raw.
-enum class CompressionPolicy : uint8_t { Never = 1, Always = 2 };
-
-/// Codec metadata for one registered text object. The byte caps apply to decompressed object content
-/// and individual text lines.
+/// Codec metadata for one registered text object. The byte caps apply to the object and to individual
+/// text lines.
 struct FormatTraits
 {
     FormatId id;
     std::string_view type;      /// header-line "type" value
     TextFamily family;
     KeyStrictness strictness;
-    CompressionPolicy compression;
     uint64_t object_cap;        /// max DECOMPRESSED object bytes
     uint64_t line_cap;          /// max bytes of one text line
 };
 
-/// Returns the traits for `id`. Throws `LOGICAL_ERROR` for `FormatId::Roster`, which is reserved and
-/// has no codec or traits row yet.
+/// Returns the traits for `id`.
 const FormatTraits & traitsFor(FormatId id);
 /// Looks up a header-line `type` string. Returns nullptr for an unregistered type; it does not throw
 /// because callers use this result to classify the input before decoding it.
 const FormatTraits * traitsForType(std::string_view type);
 std::span<const FormatId> allRegisteredFormatIds();
 
-/// The largest number of STORED bytes any materialized object may occupy: the largest whole-object
-/// cap in the registry, expanded by zstd's worst-case bound because the `Always` policy stores those
-/// objects compressed. A materialized read refuses anything larger rather than allocating it.
+/// The largest number of bytes any materialized object may occupy: the largest whole-object cap in the
+/// registry. A materialized read refuses anything larger rather than allocating it.
 uint64_t casMaxStoredObjectBytes();
-/// Returns the storage-key suffix for `id`: `.zst` for `Always`, and an empty suffix otherwise.
-/// Key builders use this policy directly so a point lookup never has to inspect the object body or
-/// try multiple keys.
-std::string_view storedSuffix(FormatId id);
 
 }

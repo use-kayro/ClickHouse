@@ -520,29 +520,15 @@ extern const Event CASBlobPut;
 extern const Event CASBlobPutDeduplicated;
 extern const Event CASBlobHead;
 extern const Event CASBlobHeadMiss;
-extern const Event CASGCPut;
+extern const Event CASOtherPut;
 }
 
 TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 {
-    /// Namespace classification by substring.
+    /// Classification by substring: blobs, and everything else.
     EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef"), CasNs::Blob);
-    EXPECT_EQ(classifyCasNs("pool/gc/registry"), CasNs::Gc);   /// gc/ prefix covers GC state (state, retired sets, etc.)
-    EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);
-    /// D3: the old per-server-control key shapes (`_watermark`, `_precommits/<n>`) have no producer
-    /// anymore -- control state now lives under `/gc/server-roots/...` (classifies as Gc). A key of
-    /// this legacy shape, if it ever showed up, would fall through to the generic /roots/ rule.
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
-    /// Final opaque-life layout: both immutable streams and point/path-addressed state remain Root
-    /// instrumentation, while part manifests remain Manifest. None may fall into Other (the
-    /// 2026-07-03 operator-stand CREATE storm misread as CASOtherHeadMiss=102 because of this).
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/stream/00000000000000000000000000000017/_log/1-1.zst"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_ckpt.zst"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_files/format_version.txt"), CasNs::Root);
-    EXPECT_EQ(classifyCasNs("pool/cas/manifests/0/srv/store/d18/uuid@cas@/24/1/000001.proto"), CasNs::Manifest);
+    EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Other);
 
     auto inner = std::make_shared<InMemoryBackend>();
     auto instrumented = std::make_shared<InstrumentedBackend>(inner);
@@ -554,7 +540,7 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDeduplicated].load();
     const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead].load();
     const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss].load();
-    const auto gc_put_before     = global_counters[ProfileEvents::CASGCPut].load();
+    const auto other_put_before     = global_counters[ProfileEvents::CASOtherPut].load();
 
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
@@ -566,7 +552,7 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_FALSE(op.head("pool/blobs/zz/absent", Retry::once()).has_value());
     /// head of the present blob key ⇒ Head.
     EXPECT_TRUE(op.head(blob_key, Retry::once()).has_value());
-    /// create on a gc key ⇒ Gc Put.
+    /// create on a non-blob key ⇒ Other Put.
     EXPECT_TRUE(std::holds_alternative<Committed>(op.create("pool/gc/state", "g1", Retry::once())));
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
@@ -575,10 +561,10 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated].load() - blob_dedup_before, 1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASGCPut].load()        - gc_put_before,     1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASOtherPut].load()        - other_put_before,     1u);
 #else
     (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
-    (void)blob_miss_before; (void)gc_put_before;
+    (void)blob_miss_before; (void)other_put_before;
 #endif
 }
 

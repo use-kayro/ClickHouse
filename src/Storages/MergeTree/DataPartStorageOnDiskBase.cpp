@@ -1232,7 +1232,10 @@ bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
-    return getDisk()->isCaseInsensitive();
+    /// A content-addressed disk names files by exact bytes (its part store is an ordered map), and it holds
+    /// only part files, so the probe file `IDisk::isCaseInsensitive` writes would be refused there.
+    const auto disk = getDisk();
+    return !disk->isContentAddressed() && disk->isCaseInsensitive();
 }
 
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getSkipIndicesPackedReader() const

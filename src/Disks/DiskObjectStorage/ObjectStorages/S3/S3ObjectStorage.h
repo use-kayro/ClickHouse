@@ -127,16 +127,6 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
-    /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
-    /// Exactly one object is always a plain `DeleteObject` instead (never gated on `s3_capabilities`: a
-    /// single physical request per call, so there is nothing here for that capability to say no to).
-    /// For more than one object, throws `NOT_IMPLEMENTED` without sending anything once `DeleteObjects`
-    /// is known unsupported (a configured or a just-learned `S3Capabilities::isBatchDeleteSupported() ==
-    /// false`) -- this storage never substitutes a per-key loop of its own, since the caller is the one
-    /// that can admit each physical delete as its own request.
-    void removeObjectsIfExistUnderProfile(
-        const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
-
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
@@ -233,9 +223,6 @@ private:
     ConditionalRemoveResult removeObjectIfTokenMatchesImpl(
         const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client,
         size_t attempt_seed);
-
-    void removeObjectsIfExistImpl(
-        const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client, size_t attempt_seed);
 
     std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
 

@@ -1,0 +1,7 @@
+<clickhouse>
+    <!-- As production readers (kayro-infra merge-tree.xml.tftpl): never merge leader, always fetch merged parts. -->
+    <merge_tree>
+        <replicated_can_become_leader>0</replicated_can_become_leader>
+        <always_fetch_merged_part>1</always_fetch_merged_part>
+    </merge_tree>
+</clickhouse>

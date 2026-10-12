@@ -339,8 +339,8 @@ TEST(CASFormatBattery, BlobEnvelope)
     const String golden = json + String((L - 1) - json.size(), ' ') + '\n';
     runFormatBattery(FormatBatteryCase{
         .id = FormatId::Blob,
-        .encode = [&] { EnvelopeHeader e = sampleHeader("t-abc/all_1_2_0"); return sealObject(FormatId::Blob, encodeEnvelopeHeader(e, L)); },
-        .decode = [](std::string_view s) { decodeEnvelopeHeader(String(openObject(FormatId::Blob, s)), s.size(), ObjectKind::Blob); },
+        .encode = [&] { EnvelopeHeader e = sampleHeader("t-abc/all_1_2_0"); return encodeEnvelopeHeader(e, L); },
+        .decode = [](std::string_view s) { decodeEnvelopeHeader(String(s), s.size(), ObjectKind::Blob); },
         .golden = golden,
         .make_future_version = blobEnvelopeWithFutureVersion});
 }

@@ -456,13 +456,13 @@ Starting from `24.5` it is possible to configure any object storage disk
 
 Setting `metadata_type` to `cas` turns a disk into a content-addressed (CAS) disk: every
 object is addressed by the hash of its content rather than by a randomly generated blob name, so
-identical content written by different parts (or different tables) is stored once and shared. A
-background garbage collector reclaims objects once no part references them anymore; see
-[`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run),
-[`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member),
-and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
-[`system.cas_mounts`](/operations/system-tables/cas_mounts), and
-[`system.cas_log`](/operations/system-tables/cas_log) system tables. See the
+identical content written by different parts (or different tables) is stored once and shared. Only
+`ReplicatedMergeTree` tables can use it: a part's metadata is its Keeper record, and the object store
+holds only the blobs. A garbage collector on the server that writes the blobs reclaims them once no
+record references them; see
+[`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run) and the
+[`system.cas_gc_log`](/operations/system-tables/cas_gc_log) and
+[`system.cas_mounts`](/operations/system-tables/cas_mounts) system tables. See the
 [content-addressed storage documentation](/antalya/cas) for the architecture, operations
 runbooks, and a live-validated quick start.
 

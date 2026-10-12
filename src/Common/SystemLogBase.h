@@ -18,7 +18,6 @@
     M(OpenTelemetrySpanLogElement) \
     M(PartLogElement) \
     M(ContentAddressedGarbageCollectionLogElement) \
-    M(ContentAddressedLogElement) \
     M(BackgroundSchedulePoolLogElement) \
     M(QueryLogElement) \
     M(QueryThreadLogElement) \

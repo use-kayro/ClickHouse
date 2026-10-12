@@ -152,9 +152,6 @@ public:
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
         CAS_GC_RUN,
-        CAS_DROP_POOL_MEMBER,
-        CAS_FSCK,
-        CAS_FORGET,
         CAS_GC_STOP,
         CAS_GC_START,
         END

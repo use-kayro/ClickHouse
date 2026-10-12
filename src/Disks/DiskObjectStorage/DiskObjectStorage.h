@@ -247,6 +247,11 @@ public:
     std::shared_ptr<const S3::Client> tryGetS3StorageClient() const override;
 #endif
 
+protected:
+    /// A content-addressed disk keeps no loose file: its object-store access is proven when the pool opens
+    /// (reading, or on the writer minting, `_pool_meta`).
+    void checkAccessImpl(const String & path) override;
+
 private:
 
     /// Create actual disk object storage transaction for operations

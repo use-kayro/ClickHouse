@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Common/Exception.h>
 
-#include <zstd.h>
 
 #include <algorithm>
 #include <array>
@@ -34,19 +33,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
 {
     switch (id)
     {
-        case FormatId::RefLog:
-        case FormatId::RefSnapshot:
-        case FormatId::RefCkpt:
-        case FormatId::RefCatalog:
         case FormatId::PoolMeta:
-        case FormatId::MountLease:
         case FormatId::Blob:
-        case FormatId::Roster:
-        case FormatId::PartManifest:
         case FormatId::PartFiles:
-        case FormatId::Owner:
-        case FormatId::ServerEpoch:
-        case FormatId::BlobMeta:
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
@@ -78,50 +67,13 @@ constexpr uint64_t kKiB = 1024;
 constexpr uint64_t kMiB = 1024 * 1024;
 
 /// Caps are 100-1000x above realistic sizes; hitting one indicates a corrupt object or protocol bug.
-/// `RefLog` and `RefSnapshot` objects are read whole, so their 64 MiB decompressed object cap
-/// accommodates the JSON-inflated removal-class transaction and full snapshot. Their codecs
-/// independently enforce the existing `ref_txn_max_bytes` (20 MiB) and 64 MiB removal/snapshot budgets
-/// before sealing.
-///
-/// Their `line_cap` intentionally equals `object_cap`. A smaller per-line limit would add no memory
-/// protection to a whole-read format, while creating a write/read split: admission measures the whole
-/// transaction against the object budget, so a large individual ref payload could be accepted on
-/// write and rejected on decode, leaving a persisted ref object that cannot be read. The line cap is
-/// instead meaningful for streaming formats, where it bounds the resident O(line) record. Matching
-/// `line_cap` to `object_cap` lets any individually valid record consume the available object budget.
-///
-/// Compression is per type and deterministic, with no size threshold. `Always` types can grow large
-/// and use a `.zst` key suffix; `Never` types are small raw singletons.
 constexpr FormatTraits TRAITS[] =
 {
-    {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256,        256},
-    {FormatId::BlobMeta,     "cas_blob_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
-    {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
-    /// `cas_ref_ckpt` is a three-field mutable singleton read by a point GET on every recovery and on
-    /// every cleanup decision, so its caps are deliberately TIGHT (64 KiB / 4 KiB rather than the
-    /// megabyte scale its Control-family siblings use): nothing legitimate approaches them, and the cap
-    /// is the first thing that fires if a foreign object ever lands at the key. STRICT for the same
-    /// reason its decoder is -- every field changes what cleanup may delete, so nothing in it may be
-    /// skipped. Raw (`Never`): a small singleton, and `publishCkpt` re-encodes it on every attempt.
-    {FormatId::RefCkpt,      "cas_ref_ckpt",      TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     64 * kKiB,  4 * kKiB},
-    /// `cas_ref_catalog` (INV-3): one object for the whole pool, token-CAS, read on every recovery.
-    /// STRICT for the same reason `cas_ref_ckpt` is -- every field decides a namespace's lifecycle, so
-    /// nothing in it may be skipped. Raw (`Never`): the admission gate measures `encodeRefCatalog`'s own
-    /// output directly, so a compressed size would answer the wrong question. The line cap is tight (4 KiB)
-    /// because one entry's record is ordinarily small -- but not always small enough: a namespace or
-    /// `server_root_id` near their own byte bounds, worst-case escaped, can push a single line past
-    /// 4 KiB, and `encodeRefCatalog` REFUSES that entry (`LIMIT_EXCEEDED`, `CasRefCatalogFormat.cpp`'s
-    /// `checkLineBytes`) rather than writing an object no reader could later decode.
-    {FormatId::RefCatalog,   "cas_ref_catalog",   TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     256 * kMiB, 4 * kKiB},
-    {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
-    /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`). The caps only bound
-    /// decoding (the manifest's); what bounds a record in practice is Keeper's request size.
-    {FormatId::PartFiles,    "cas_part_files",    TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256 * kMiB, 64 * kKiB},
-    {FormatId::Owner,        "cas_owner",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
+    {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, 256,        256},
+    {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, 1 * kMiB,   64 * kKiB},
+    /// `cas_part_files` is a Keeper znode value, never an S3 object: raw. The caps only bound
+    /// decoding; what bounds a record in practice is Keeper's request size.
+    {FormatId::PartFiles,    "cas_part_files",    TextFamily::PayloadHybrid, KeyStrictness::Tolerant, 256 * kMiB, 64 * kKiB},
 };
 }
 
@@ -129,10 +81,10 @@ uint64_t casMaxStoredObjectBytes()
 {
     static const uint64_t bound = []
     {
-        uint64_t largest_uncompressed = 0;
+        uint64_t largest = 0;
         for (const FormatTraits & t : TRAITS)
-            largest_uncompressed = std::max(largest_uncompressed, t.object_cap);
-        return static_cast<uint64_t>(ZSTD_compressBound(largest_uncompressed));
+            largest = std::max(largest, t.object_cap);
+        return largest;
     }();
     return bound;
 }
@@ -165,9 +117,5 @@ std::span<const FormatId> allRegisteredFormatIds()
     return ids;
 }
 
-std::string_view storedSuffix(FormatId id)
-{
-    return traitsFor(id).compression == CompressionPolicy::Always ? ".zst" : "";
-}
 
 }

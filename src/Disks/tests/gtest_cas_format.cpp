@@ -15,15 +15,11 @@ using namespace DB::Cas;
 /// Closed-set pin: the registry's complete set of object `type` strings. `allRegisteredFormatIds`
 /// is the registry's own enumeration accessor, so this walks the SAME set the codecs and the object
 /// header gate see -- a registered class with no test coverage here is a registered class this test
-/// cannot see either, which is the point: a 13th, 14th, ... entry the spec's closed set does not
-/// name would show up as a set-size mismatch instead of passing unnoticed.
+/// cannot see either, which is the point: an entry the closed set does not name shows up as a mismatch
+/// instead of passing unnoticed.
 TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
 {
-    const std::set<std::string_view> expected{
-        "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
-        "cas_ref_ckpt", "cas_ref_catalog", "cas_part_manifest",
-        "cas_owner", "cas_epoch", "cas_mount_lease", "cas_part_files"};
-    ASSERT_EQ(expected.size(), 12u);
+    const std::set<std::string_view> expected{"cas_blob", "cas_pool_meta", "cas_part_files"};
 
     std::set<std::string_view> actual;
     for (const auto id : allRegisteredFormatIds())
@@ -52,11 +48,6 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
         EXPECT_EQ(cps.front().generation, 1u);
         EXPECT_EQ(cps.front().min_reader, 1u);
     }
-
-    const auto roster_cps = changePoints(FormatId::Roster);
-    ASSERT_EQ(roster_cps.size(), 1u);
-    EXPECT_EQ(roster_cps.front().generation, 1u);
-    EXPECT_EQ(roster_cps.front().min_reader, 1u);
 }
 
 TEST(CASFormat, CurrentVersionsAreGBuild)

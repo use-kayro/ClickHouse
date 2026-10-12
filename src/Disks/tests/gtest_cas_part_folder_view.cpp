@@ -45,9 +45,7 @@ std::shared_ptr<const Cas::PartFolderView> makeView()
     add("txn_version.txt", Cas::EntryPlacement::Inline, "ver", 3);
 
     return std::make_shared<const Cas::PartFolderView>(
-        Cas::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"},
-        Cas::ManifestId{Cas::RootNamespace{"srv/t"}, Cas::ManifestRef{1, 2, 3}},
-        /*manifest_size=*/1000, manifest);
+        Cas::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"}, manifest);
 }
 
 std::vector<String> sorted(std::vector<String> v) { std::sort(v.begin(), v.end()); return v; }
@@ -91,7 +89,6 @@ TEST(CASPartFolderView, SizesAndBytes)
     EXPECT_EQ(v->inlineBytes("checksums.txt"), std::optional<String>("cs"));
     EXPECT_EQ(v->inlineBytes("data.bin"), std::nullopt);                   /// blob has no inline bytes
     EXPECT_EQ(v->inlineBytes("txn_version.txt"), std::optional<String>("ver"));
-    EXPECT_GE(v->estimatedBytes(), 1000u);                                 /// >= manifest_size
 }
 
 TEST(CASPartFolderView, ProjectionDirPrefixRecognizer)

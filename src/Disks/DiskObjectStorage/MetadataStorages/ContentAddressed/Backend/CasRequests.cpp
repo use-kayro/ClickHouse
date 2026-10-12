@@ -597,23 +597,6 @@ void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & f
     }
 }
 
-void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy)
-{
-    if (keys.size() > kBulkDeleteMaxKeys)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS removeManyWriteOnce: {} keys in one chunk, the limit is {}; the consumer chunks its input",
-            keys.size(), kBulkDeleteMaxKeys);
-    if (keys.empty())
-        return;
-    const Retry::Bound bound = policy.bind(owner.now_ms());
-    const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
-    readLoop("removeManyWriteOnce", subject, policy, bound, [&](auto & access)
-    {
-        owner.backend->removeManyWriteOnce(keys, access);
-        return true;
-    });
-}
-
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
     return removeUnder(key, owner.valueFor(key, seen), policy, policy.bind(owner.now_ms()));
@@ -650,69 +633,6 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         }
         if (!fits(needed, bound))
             giveUpReadDeadline("removeCurrent", key, bound, attempt);
-        detail::recordReissue();
-        owner.sleep_ms(pause_ms);
-    }
-}
-
-SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry & policy)
-{
-    const Retry::Bound bound = policy.bind(owner.now_ms());
-    bool refresh_attempted = false;
-    for (uint32_t attempt = 1;; ++attempt)
-    {
-        const uint64_t reservation = reservedFor(0, 1);
-        switch (gate(reservation))
-        {
-            case Gate::FenceLost: giveUpReadFenceLost("probeSentinel", key, "before the request");
-            case Gate::NoBudget:  giveUpReadNoBudget("probeSentinel", key, "for one more request");
-            case Gate::Ok: break;
-        }
-        /// Before the first attempt nothing has been probed, so the caller is told the request never
-        /// happened rather than being handed an outcome no request produced.
-        if (!fits(reservation, bound))
-            giveUpReadDeadline("probeSentinel", key, bound, attempt - 1);
-
-        detail::recordAttempt();
-        SentinelProbeResult result{ProbeOutcome::Indeterminate, std::nullopt};
-        try
-        {
-            result = owner.withTransportAccess(attempt, [&](auto & access)
-            {
-                return owner.backend->probeSentinelRaw(key, access);
-            });
-        }
-        catch (const std::exception & e)
-        {
-            /// The probe never counts a fuse, so whether this fault was a credential reissue is not
-            /// interesting here -- only the write and read loops guard a counter with it.
-            bool refreshed = false;
-            if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
-                throw;
-            /// The probe reports every transport failure as `Indeterminate` rather than by throwing, so
-            /// a decorator that does throw is folded onto the same inconclusive outcome.
-        }
-
-        /// The reissue is driven by the OUTCOME: this is the one primitive whose failures never reach a
-        /// `catch`, and `Indeterminate` means "inconclusive", which is exactly what a retry resolves.
-        /// The other four outcomes are authoritative answers and return on the first attempt.
-        if (result.outcome != ProbeOutcome::Indeterminate || policy.single_attempt)
-            return result;
-
-        const uint64_t pause_ms = Retry::backoff(attempt);
-        const uint64_t needed = reservedFor(pause_ms, 1);
-        /// A lost fence and a spent lease budget are not things the store said, so they are reported the
-        /// way every other read verb reports them rather than being dressed up as an outcome.
-        switch (gate(needed))
-        {
-            case Gate::FenceLost: giveUpReadFenceLost("probeSentinel", key, "before the reissue");
-            case Gate::NoBudget:  giveUpReadNoBudget("probeSentinel", key, "for the reissue");
-            case Gate::Ok: break;
-        }
-        /// Only the policy's own bound ends the loop with a value: a probe DID run, and what it saw is
-        /// more than a give-up exception could say. Every consumer treats `Indeterminate` fail-closed.
-        if (!fits(needed, bound))
-            return result;
         detail::recordReissue();
         owner.sleep_ms(pause_ms);
     }

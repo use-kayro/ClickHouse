@@ -97,10 +97,6 @@ public:
     /// returning a write-response value. Streaming uses ordinary write settings; staged bytes require
     /// a native same-store copy.
     void publish(const BlobPublishRequest & request, TransportAccess & access) override;
-    /// Removes up to 1000 write-once keys in one request. Native mode issues one `DeleteObjects`
-    /// under the control-plane profile; `EmulatedSingleProcess` deletes each present key under the
-    /// emulation lock with the same token bookkeeping as the single-key delete.
-    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
     /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
     /// own values.
     Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }
@@ -144,13 +140,6 @@ public:
     /// test construction reports no support; this check is the mount-time gate. No-op for
     /// `EmulatedSingleProcess`.
     void checkConditionalWriteSingleAttemptSupport() override;
-
-    /// See Backend::probeSentinelRaw. Native: ONE `read`, classified by the S3 error it throws. A GET
-    /// 404 carries a response body, so the SDK can parse its `<Code>` and tell `NoSuchKey` from
-    /// `NoSuchBucket` -- a distinction a bodyless HEAD 404 cannot make.
-    /// EmulatedSingleProcess (Local): stats the configured container directory (`emu_root`) first --
-    /// `ContainerAbsent` if it is gone -- then the key.
-    SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access) override;
 
     /// The token kind this backend's object storage mints: Dialect::ETag for AWS-compatible
     /// stores, Dialect::Generation when the storage mints GCS generations (the
@@ -241,7 +230,6 @@ private:
     RawListPage listUnder(const String & prefix, const String & cursor, size_t limit,
                           const ObjectStorageControlRequest & request);
     RawRemoval removeUnder(const String & key, const String & expected_value, const ObjectStorageControlRequest & request);
-    SentinelProbeResult probeSentinelUnder(const String & key, const ObjectStorageControlRequest & request);
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could
     /// land in the same mtime quantum. `deleteExact` erases already-old entries immediately and queues
@@ -310,11 +298,10 @@ private:
     String emuMintToken(const String & key, const String & etag, bool just_wrote);
 };
 
-/// Fail-closed programmer-error guard: a mount opens exactly one backend and one `CasRequestBudget`
-/// together (`ContentAddressedMetadataStorage::openPoolView`), and the pool's lease arithmetic
-/// (`validateCasRequestBudget`, `CasMountRuntime::admit`) is validated against the budget alone --
-/// never against the backend it hands to the request layer. If the two ever disagree, the backend
-/// would silently outlive (or underlive) the envelope the lease math was checked against. Throws
+/// Fail-closed programmer-error guard: a pool opens exactly one backend and one `CasRequestBudget`
+/// together (`ContentAddressedMetadataStorage::openPoolView`), and the request layer reserves the budget's
+/// attempt envelope -- never the backend's. If the two ever disagree, the backend would silently outlive
+/// (or underlive) the envelope the requests reserve. Throws
 /// `LOGICAL_ERROR` naming both values; called once at open, before `Pool::open`.
 void ensureBackendMatchesBudget(const ObjectStorageBackend & backend, const CasRequestBudget & budget);
 

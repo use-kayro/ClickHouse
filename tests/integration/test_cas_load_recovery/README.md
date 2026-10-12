@@ -21,10 +21,8 @@ docker compose down -v
 ```
 
 Always run `docker compose down -v` after saving `.lab/results.jsonl`, including
-on test failure. For the unmodified control, start a fresh environment and run only
-`python3 lab.py loading --role writer` after `init`. It requires the cached
-`ASYNC_LOAD_WAIT_FAILED`/`NETWORK_ERROR` after storage recovery; destroy that
-environment before running another control. The failed writer cannot be reused.
-To check terminal refusal, run `python3 lab.py terminal --role writer` after a
-successful recovery, then destroy the environment (do not reuse it for shutdown).
+on test failure. Since TEC-851 step 3c a table loads from its Keeper part records and
+the pool holds only blob bodies: the loading scenario interrupts the whole pool while
+the server starts and requires the load to succeed and the server to recover without
+a restart; there is no mount lease to lose and no `SYSTEM CAS FORGET` to test.
 Tests and compiles belong on AWS; redirect output to a build log for review.

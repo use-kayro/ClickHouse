@@ -479,23 +479,6 @@ struct MismatchOnceOnRemoveBackend : InMemoryBackend
     }
 };
 
-/// Answers `Indeterminate` for its first `indeterminate_answers` probes, then delegates -- a store
-/// briefly out of reach, whose absence was never established.
-struct IndeterminateProbeBackend : InMemoryBackend
-{
-    using Backend::probeSentinelRaw;
-
-    size_t probes = 0;
-    size_t indeterminate_answers = 2;
-
-    SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access) override
-    {
-        if (++probes <= indeterminate_answers)
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        return InMemoryBackend::probeSentinelRaw(key, access);
-    }
-};
-
 /// Refuses the FIRST `list` naming each distinct cursor -- one refusal per page -- and charges every
 /// list a fixed slice of the caller's clock, so what a page costs is a fact rather than a jitter draw.
 /// `always_refuse_cursor` keeps one page refused for good.
@@ -869,37 +852,6 @@ TEST(CASRequests, RemoveCurrentReObservesAMismatchAndRefusesUnderOnce)
         expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.removeCurrent("k", Retry::once()); });
         EXPECT_EQ(backend->heads, 1u);
         EXPECT_EQ(backend->removes, 1u);
-        EXPECT_TRUE(clock.sleeps.empty());
-    }
-}
-
-TEST(CASRequests, ProbeSentinelRetriesOnlyTheIndeterminateOutcome)
-{
-    {
-        FakeClock clock;
-        auto backend = std::make_shared<IndeterminateProbeBackend>();
-        auto requests = makeRequests(backend, clock);
-        auto op = requests.admit();
-        orThrow(op.create("k", "v", Retry::standard()), "create");
-
-        const SentinelProbeResult result = op.probeSentinel("k", Retry::standard());
-        EXPECT_EQ(result.outcome, ProbeOutcome::Present);
-        ASSERT_TRUE(result.body.has_value());
-        EXPECT_EQ(*result.body, "v");
-        EXPECT_EQ(backend->probes, 3u);          /// inconclusive twice, then an authoritative answer
-        EXPECT_EQ(clock.sleeps.size(), 2u);
-    }
-    {
-        FakeClock clock;
-        auto backend = std::make_shared<IndeterminateProbeBackend>();
-        auto requests = makeRequests(backend, clock);
-        auto op = requests.admit();
-        orThrow(op.create("k", "v", Retry::standard()), "create");
-
-        /// With no reissue left, the inconclusive outcome IS the answer: reported, never thrown.
-        const SentinelProbeResult result = op.probeSentinel("k", Retry::once());
-        EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
-        EXPECT_EQ(backend->probes, 1u);
         EXPECT_TRUE(clock.sleeps.empty());
     }
 }
@@ -2949,41 +2901,11 @@ TEST(CASRequestsFuse, ReadRefreshedCredentialTextDoesNotDoubleCountTheFuse)
 
 #endif
 
-TEST(CASRequestBudget, EnvelopeIsValidatedNotTheBareAttempt)
+TEST(CASRequestBudget, EnvelopeIsTwoConnectCapsPlusTheAttempt)
 {
-    CasRequestBudget budget{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = 1000};
+    CasRequestBudget budget{.attempt_timeout_ms = 5000, .connect_timeout_cap_ms = 1000};
     EXPECT_EQ(budget.attemptEnvelopeMs(), 7000u);
-    EXPECT_EQ((CasRequestBudget{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = std::nullopt}.attemptEnvelopeMs()), 5000u);
-    /// Defaults with the default TTL / period are accepted.
-    EXPECT_NO_THROW(validateCasRequestBudget(budget, 30000, 10000, /*background_renewal=*/true));
-    /// A zero attempt timeout would reserve nothing while the request keeps the disk's own timeout.
-    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
-    {
-        validateCasRequestBudget(CasRequestBudget{.attempt_timeout_ms = 0, .lease_safety_margin_ms = 2000,
-                                                   .connect_timeout_cap_ms = std::nullopt}, 30000, 10000, true);
-    });
-    /// The old inequality (attempt <= TTL - margin - period: 5000 <= 13000) accepted this; two envelopes
-    /// of 15 s do not fit a 25 s lease behind a 10 s period and a 2 s margin.
-    const CasRequestBudget wide{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = 5000};
-    try
-    {
-        validateCasRequestBudget(wide, 25000, 10000, true);
-        FAIL() << "must refuse";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_THAT(e.message(), testing::HasSubstr("envelope"));
-        EXPECT_THAT(e.message(), testing::HasSubstr("15000"));
-    }
-    /// Without background renewal only `envelope + margin < TTL` applies (15000 + 2000 < 25000).
-    EXPECT_NO_THROW(validateCasRequestBudget(wide, 25000, 10000, /*background_renewal=*/false));
-    /// Saturation: absurd values fail closed rather than wrap.
-    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
-    {
-        validateCasRequestBudget(CasRequestBudget{.attempt_timeout_ms = std::numeric_limits<uint64_t>::max(),
-                                                   .lease_safety_margin_ms = 1, .connect_timeout_cap_ms = 1},
-                                  30000, 10000, true);
-    });
+    EXPECT_EQ((CasRequestBudget{.attempt_timeout_ms = 5000, .connect_timeout_cap_ms = std::nullopt}.attemptEnvelopeMs()), 5000u);
 }
 
 TEST(CASRequests, ReservationIsTheEnvelope)

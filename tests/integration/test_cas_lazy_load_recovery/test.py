@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -29,9 +30,7 @@ def start_cluster():
 
 def _create(node):
     # lazy_load_tables=1: the CAS table attaches as a proxy and its real storage is built on first
-    # access. A transient object-store outage during that build is ridden out / retried on a later
-    # access instead of being cached as a permanently-FAILED AsyncLoader job (which, for a non-lazy
-    # database, would strand the table until a full server restart).
+    # access.
     node.query("CREATE DATABASE IF NOT EXISTS lazy_db ENGINE = Atomic SETTINGS lazy_load_tables = 1")
     node.query(
         "CREATE TABLE IF NOT EXISTS lazy_db.t (k UInt64, v UInt64) "
@@ -40,7 +39,7 @@ def _create(node):
     )
 
 
-def test_lazy_cas_table_self_heals_after_s3_recovery(start_cluster):
+def test_lazy_cas_table_build_survives_an_object_store_outage(start_cluster):
     node = cluster.instances["node1"]
     _create(node)
     node.query("INSERT INTO lazy_db.t SELECT number, number FROM numbers(100)")
@@ -50,40 +49,23 @@ def test_lazy_cas_table_self_heals_after_s3_recovery(start_cluster):
     # disk mounts at startup while S3 is up, the storage is built only on first access below).
     node.restart_clickhouse()
 
-    # Touch the table while S3 is unreachable: the lazy first-access build (its CAS ref-recovery LIST
-    # over the object store) cannot complete, so the client query fails within its bounded timeout.
-    # Note: the build does NOT fail fast server-side -- it blocks on the object store's own retry until
-    # S3 returns (see the BACKLOG "block-until-recovered" note); the client-side timeout is what makes
-    # this probe short. We assert the probe DID hit the outage (raised): the build needs several object-
-    # store round-trips, so the freezer (effective within milliseconds of `pause_container` returning)
-    # reliably catches it -- if this ever flakes, the pause raced a sub-millisecond full build, not a
-    # real self-heal regression.
-    with cluster.pause_container("rustfs1", wait_for_paused=False):
-        probe_raised = False
-        try:
-            node.query("SELECT count() FROM lazy_db.t", timeout=30)
-        except Exception:
-            probe_raised = True  # expected while the object store is unreachable
-        assert probe_raised, "the probe should have failed while S3 was unreachable (did the pause race the build?)"
+    # TEC-851 step 3c: the first-access build re-attaches the parts from their Keeper records; loading a
+    # part still reads its marks (blobs). Started while S3 is unreachable, the build waits on that read and
+    # completes once S3 is back, with every part.
+    result = {}
 
-    # S3 is back (context exit unpaused rustfs). WITHOUT a server restart and WITHOUT any DETACH, a
-    # later access must make the table usable again. This proves the key Layer 2 property: a transient
-    # object-store outage during a lazy CAS table's first-access build leaves NO permanently-cached
-    # AsyncLoader FAILED state (a non-lazy table whose load failed would stay FAILED until a full server
-    # restart). What actually recovers here is the original in-flight build completing once S3 returns
-    # (the block-until-recovered path), which is sufficient for "usable again without restart"; this
-    # test does not (and, given block-until-recovered, cannot) assert a proxy retry of a THROWN build.
-    deadline = time.time() + 180
-    last = None
-    while time.time() < deadline:
-        try:
-            last = node.query("SELECT count() FROM lazy_db.t").strip()
-        except Exception as e:
-            last = "err: " + str(e)
-        if last == "100":
-            break
-        time.sleep(3)
-    assert last == "100", (
-        "lazy CAS table must become usable again on a later access after S3 returns, with no server "
-        "restart (last=%r)" % last
-    )
+    def first_access():
+        result["count"] = node.query("SELECT count() FROM lazy_db.t", timeout=300).strip()
+
+    with cluster.pause_container("rustfs1", wait_for_paused=False):
+        reader = threading.Thread(target=first_access)
+        reader.start()
+        deadline = time.time() + 60
+        while node.query("SELECT count() FROM system.processes WHERE query LIKE 'SELECT count() FROM lazy_db.t%'").strip() == "0":
+            assert time.time() < deadline, "the first access never started"
+            time.sleep(0.5)
+    reader.join(300)
+    assert not reader.is_alive(), "the first access did not finish after S3 came back"
+    assert result.get("count") == "100"
+
+    assert node.query("SELECT sum(v) FROM lazy_db.t").strip() == str(sum(range(100)))

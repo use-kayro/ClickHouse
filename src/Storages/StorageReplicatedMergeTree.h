@@ -692,12 +692,6 @@ private:
     /// without listing the object store.
     void holdPartsFromCasRecords(const Strings & parts_on_replica);
 
-    /// In the attach thread, after `createNewZooKeeperNodes`: creates the missing Keeper records of this
-    /// replica's active parts on content-addressed disks (parts committed before records existed), with the
-    /// same bytes a commit writes -- from the part views the load already read, so no object-store write or
-    /// LIST. Idempotent: a record another replica created meanwhile is left as it is.
-    void backfillCasPartRecords();
-
     /// `ICasKeeperRecordSource`: this table's records on the pool of `disk`, whether some replica lists each
     /// record's part, and -- when this replica is the writer (a merge leader, `replicated_can_become_leader`)
     /// -- the epoch the removals check.

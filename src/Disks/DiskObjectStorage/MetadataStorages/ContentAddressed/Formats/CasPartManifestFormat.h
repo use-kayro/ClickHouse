@@ -10,27 +10,8 @@
 namespace DB::Cas
 {
 
-/// Text codec for the immutable, root-local `cas_part_manifest` body. It is a `PayloadHybrid` object
-/// made of JSON lines followed by a raw payload zone. The public types and helper signatures remain
-/// stable for the surrounding CAS protocol.
-///
-///   header line                 {"type":"cas_part_manifest","v":N}
-///   descriptor meta line         {"epoch","build","ord"} (the ManifestRef, shared rendering with
-///                                refsnaplog, `CasWireVocab.h`) + `root_namespace` + `payload_digest`
-///                                (payload digest, 32 lowercase hex)
-///   one entry-record line each   {"path":path,"place":placement-word, then either the Blob's
-///                                {"algo","digest","size"} or the Inline's {"size"}}, in canonical path order
-///   trailer line                 {"n":entry-count}
-///   PAYLOAD ZONE (raw, follows the trailer): for each Inline entry, in path order, a
-///                                `head -v`-style banner line `==> "<escaped path>" size=<n> <==\n`, then
-///                                exactly `n` raw bytes, then `\n`. The path uses the same writer as
-///                                the entry-record line, so decode can rebuild the banner byte-wise.
-///                                Blob entries carry no
-///                                payload-zone bytes — their bytes live in a separately addressed
-///                                CAS blob; the manifest carries only the `BlobRef` + size.
-///
-/// The payload zone is why this format is `PayloadHybrid` rather than a plain `Control` object: `inline_bytes` is arbitrary binary, not necessarily valid UTF-8, so it cannot be
-/// JSON-string-encoded safely and instead rides outside the JSON-line region entirely.
+/// The file list of one part (`PartManifest`), held in memory (`Parts/PartFolderAccess`), and the text codec of
+/// its Keeper record (`cas_part_files`, below).
 
 /// Where a manifest entry's file bytes live. There are no nested tree objects: a directory is a path
 /// prefix, not a placement. `Inline` bytes belong to the manifest's raw payload zone; `Blob` bytes
@@ -71,47 +52,13 @@ struct ManifestEntry
     uint64_t size() const { return placement == EntryPlacement::Inline ? inline_bytes.size() : blob_size; }
 };
 
-/// The immutable body of one root-local part manifest. It repeats `ref` and `root_namespace_id` so
-/// readers can validate the journal reference and owning root namespace against the body; neither
-/// repetition is a second identity. `payload_digest` is integrity/debug metadata only: it is never a
-/// key, deduplication input, or in-degree. Mutable per-reference payload remains in the root
-/// `RefRecord`. Entries carry their own digest algorithm, so one manifest may mix digest widths.
-/// Entries are strictly ascending by `path` after decoding, which permits index-free binary-search
-/// and prefix-range lookup without adding a directory index to the immutable body.
+/// The files of one part, strictly ascending by `path` (`sortedUniqueEntries`), which permits index-free
+/// binary-search and prefix-range lookup. Entries carry their own digest algorithm, so one part may mix them.
 struct PartManifest
 {
-    ManifestRef ref;
-    RootNamespace root_namespace_id;
-    UInt128 payload_digest{};
     std::vector<ManifestEntry> entries;
     bool operator==(const PartManifest &) const = default;
 };
-
-/// Deterministic, streaming-capable encode. Entries are written in canonical path order (the encoder
-/// sorts them); a duplicate path throws `CORRUPTED_DATA`. Byte output is reproducible for identical
-/// input (no timestamps, no nondeterministic compression). Returns the canonical TEXT (NOT sealed);
-/// the caller compresses via `sealObject(FormatId::PartManifest, …)` on the persist path
-/// (`CompressionPolicy::Always`).
-String encodePartManifest(const PartManifest & m);
-
-/// Decode the canonical TEXT (the caller `openObject`s a stored `.zst` first). Throws `CORRUPTED_DATA`
-/// on a malformed header/descriptor/record/trailer/payload-zone shape or an unknown placement word;
-/// `UNKNOWN_FORMAT_VERSION` for a header `v` above this build.
-PartManifest decodePartManifest(std::string_view data);
-
-/// Content digest of the canonical encoded body, using the CAS content-hash primitive
-/// (`CityHash_v1_0_2::CityHash128`, the same one used for blob/tree hashing, not a second hash
-/// primitive). Callers set `PartManifest.payload_digest` from this. It is
-/// integrity/debug ONLY - never a key, never dedup, never in-degree. Stable for identical bodies;
-/// changes when any byte of the canonical encoding does, and is independent of the `payload_digest`
-/// field itself (computed with it zeroed).
-UInt128 computePayloadDigest(const PartManifest & m);
-
-/// Fail-closed identity checks used when reading or folding a manifest. The journal `ManifestRef`
-/// must equal the `ref` inside the decoded body.
-bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body);
-/// The body `root_namespace_id` must equal the owning root namespace.
-bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body);
 
 /// Text codec for `cas_part_files`, a part's Keeper record: one copy per part at the table level,
 /// `<zookeeper_path>/cas_parts/<part>` (`Storages/MergeTree/CasKeeperPartRecord.h`). Immutable per part name
@@ -122,7 +69,9 @@ bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest &
 ///   descriptor meta line         {"pool":"<32 hex pool_id>"}
 ///   one entry-record line each   {"path":path,"place":"inline","size":n}, in canonical path order
 ///   trailer line                 {"n":entry-count}
-///   PAYLOAD ZONE                 as in `cas_part_manifest`
+///   PAYLOAD ZONE (raw, follows the trailer): for each entry, in path order, a `head -v`-style banner line
+///                                `==> "<escaped path>" size=<n> <==\n`, then exactly `n` raw bytes, then `\n`
+///                                (`inline_bytes` is arbitrary binary, so it rides outside the JSON lines).
 ///
 /// The Blob entries are not repeated: the inline `checksums.txt` already names every other file with its
 /// size and its CityHash128, which is the `ch128` blob digest. `encodePartFiles` throws `LOGICAL_ERROR`
@@ -139,10 +88,9 @@ PartFiles decodePartFiles(std::string_view data);
 /// entry-record codec writes and every part view relies on. The pointers alias `entries`.
 std::vector<const ManifestEntry *> sortedUniqueEntries(const std::vector<ManifestEntry> & entries, std::string_view what);
 
-/// Pure ordered-entry lookup primitives over a decoded manifest. `decodePartManifest` guarantees
-/// strict ascending order by `path`; `PartFolderView` composes these lookups with wiring policy.
+/// Pure ordered-entry lookup primitives over entries strictly ascending by `path`.
 
-/// Binary search. Returns nullptr when absent. The pointer aliases `entries` — do not outlive it.
+/// Binary search. Returns nullptr when absent. The pointer aliases `entries` -- do not outlive it.
 const ManifestEntry * findEntry(const std::vector<ManifestEntry> & entries, std::string_view path);
 
 /// The contiguous [first, last) sub-span of entries whose path starts with `dir_prefix` (canonical

@@ -334,7 +334,7 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
 ///
 /// `NO_SUCH_BUCKET` is deliberately NOT here even though it is the third member of the store's own
 /// 404 family: a vanished CONTAINER is not an absent key, and answering "absent" for it would let a
-/// caller read an empty pool out of an outage. It propagates, and `probeSentinelRaw` classifies it.
+/// caller read an empty pool out of an outage. It propagates.
 /// Any other error (network, auth, throttle, corruption) propagates unchanged — fail-closed.
 static bool isObjectNotFound(const std::exception & e)
 {
@@ -731,71 +731,6 @@ std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(const String & k
     return RawMeta{metadata->size_bytes, emuObserveToken(key)};
 }
 
-/// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
-SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess & access)
-{
-    return probeSentinelUnder(key, controlRequest(access.attemptNo()));
-}
-
-SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key, const ObjectStorageControlRequest & request)
-{
-    if (mode == Mode::Native)
-    {
-        try
-        {
-            /// One `read`: unlike a bodyless HEAD 404, a GET 404 carries a response body, so the
-            /// SDK can parse its `<Code>` and a missing key and a missing bucket arrive as different
-            /// errors -- which is the whole distinction this probe exists to make.
-            auto raw = readUnder(key, request);
-            if (!raw)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            return {ProbeOutcome::Present, std::move(raw->bytes)};
-        }
-#if USE_AWS_S3
-        catch (const S3Exception & e)
-        {
-            /// `read` already answers the key-absent half of the store's 404 family (see
-            /// `isObjectNotFound`), so what reaches here is what it deliberately does not flatten.
-            /// The limit of the one-read shape: every case below classifies an error a GET raised, so
-            /// a store whose HEAD and GET answer differently for the same key is classified by its GET.
-            switch (e.getS3ErrorCode())
-            {
-                case Aws::S3::S3Errors::NO_SUCH_BUCKET:
-                    return {ProbeOutcome::ContainerAbsent, std::nullopt};
-                case Aws::S3::S3Errors::ACCESS_DENIED:
-                    return {ProbeOutcome::AccessDenied, std::nullopt};
-                default:
-                    /// Everything else (timeouts, 5xx, throttling, an unmodeled code) is inconclusive —
-                    /// NEVER promoted to KeyAbsent, per the IAM permutation table in spec §2.
-                    return {ProbeOutcome::Indeterminate, std::nullopt};
-            }
-        }
-#endif
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
-
-    /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`read`
-    /// alone cannot distinguish "this key is absent" from "the whole pool directory is gone" (Local
-    /// listing is best-effort and silently reports zero either way, see LocalObjectStorage::listObjects).
-    try
-    {
-        if (!object_storage->existsOrHasAnyChild(emu_root))
-            return {ProbeOutcome::ContainerAbsent, std::nullopt};
-
-        auto raw = readUnder(key, request);
-        if (!raw)
-            return {ProbeOutcome::KeyAbsent, std::nullopt};
-        return {ProbeOutcome::Present, std::move(raw->bytes)};
-    }
-    catch (...)
-    {
-        return {ProbeOutcome::Indeterminate, std::nullopt};
-    }
-}
-
 /// Settings for a genuine Native conditional write. Mark the request for the typed conditional
 /// dialect and, on a generation-token store, force a single PUT: GCS does not enforce the condition
 /// on multipart completion. Blob publication never uses these settings; it remains an ordinary
@@ -999,33 +934,6 @@ void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
             emu_token_state.erase(it);
         else
             emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
-    }
-}
-
-void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
-{
-    if (keys.empty())
-        return;
-    if (mode == Mode::Native)
-    {
-        StoredObjects objects;
-        objects.reserve(keys.size());
-        for (const WriteOnceKey & key : keys)
-            objects.emplace_back(key.str());
-        /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- this layer never
-        /// substitutes a per-key loop of its own (that would run under a single admission for up to
-        /// 1000 keys).
-        object_storage->removeObjectsIfExistUnderProfile(objects, controlRequest(access.attemptNo()));
-        return;
-    }
-
-    std::lock_guard lock(emu_mutex);
-    for (const WriteOnceKey & key : keys)
-    {
-        if (!emuExists(key.str()))
-            continue;
-        object_storage->removeObjectIfExists(StoredObject(emuPath(key.str())));
-        emuForgetDeletedToken(key.str());
     }
 }
 

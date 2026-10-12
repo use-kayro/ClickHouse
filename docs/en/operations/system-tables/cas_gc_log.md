@@ -12,7 +12,7 @@ doc_type: 'reference'
 The `system.cas_gc_log` table contains per-round records of the
 content-addressed (CAS) MergeTree garbage collector. For every garbage-collection round it stores a
 `Start` row and a `Finish` row (like `system.part_log` stores events per data part), with the counts
-of blobs condemned and deleted, the round duration, the outcome, and a per-round `ProfileEvents`
+of blobs deleted, the round duration, the outcome, and a per-round `ProfileEvents`
 delta.
 
 Between them it also stores one `Phase` row per GC phase the round reached, each carrying that
@@ -34,17 +34,15 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `event_time_microseconds` ([DateTime64(6)](/sql-reference/data-types/datetime64)) — Event time with microseconds precision.
 - `event_type` ([Enum8](/sql-reference/data-types/enum)) — `Start` or `Finish` of a GC round, or one `Phase` of it.
 - `disk_name` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The content-addressed disk the round ran on.
-- `server_root_id` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Identifies the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against [`system.cas_mounts`](/operations/system-tables/cas_mounts).
+- `server_root_id` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The disk's `cas_server_root_id` on the server that ran this round.
 - `trigger` ([Enum8](/sql-reference/data-types/enum)) — `Scheduled` (background tick) or `Manual` (`SYSTEM` command).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — This process's round number on this disk (`0` on a `Start` row, and on a round that did not run as the writer).
 - `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Unknown` (on a `Start` row), `Success` (the round completed), `Aborted` (the round threw a transient error — backend or Keeper unavailability; the next scheduled round retries it), `Stopped` (a transient error observed after the disk began shutting down: the round was cut short so the shutdown need not wait for it), or `Error` (the round threw a non-transient error — investigate).
-- `writer` ([UInt8](/sql-reference/data-types/int-uint)) — `1` when the round ran as the writer (this server writes every table on the disk; only the writer deletes); `0` when it only read the tables' records.
-- `objects_condemned` ([UInt64](/sql-reference/data-types/int-uint)) — Blobs condemned this round (`.meta = Condemned`): referenced only by records of parts no replica lists.
+- `writer` ([UInt8](/sql-reference/data-types/int-uint)) — `1` when the round ran as the writer (this server is the merge leader of every table on the disk); `0` when it stopped after reading the tables.
 - `objects_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Blobs deleted this round (exact `ETag`), after their last record was removed.
-- `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Condemned blobs already gone when deleted.
-- `objects_replaced` ([UInt64](/sql-reference/data-types/int-uint)) — Condemned blobs re-uploaded since their condemnation (`ETag` changed), so spared.
-- `objects_spared` ([UInt64](/sql-reference/data-types/int-uint)) — Condemned blobs a listed part references again.
-- `fence_outs` ([UInt64](/sql-reference/data-types/int-uint)) — Expired mounts fenced out by this round's heartbeat floor.
+- `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Candidate blobs already gone when deleted.
+- `objects_replaced` ([UInt64](/sql-reference/data-types/int-uint)) — Candidate blobs re-uploaded since their `ETag` was read, so kept.
+- `objects_spared` ([UInt64](/sql-reference/data-types/int-uint)) — Candidate blobs a record references again.
 - `duration_ms` ([UInt64](/sql-reference/data-types/int-uint)) — The round wall-clock duration (on a `Finish` row).
 - `error` ([String](/sql-reference/data-types/string)) — The exception text when `outcome = 'Aborted'`, `'Stopped'` or `'Error'`. On a `Stopped` row it names the request the shutdown refused, not the shutdown itself.
 - `error_code` ([Int32](/sql-reference/data-types/int-uint)) — The exception code when `outcome = 'Aborted'`, `'Stopped'` or `'Error'`; `0` otherwise. Key monitoring on this column rather than on the `error` text. On an `Aborted`, `Stopped` or `Error` row the counters still report everything the round completed before it threw.
@@ -65,10 +63,9 @@ The phases, in execution order:
 
 | `phase` | What it covers | Dominant I/O |
 |---|---|---|
-| `keeper_records` | Read every registered table's Keeper part records (`records`, `unrecorded_listed` in `phase_metrics`). | one batched Keeper read per table |
-| `heartbeat_floor` | Classify every mount slot and fence out the dead ones. | `LIST` of the mount prefix, one `GET` per mount, one `PUT` per fence |
-| `mark` | Mark the records whose part no replica lists, and condemn the blobs only they reference (`marked`, `condemned`, `due`). | one Keeper `set` per newly marked record, one `HEAD` and one `.meta` write per condemned blob |
-| `remove` | Remove the records unlisted past `old_parts_lifetime`, then delete the condemned blobs no remaining record references (`records_removed`). | one Keeper multi-op per removed record, one `DELETE` per blob |
+| `keeper_records` | Read every registered table's Keeper part records (`tables`, `records`, and the size of the in-memory count: `held_blobs`, `held_references`). | one batched Keeper read per table |
+| `mark` | Mark the records whose part no replica lists (`marked`, `due`). | one Keeper `set` per newly marked record |
+| `remove` | Remove the records unlisted past `old_parts_lifetime`, then delete the blobs no remaining record and nothing on this server references (`records_removed`, `blobs_deleted`, `blobs_absent`, `blobs_replaced`, `blobs_pending`). | one Keeper multi-op per removed record; per candidate blob a `HEAD`, then an exact `DELETE` |
 
 Which phase dominates a round:
 
@@ -115,7 +112,6 @@ SELECT
     disk_name,
     trigger,
     outcome,
-    objects_condemned,
     objects_deleted,
     duration_ms
 FROM system.cas_gc_log
@@ -127,6 +123,5 @@ FORMAT Vertical;
 ## See Also {#see-also}
 
 - [`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run) — run one GC round synchronously.
-- [`system.cas_mounts`](/operations/system-tables/cas_mounts) — live per-`server_root_id` mount and GC-health state.
-- [`system.cas_log`](/operations/system-tables/cas_log) — per-decision event log for the CAS garbage collector and writer.
+- [`system.cas_mounts`](/operations/system-tables/cas_mounts) — per-disk GC health.
 - [`system.part_log`](/operations/system-tables/part_log) — the analogous per-part event log.

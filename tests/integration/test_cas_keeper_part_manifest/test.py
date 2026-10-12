@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from helpers.cas import join_pool_after_writer
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
@@ -43,11 +44,12 @@ def start_cluster():
     for name in ("writer", "reader"):
         cluster.add_instance(
             name,
-            main_configs=[
-                "configs/storage_conf.xml",
-                "configs/server_root_id_{}.xml".format(name),
+            main_configs=([] if name == "reader" else ["configs/storage_conf.xml", "configs/server_root_id_writer.xml"])
+            + [
                 "configs/part_log.xml",
-            ],
+            ]
+            # As production readers: never merge leader, always fetch merged parts (`merge_tree` settings).
+            + (["configs/reader_role.xml"] if name == "reader" else []),
             macros={"replica": name},
             with_rustfs=True,
             with_zookeeper=True,
@@ -56,6 +58,9 @@ def start_cluster():
         )
     try:
         cluster.start()
+        join_pool_after_writer(
+            cluster.instances["reader"], cluster.base_dir, ["configs/storage_conf.xml", "configs/server_root_id_reader.xml"]
+        )
         yield cluster
     finally:
         cluster.shutdown()
@@ -90,9 +95,6 @@ def create_table(node, table, wide, reader, cleanup_period=1):
         "max_cleanup_delay_period = {}".format(cleanup_period),
         "merge_tree_clear_old_temporary_directories_interval_seconds = {}".format(cleanup_period),
     ]
-    if reader:
-        # As production readers: they never assign merges and never run them, they fetch the writer's result.
-        settings += ["always_fetch_merged_part = 1", "replicated_can_become_leader = 0"]
     node.query(
         """
         CREATE TABLE {table} (
@@ -265,7 +267,7 @@ def test_reader_restart_reattaches_from_keeper():
     create_table(writer, table, wide=True, reader=False, cleanup_period=3600)
     create_table(reader, table, wide=True, reader=True, cleanup_period=3600)
 
-    list_events = ["S3ListObjects", "DiskS3ListObjects", "CASRootList", "CASOtherList", "CASManifestList", "CASBlobList"]
+    list_events = ["S3ListObjects", "DiskS3ListObjects", "CASOtherList", "CASBlobList"]
 
     def boot_lists():
         reader.restart_clickhouse()
@@ -314,71 +316,11 @@ def test_reader_restart_reattaches_from_keeper():
     ) == 0
     # ...and the boot listed exactly what a boot with no parts lists: re-attaching N parts costs no LIST.
     assert full_boot == empty_boot, (empty_boot, full_boot)
-    # What a boot does list is the mount probe and the namespace-files emulation of the table directory
-    # (TEC-845 (C)); never a manifest, a blob, a ref stream or anything per part.
+    # And a boot lists nothing at all (TEC-851 step 3c: no mount probe, no namespace-files emulation).
     boot = reader.query("SELECT formatDateTime(now() - uptime(), '%Y.%m.%d %H:%i:%S')").strip()
     lists = [line for line in log_lines(reader, r"Make S3 request to: .*list-type=2") if line[:19] >= boot]
-    prefixes = {re.search(r"prefix=([^&,]*)", line).group(1) for line in lists}
-    assert lists and all(p.startswith("keeper_pool%2F_probe%2F") or p.endswith("%2F_files%2F") for p in prefixes), prefixes
+    assert lists == [], lists[:5]
 
-
-
-def test_writer_boot_backfills_missing_records():
-    """Parts committed without a record (as by a build before records existed) get one at the next boot,
-    with the bytes a commit would have written. A reader that already has those parts in its own ref table
-    keeps serving them from there (a record never shadows it), and a part inserted afterwards reaches the
-    reader through its record."""
-    writer = cluster.instances["writer"]
-    reader = cluster.instances["reader"]
-    table = "keeper_parts_backfill"
-    for node in (writer, reader):
-        node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
-    create_table(writer, table, wide=True, reader=False)
-    create_table(reader, table, wide=True, reader=True)
-
-    def insert(start):
-        writer.query(
-            "INSERT INTO {table} SELECT number, number, toString(number), NULL FROM numbers({start}, 1000)".format(
-                table=table, start=start
-            )
-        )
-
-    # The writer commits as a build without records did. The reader fetches by relink (there is no record)
-    # and its fetch commit never creates one: only a replica that produced a part may.
-    writer.query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
-    try:
-        for i in range(3):
-            insert(i * 1000)
-        reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
-    finally:
-        writer.query("SYSTEM DISABLE FAILPOINT cas_part_record_omit")
-    assert record_lengths(writer, table) == {}
-    # As a table created by a build without records: not even the parent node exists. The attach thread
-    # creates it before backfilling.
-    cluster.get_kazoo_client("zoo1").delete("/clickhouse/tables/{}/cas_parts".format(table))
-    legacy = active_parts(writer, table)
-    assert active_parts(reader, table) == legacy
-
-    writer.restart_clickhouse()
-    writer.query("SELECT count() FROM {}".format(table))
-    assert sorted(record_lengths(writer, table)) == legacy
-    assert log_lines(
-        writer, r"default\.{} .*Backfilled {} Keeper part records \(0 already present\)".format(table, len(legacy))
-    )
-
-    # The reader's own ref table holds those parts: at its boot the records attach none of them.
-    reader.restart_clickhouse()
-    assert results(reader, table) == results(writer, table)
-    held = log_lines(reader, r"default\.{} .*Attached 0 of [0-9]+ parts of this replica from their Keeper records".format(table))
-    assert held, "the reader's ref-table parts must not be re-attached from their records"
-
-    # A part inserted now reaches the reader through its record.
-    insert(3000)
-    reader.query("SYSTEM SYNC REPLICA {}".format(table), timeout=120)
-    assert results(reader, table) == results(writer, table)
-    assert log_lines(reader, r"default\.{} .*Attached part .* from its Keeper record".format(table))
-    for node in (writer, reader):
-        node.query("DROP TABLE {} SYNC".format(table))
 
 
 def test_replace_partition_creates_records():
@@ -393,7 +335,8 @@ def test_replace_partition_creates_records():
     create_table(writer, table, wide=True, reader=False)
     create_table(reader, table, wide=True, reader=True)
     writer.query(
-        "CREATE TABLE {source} AS {table} ENGINE = MergeTree PARTITION BY id % 2 ORDER BY id "
+        "CREATE TABLE {source} AS {table} ENGINE = ReplicatedMergeTree('/clickhouse/tables/{source}', '{{replica}}') "
+        "PARTITION BY id % 2 ORDER BY id "
         "SETTINGS storage_policy = '{policy}', min_bytes_for_wide_part = 0".format(source=source, table=table, policy=STORAGE_POLICY)
     )
     writer.query(

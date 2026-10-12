@@ -133,18 +133,12 @@ PoolMeta PoolMeta::createOrValidate(
     /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
     /// creation, not left at 0.
     ///
-    /// BOOTSTRAP GATE: minting is permitted ONLY on the verified bootstrap path. A
-    /// non-bootstrap caller (a read-only/observe open, `openForDecommission`) passes `allow_mint=false`
-    /// and fails closed here — never minting a fresh identity outside that path (an observe scan that
-    /// minted would poison the next writable mount's residual check). The residual EMPTINESS proof itself
-    /// cannot live here: it must precede ANY write (spec's "zero-write residual check FIRST, before ANY
-    /// probe write"), and by the time `createOrValidate` runs the capability battery has already written
-    /// to the prefix, so `Pool::open` runs `probePoolBootstrapResidual` up front and only then passes
-    /// `allow_mint=true`. `pool_prefix` is exclusively CAS-owned.
+    /// Only the pool's writer mints (`allow_mint`, TEC-851 step 3c): every other open fails closed here, so a
+    /// reader started on a brand-new pool before its writer refuses to boot instead of writing.
     if (!allow_mint)
         throw Exception(ErrorCodes::INVALID_STATE,
-            "CAS pool meta: _pool_meta absent — refusing to mint outside the verified bootstrap path; "
-            "run a writable mount (or recreate the pool)");
+            "CAS pool meta: _pool_meta absent and this server is not the pool's writer; "
+            "start the writer first on a new pool");
 
     PoolMeta pm;
     pm.pool_id = mintPoolId();

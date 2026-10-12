@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
@@ -22,31 +21,6 @@
 
 namespace DB::Cas
 {
-
-/// Typed erasure evidence for one key or one prefix. Ordinary `head`/`read` answer only two things
-/// for a plain caller: the object, or nullopt for the store's own authoritative "key not found" (see
-/// `isObjectNotFound`) -- every other fault (a missing bucket/container, a permission failure, a
-/// transport fault) propagates as an exception instead of being flattened into absence. That
-/// present/absent/throw shape is exactly right for a plain read, but wrong for lifecycle recovery,
-/// which must never treat a fault it cannot classify as proof that data is gone. `ProbeOutcome` keeps
-/// the four cases distinct: only a backend's OWN authoritative "not found" evidence earns `KeyAbsent`
-/// -- a timeout, a 5xx, or an unclassifiable error is ALWAYS `Indeterminate`, never promoted to absence.
-enum class ProbeOutcome : uint8_t
-{
-    Present,           /// the key (or, for a prefix probe, at least one object under it) exists
-    KeyAbsent,         /// authoritative miss: the container is alive, the key itself is not there
-    ContainerAbsent,   /// the bucket/prefix-parent itself is gone, not merely the key
-    AccessDenied,      /// the probe was rejected on permissions — absence was never established
-    Indeterminate,     /// a transport/timeout/unclassifiable error — absence was NEVER proven
-};
-
-/// Result of `Backend::probeSentinelRaw`. `body` carries the materialized bytes only when the outcome is
-/// `Present`.
-struct SentinelProbeResult
-{
-    ProbeOutcome outcome;
-    std::optional<String> body;
-};
 
 /// Re-readable payload transport for one unconditional blob publication. `fresh_envelope` is the
 /// complete CAS envelope to prepend, while `payload_size` is the exact number of bytes the source
@@ -193,38 +167,6 @@ public:
     /// Executes one unconditional blob publication and returns once the complete destination is
     /// visible. Transport only: it observes no destination state and produces no incarnation.
     virtual void publish(const BlobPublishRequest & request, TransportAccess &) = 0;
-
-    /// Removes up to 1000 WRITE-ONCE keys in one request with no per-key precondition; an absent key
-    /// is success. The caller proves the keys are write-once by minting them as `WriteOnceKey`, so a
-    /// backend never sees a mutable control key through this verb. Throws on any failure; the whole
-    /// chunk is reissued by the engine, which is sound because a key already deleted is absent, and
-    /// absence is success.
-    virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
-
-    /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
-    /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`
-    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
-    /// call is `Indeterminate` -- never promoted to `KeyAbsent`. A backend able to surface real
-    /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
-    /// overrides this to sharpen the classification.
-    virtual SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access)
-    {
-        try
-        {
-            const auto meta = head(key, access);
-            if (!meta)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            auto raw = read(key, access);
-            /// Vanished between the two: still a clean, authoritative miss, not an error.
-            if (!raw)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            return {ProbeOutcome::Present, std::move(raw->bytes)};
-        }
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
 
     /// The dialect this backend mints its incarnation values in.
     virtual Dialect dialect() const = 0;
