@@ -31,14 +31,12 @@ TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
         "{\"u64_string_field\":\"7\",\"number_field\":3,\"bool_field\":true,\"second_u64_string_field\":\"1\"}\n");
 }
 
-TEST(CASJsonWriter, EmptyObjectAndClear)
+TEST(CASJsonWriter, EmptyObject)
 {
     CasJsonWriter w;
     bool first = true;
     w.closeObject(first);
     EXPECT_EQ(w.view(), "{}");
-    w.clear();
-    EXPECT_EQ(w.size(), 0u);
 }
 
 TEST(CASJsonWriter, Hex128MatchesU128ToHex)

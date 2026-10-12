@@ -40,33 +40,29 @@ String condemnMarkerKey(const PersistedEtag & token)
 /// self-healing) staleness window for the NEXT point-reader — with ONE exception: the CONDEMN marker
 /// is load-bearing for the delete edge. The exact-token delete argument
 /// below assumes the marker was durably written before the delete fires; a swallowed condemn-marker
-/// write lets a writer observe absent/Clean meta and adopt the SAME token the graduated entry later
-/// deletes (a dangling manifest). Graduation to `delete_pending` is therefore GATED on confirmed
-/// durable Condemned evidence for the exact (hash, token) — recorded in-process when the scheduled
-/// `writeCondemnedMeta` reports success, or re-established by a synchronous `loadMeta` re-check at
-/// graduation time. An unconfirmed entry is CARRIED (fail-safe delay) and its marker write retried;
-/// the delete itself and every other meta op stay async/advisory.
+/// write lets a writer observe absent/Clean meta and adopt the SAME token the condemned entry later
+/// deletes (a dangling manifest). `KeeperGc` therefore keeps a condemnation only once the scheduled
+/// `writeCondemnedMeta` confirmed durable Condemned evidence for the exact (hash, token); an
+/// unconfirmed blob is condemned again next round. Every other meta op stays async/advisory.
 ///
 /// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
 /// token is confirmed deleted/absent (`deleteConfirmedMeta`), but it NEVER transitions `Condemned ->
 /// Clean` on a spare. The SOLE `-> Clean` transition is a WRITER that has already displaced the body with
-/// a fresh incarnation token (`PartWriteTxn::ensureBlobPresent` publication + metadata reconciliation). Rationale: a deposed leader that cleared a
-/// spare's meta then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body;
-/// a writer reading `Clean` would reuse the exact condemned token, which a stale pre-CAS exact-token
-/// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token
-/// delete argument in full: once a hash is `Condemned`, observing `Clean` means EITHER the condemned body
+/// a fresh incarnation token (`PartWriteTxn::ensureBlobPresent` publication + metadata reconciliation).
+/// Rationale: a stray `Clean` over a still-condemned body would let a writer reuse the exact condemned
+/// token, which a later exact-token delete then deletes -- live-blob data loss (INV_NO_LOSS). Without
+/// the clear the exact-token delete argument holds in full: once a hash is `Condemned`, observing `Clean` means EITHER the condemned body
 /// is absent OR a writer already changed its incarnation, so every stale exact-incarnation delete of the
 /// condemned incarnation finds the body absent or holding a different one.
 
-/// Write the per-hash meta to Condemned: a blob newly entering the retired set this round (either the
-/// fresh zero-in-degree condemn, or a republication-supersede re-condemn of the current token). Absent meta
-/// is created fresh; an already-Condemned meta (a racing condemn, or a replay of this same round) is left
-/// alone rather than clobbering a possibly-newer condemn_round.
+/// Write the per-hash meta to Condemned for a blob condemned this round. Absent meta is created fresh; an
+/// already-Condemned meta (a racing condemn, or a replay) is left alone rather than clobbering a
+/// possibly-newer condemn_round.
 ///
 /// Returns whether durable Condemned evidence exists after the call: the conditional write committed,
 /// or an already-Condemned meta was observed. Any other write outcome reports false and writes nothing
 /// further (the loser re-reads next time); a thrown backend error propagates (the scheduling wrapper
-/// swallows it) — either way the entry stays UNCONFIRMED and the graduation gate carries it.
+/// swallows it) — either way the entry stays UNCONFIRMED and is condemned again next round.
 bool writeCondemnedMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
                         uint64_t condemn_round, uint64_t size)
 {

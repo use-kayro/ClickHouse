@@ -66,7 +66,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsString server_root_id;
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
-    extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
@@ -277,7 +276,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , context(context_ ? std::optional<ContextWeakPtr>(context_) : std::nullopt)
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
-    , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , mount_lease_ttl(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_lease_ttl_ms].value))
     , mount_renew_period(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_renew_period_ms].value))
     , cas_unsafe_remount_no_delay(settings_[ContentAddressedSetting::unsafe_remount_no_delay].value)
@@ -339,11 +337,9 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// throws the typed Vanished [D5] refusal; an uncertain one throws 668) before touching the scheduler.
     /// The later `!cas_store` re-check under `gc_scheduler_mutex` still guards the not-mounted race.
     checkOpAdmitted(CasOpClass::Admin);
-    /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
-    /// protocol compares consecutive observations of the SAME observer (gc_id), so an ad-hoc
-    /// scheduler per call would acquire the lease on the first call and then back off forever
-    /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
-    /// would therefore make every round after the first a silent no-op.
+    /// The pacing scheduler must be STABLE across calls: its `KeeperGc` keeps condemnations, marked
+    /// records and mount observations in memory, and a scheduler per call would start each round
+    /// from nothing.
     /// Hold gc_scheduler_mutex for the whole round: a concurrent `shutdown` waits for the round to
     /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex (a
     /// separate, briefly-held mutex) only guards the scheduler snapshot/creation below, so
@@ -560,8 +556,6 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
         e.object_kind = toString(ev.object_kind);
         e.object_hash = std::move(ev.object_hash);
         e.token = std::move(ev.token);
-        e.round = ev.round;
-        e.gen = ev.gen;
         e.at_version = ev.at_version;
         e.outcome = std::move(ev.outcome);
         e.reason = std::move(ev.reason);
@@ -582,8 +576,8 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool before touching
     /// the scheduler -- `SYSTEM CAS GC RUN` reaches here directly.
     checkOpAdmitted(CasOpClass::Admin);
-    /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
-    /// observation-window steal protocol compares consecutive observations of the same gc_id).
+    /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (its `KeeperGc` keeps its
+    /// condemnations and observations in memory).
     /// Hold gc_scheduler_mutex for the whole round: a concurrent `shutdown` waits for the round to
     /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex only
     /// guards the scheduler snapshot/creation below, so gcHealth/store/partAccess never block behind
@@ -710,7 +704,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.blob_hash_algo = blob_hash_algo;
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
-    pool_config.gc_shards = gc_shards;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
@@ -806,14 +799,13 @@ void ContentAddressedMetadataStorage::startup()
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
-    /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no
-    /// further gating is needed because the scheduler's lease coordinates concurrent mounters.
+    /// enabled; a round acts only when this server writes every table registered on the disk.
     /// `CasGcScheduler` holds its own `PoolPtr` (see its `store` member), so starting it against the
     /// LOCAL `pool` before publish is safe -- the scheduler keeps the pool alive on its own. It is
     /// also safe on the unwind path below: `scheduler` here is a local `shared_ptr`, so if something
     /// after this point throws (only the fault-injection hook can, in production nothing does),
     /// its destructor runs during stack unwinding, which drops the last reference and destroys the
-    /// `CasGcScheduler`; its destructor calls `stop()`, which joins both worker threads before the
+    /// `CasGcScheduler`; its destructor calls `stop()`, which joins its worker thread before the
     /// exception continues propagating. No explicit `SCOPE_EXIT` is needed for that.
     std::shared_ptr<Cas::CasGcScheduler> scheduler;
     if (startup_context && gc_enabled && !read_only)
@@ -999,8 +991,8 @@ void ContentAddressedMetadataStorage::gcStop()
 {
     /// SYSTEM CAS GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
     /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`, which `std::move`
-    /// it out and destroy it): a later `gcStart` must re-enter the SAME instance so its `gc_id` + lease
-    /// observation history survive. Keeping it in the member also keeps `gcHealth` reading the (stopped)
+    /// it out and destroy it): a later `gcStart` must re-enter the SAME instance so its in-memory
+    /// `KeeperGc` state survives. Keeping it in the member also keeps `gcHealth` reading the (stopped)
     /// state truthfully, rather than "no GC".
     /// A lifecycle-control verb: serialized against FSCK / forget / GC START by `lifecycle_mutex`, and
     /// against a concurrent synchronous GC round by `gc_scheduler_mutex` (a round holds the latter, so this
@@ -1025,7 +1017,7 @@ void ContentAddressedMetadataStorage::gcStop()
             "(disabled/read-only/not started) -- nothing to stop.", disk_name);
         return;
     }
-    /// `stop()` joins the worker + heartbeat threads and clears the in-process leadership hint. Runs OUTSIDE
+    /// `stop()` joins the worker thread and clears the in-process leadership hint. Runs OUTSIDE
     /// `pointer_mutex` (it joins threads). Idempotent: a second STOP finds an already-stopped scheduler and
     /// `stop()` is a safe no-op.
     snapshot->stop();
@@ -1067,8 +1059,7 @@ void ContentAddressedMetadataStorage::gcStart()
         snapshot = gc_scheduler;
     }
     /// `start()` is a no-op if already running (idempotent) and re-enters the SAME instance after a stop --
-    /// the persistent `gc` observer + `gc_id` are preserved, and leadership is re-acquired only by the next
-    /// round's normal `gc/state` acquisition, never restored here. Runs outside `pointer_mutex` for symmetry
+    /// its `KeeperGc` state is preserved. Runs outside `pointer_mutex` for symmetry
     /// with `stop()` (it spawns threads but joins nothing, so it does not block).
     snapshot->start();
 }

@@ -21,15 +21,13 @@ ColumnsDescription ContentAddressedLogElement::getColumnsDescription()
         {"event_date", std::make_shared<DataTypeDate>(), "Event date."},
         {"event_time", std::make_shared<DataTypeDateTime>(), "Event time."},
         {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Event time with microseconds."},
-        {"event_type", lc_string, "The CA decision/event (blob_put, blob_reuse_adopt, root_remove, indegree_zero, gc_retire_decision, gc_recheck_verdict, blob_delete, dangling_access, corrupt_dangle, ...)."},
+        {"event_type", lc_string, "The CA decision/event (blob_put, blob_reuse_adopt, gc_retire_decision, dangling_access, corrupt_dangle, ...)."},
         {"disk_name", lc_string, "Content-addressed disk / pool the event belongs to."},
         {"namespace", std::make_shared<DataTypeString>(), "roots/<namespace> (server/table), empty if N/A."},
         {"ref_name", std::make_shared<DataTypeString>(), "Part name / ref the event concerns, empty if N/A."},
         {"object_kind", lc_string, "none/blob/manifest/root/snapshot."},
         {"object_hash", std::make_shared<DataTypeString>(), "Content hash (lowercase hex) of the object, empty if N/A."},
         {"token", std::make_shared<DataTypeString>(), "Incarnation token (ETag) involved, empty if N/A."},
-        {"round", std::make_shared<DataTypeUInt64>(), "GC round (0 if N/A)."},
-        {"generation", std::make_shared<DataTypeUInt64>(), "GC snapshot generation (0 if N/A)."},
         {"at_version", std::make_shared<DataTypeUInt64>(), "Manifest shard_version of the driving journal record (0 if N/A)."},
         {"outcome", lc_string, "Decision outcome (ok/adopt/resurrect/deleted/replaced/spared/absent/zeroed/skipped/...)."},
         {"reason", lc_string, "Human-readable WHY of the decision (the rationale) -- templated across rows, so LowCardinality."},
@@ -54,8 +52,6 @@ void ContentAddressedLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(object_kind);
     columns[i++]->insert(object_hash);
     columns[i++]->insert(token);
-    columns[i++]->insert(round);
-    columns[i++]->insert(gen);
     columns[i++]->insert(at_version);
     columns[i++]->insert(outcome);
     columns[i++]->insert(reason);

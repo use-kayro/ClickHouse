@@ -29,9 +29,9 @@ enum class FormatId : uint16_t
     /// Values 2, 3, and 4 are retired. The former tree and GC-snapshot classes were replaced by the
     /// root-local part manifest, while the former mutable `cas_ref_shard` class was replaced by the
     /// immutable `RefSnapshot` and `RefLog` objects. Keep all three values unused.
-    GcState = 5,
-    /// Value 6 (the condemned-state object) is retired. Keep it unused. Value 7 is also retired: the
-    /// build-watermark floor is carried by the `MountLease` beat rather than a standalone object.
+    /// Value 5 (`gc/state`) is retired with the S3-listing GC round, and value 6 (the condemned-state
+    /// object) before it. Value 7 is also retired: the build-watermark floor is carried by the
+    /// `MountLease` beat rather than a standalone object. Keep all three unused.
     PoolMeta = 8,
     Roster = 9,
     /// Value 10 is retired: discovery authority is the pool-wide `cas/ref_catalog` object rather

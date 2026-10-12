@@ -115,10 +115,10 @@ public:
     /// Exact `Live -> Removing` transition. The immutable observed row is compared by full value on
     /// every catalog retry, and `op`'s admission is checked after every fresh read and before its
     /// write. A row already `Removing` under the same namespace/life resolves an ambiguous or
-    /// concurrent transition positively; no caller may change its recorded start round afterward.
+    /// concurrent transition positively. The row's `removal_started_round` is written as 0: the field
+    /// stays in the format, and nothing reads it.
     static BeginRemovingOutcome beginRemoving(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        uint64_t removal_started_round);
+        CasOperation & op, const Layout & layout, const CatalogEntry & observed);
 
     /// Outcome of exact stalled-creation cancellation.
     enum class StalledCreatingCancelOutcome : uint8_t
@@ -130,7 +130,7 @@ public:
     };
 
     /// Exact-CAS-deletes one observed `Creating` row only after its complete creator fence is proven
-    /// terminal. This performs no `_ckpt` or other physical cleanup; debris belongs to the janitor.
+    /// terminal. This performs no `_ckpt` or other physical cleanup.
     static StalledCreatingCancelOutcome cancelStalledCreating(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
@@ -193,7 +193,7 @@ public:
     /// `Live` is adopted, `Removing` is refused there, a still-`Creating` entry resumes through
     /// `reconcileStaleCreator` + `completeCreation`).
     static NamespaceCreationOutcome createNamespace(
-        CasOperation & op, const Layout & layout, uint64_t /*gc_shards*/,
+        CasOperation & op, const Layout & layout,
         const RootNamespace & ns, const CreatorFence & creator,
         const Retry & policy = Retry::standard());
 

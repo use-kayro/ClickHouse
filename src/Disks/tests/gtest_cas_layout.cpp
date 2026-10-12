@@ -27,7 +27,6 @@ TEST(CASLayout, KeyShapes)
     const BlobRef ref = prefixedRef(BlobHashAlgo::CityHash128);
     const String hex = codecFor(BlobHashAlgo::CityHash128).toHex(ref.digest);
     EXPECT_EQ(l.blobKey(ref), "p/blobs/ch128/" + hex.substr(0, 2) + "/" + hex);
-    EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
 

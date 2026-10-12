@@ -117,18 +117,14 @@ GROUP BY disk_name, outcome
 ORDER BY disk_name, rounds DESC;
 ```
 
-A steady stream of `Success` and `Deferred` rows is healthy; `Deferred` means the round found no
-changed shard needing a fold and no graduation was due — a cheap round, not a stuck one (see
-[the round](/antalya/cas/architecture/garbage-collection#the-round)). Recurring `Error` rows, or
-`NotALeader` outcomes for the disk's own scheduler, warrant investigation. `anomalies` in the
-`Finish` row is worth a steady watch: it is fold clamps surfaced and survived, so a non-zero value
-that persists across rounds is more interesting than an isolated one.
+A steady stream of `Success` rows is healthy (see
+[the round](/antalya/cas/architecture/garbage-collection#the-round)); only rows with `writer = 1`
+condemn or delete. Recurring `Error` rows warrant investigation.
 
 A dashboard alert that filters on `outcome = 'Error'` alone misses `Aborted` and `Stopped` rows too
 — see the [`outcome` column](/operations/system-tables/cas_gc_log#columns) for what each one means.
 A round that is recurring `Aborted` rather than `Error` still deserves attention: it keeps retrying,
-but the underlying transient condition (backend unavailability, a lost lease, a competing leader)
-has not gone away.
+but the underlying transient condition (backend or Keeper unavailability) has not gone away.
 
 Which phase dominates round duration or the `LIST` budget — reproduced from the
 [per-phase rows](/operations/system-tables/cas_gc_log#per-phase-rows) reference:

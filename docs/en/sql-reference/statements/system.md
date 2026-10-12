@@ -479,7 +479,7 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
-The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `writer`, `round`, `objects_condemned`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, and `fence_outs`, describing the outcome of that round (see [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) for their meaning). Only a round that runs as the writer (`writer = 1`: this server writes every table on the disk) condemns or deletes.
 
 A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
@@ -498,13 +498,11 @@ SYSTEM CAS GC START [ON CLUSTER cluster_name] disk_name
 each command targets exactly one disk's scheduler.
 
 `GC STOP` stops in place: the scheduler object is retained, so a later `GC START` resumes the *same*
-instance, preserving its `gc_id` and lease-observation history. It is idempotent, and works even on
+instance, preserving its in-memory condemnations. It is idempotent, and works even on
 a disk that is not currently live (stopping GC on a sick disk is a legitimate operation). It does
 not stop a manual [`SYSTEM CAS GC RUN`](#system-cas-gc-run) on the same disk.
 
-`GC START` re-enters that same scheduler instance rather than creating a new one; leadership is
-**not** automatically restored — the scheduler re-acquires the durable `gc/state` lease through the
-next round's normal acquisition, the same as any other contender. It is idempotent (a no-op on an
+`GC START` re-enters that same scheduler instance rather than creating a new one. It is idempotent (a no-op on an
 already-running scheduler), and refuses with a typed error on a decommissioned or uncertain pool,
 since restarting GC there would only spin failing rounds.
 
@@ -521,14 +519,13 @@ SYSTEM CAS FSCK [ON CLUSTER cluster_name] disk_name
 ```
 
 `disk_name` is **required**. The command returns one row with columns `disk`, `reachable`,
-`dangling`, `unreachable`, `pending_gc`, `awaiting_gc`, `unaccounted`, `stale_edge`,
-`corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`, `namespace_janitor_pending`,
+`dangling`, `unreachable`, `pending_gc`, `unaccounted`, `chain_broken`, `unchecked`,
+`lifeless_keys`, `namespace_janitor_pending`,
 `namespace_janitor_pending_bytes`, `namespace_janitor_pending_lives`, `ref_records_walked`,
 `physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, and `total_blob_refs`. `dangling` is
-the one column that means data loss; `unreachable` counts every present, unreferenced object, of
-which `pending_gc` are blobs whose `.meta` is `Condemned` and `unaccounted` the other blobs — not a
-problem on their own. `awaiting_gc`, `stale_edge` and `corrupted_runs` are always `0`. This is a
-summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
+the one column that means data loss; `unreachable` counts every present object no live ref
+references (`unaccounted` the blobs among them) — not a problem on their own. `pending_gc` is `0`: the
+retired set it counted belonged to the S3-listing GC. This is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
 
 ### SYSTEM CAS FORGET {#system-cas-forget}
 

@@ -15,7 +15,7 @@ namespace DB::Cas
 enum class MetaState : uint8_t
 {
     Clean = 0,       /// The body is present and may be referenced.
-    Condemned = 1,   /// GC observed zero in-degree; the body remains present until exact-token deletion,
+    Condemned = 1,   /// GC found no record referencing the blob; the body remains present until exact-token deletion,
                      /// so a writer may republish it by replacing the body and updating this marker.
 };
 

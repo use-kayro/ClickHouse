@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
@@ -788,34 +787,20 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// Present-but-unreferenced blobs, labeled by what the pool holds for them: `.meta = Condemned` (GC
-    /// condemned the blob and keeps the marker until its exact-token delete, or a writer re-uploads it) or
-    /// unreferenced. Labels only — reachability above never consults them. Only a blob with a listed
-    /// `.meta` costs a GET.
+    /// Present-but-unreferenced blobs. Reachability above never consults them.
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.contains(bkey))
             continue;
         ++report.unreachable;
-
-        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) is debris, not a pool object: unreferenced.
-        const std::optional<BlobRef> ref = layout.parseBlobKey(bkey);
-        std::optional<LoadedMeta> meta;
-        if (ref && present_meta_hashes.contains(*ref))
-            meta = loadMeta(op, layout, *ref);
-        const bool condemned = meta && meta->meta.state == MetaState::Condemned;
-
-        if (condemned)
-            ++report.pending_gc;
-        else
-            ++report.unaccounted;
+        ++report.unaccounted;
         if (detail)
         {
             FsckObject o;
             o.key = bkey;
             o.kind = ObjectKind::Blob;
             o.size = sz;
-            o.cls = condemned ? FsckClass::Condemned : FsckClass::Unreferenced;
+            o.cls = FsckClass::Unaccounted;
             report.objects.push_back(std::move(o));
         }
     }

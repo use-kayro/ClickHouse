@@ -15,7 +15,7 @@ class Layout;
 
 /// `_pool_meta` — the pool identity and the pool-wide constants that every reader and writer must
 /// agree on. The text representation is a header line followed by one JSON body object:
-/// {"pool_id":"<32hex>","blob_header_len":<blob_header_len>,"gc_shards":<gc_shards>,
+/// {"pool_id":"<32hex>","blob_header_len":<blob_header_len>,
 ///  "min_reader_generation":<min_reader_generation>,"algos_used":["<algo-word>",...]}.
 ///
 /// The persisted object is authoritative after creation. On reopen, `createOrValidate` uses its
@@ -26,7 +26,6 @@ struct PoolMeta
 {
     UInt128 pool_id{};
     uint64_t blob_header_len = 0;
-    uint64_t gc_shards = 1;   /// written and decoded for the format; nothing reads it
     uint64_t min_reader_generation = 0;
     /// Every hash algorithm ever admitted, encoded as `static_cast<uint8_t>(BlobHashAlgo)`, in strictly
     /// increasing order. Admission only appends a new algorithm to this durable set.

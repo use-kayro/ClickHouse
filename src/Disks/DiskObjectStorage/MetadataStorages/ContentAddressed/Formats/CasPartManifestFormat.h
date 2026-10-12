@@ -29,8 +29,7 @@ namespace DB::Cas
 ///                                payload-zone bytes — their bytes live in a separately addressed
 ///                                CAS blob; the manifest carries only the `BlobRef` + size.
 ///
-/// The payload zone is why this format is `PayloadHybrid` rather than a plain `RecordStream`/
-/// `Control` object: `inline_bytes` is arbitrary binary, not necessarily valid UTF-8, so it cannot be
+/// The payload zone is why this format is `PayloadHybrid` rather than a plain `Control` object: `inline_bytes` is arbitrary binary, not necessarily valid UTF-8, so it cannot be
 /// JSON-string-encoded safely and instead rides outside the JSON-line region entirely.
 
 /// Where a manifest entry's file bytes live. There are no nested tree objects: a directory is a path

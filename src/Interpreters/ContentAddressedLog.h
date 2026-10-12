@@ -24,8 +24,6 @@ struct ContentAddressedLogElement
     String object_kind;           /// none/blob/manifest/root/snap
     String object_hash;
     String token;
-    UInt64 round = 0;
-    UInt64 gen = 0;
     UInt64 at_version = 0;
     String outcome;
     String reason;

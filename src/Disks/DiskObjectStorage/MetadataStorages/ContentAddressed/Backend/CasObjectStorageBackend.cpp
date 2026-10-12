@@ -799,9 +799,8 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
 /// Settings for a genuine Native conditional write. Mark the request for the typed conditional
 /// dialect and, on a generation-token store, force a single PUT: GCS does not enforce the condition
 /// on multipart completion. Blob publication never uses these settings; it remains an ordinary
-/// unconditional multipart-capable write. CAS-mutable keys (shard manifests, gc/state, the registry)
-/// also skip the racy post-upload existence/size check; a publish's manifest CAS was observed racing
-/// the GC fence there.
+/// unconditional multipart-capable write. CAS-mutable keys (checkpoints, the catalog, mounts) also
+/// skip the racy post-upload existence/size check, which a concurrent conditional writer can race.
 WriteSettings ObjectStorageBackend::conditionalWriteSettings(size_t attempt_no) const
 {
     WriteSettings ws;

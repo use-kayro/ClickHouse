@@ -46,6 +46,8 @@ public:
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
     void latch() { latched = true; }
+    /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
+    void disarm() { throw_key.clear(); mismatch_key.clear(); latched = false; }
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
@@ -838,7 +840,9 @@ TEST(CASDecommission, DrainsDebrisStagingAndRoots)
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
-    EXPECT_GE(report.manifest_debris_removed, 1u);
+    /// The orphan body and the removed table's own committed manifest: both are unowned once the
+    /// namespace is removed, under a retired build.
+    EXPECT_EQ(report.manifest_debris_removed, 2u);
     EXPECT_EQ(report.staging_objects_removed, 2u);
     EXPECT_EQ(report.mountpoint_objects_removed, 1u);
 
@@ -974,6 +978,8 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 
     EXPECT_EQ(report.namespaces_removed, 1u)
         << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
+    EXPECT_EQ(report.manifest_debris_removed, 1u)
+        << "the removed table's own manifest is drained; only the failing body is left";
     EXPECT_EQ(report.warnings.size(), 1u)
         << "the thrown per-key delete must keep the retirement tail fail-closed";
     EXPECT_EQ(report.staging_objects_removed, 1u)
@@ -1276,8 +1282,9 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
 
 /// Task 4 fail-close, manifest-debris variant (review follow-up: the plan's own example only exercises
 /// a roots-phase failure). A per-key `deleteExact` throw inside the manifest-debris drain must ALSO
-/// keep the slot: `report.slot_removed == false` and the mount object survives.
-TEST(CASDecommission, ManifestDebrisFailureKeepsSlot)
+/// keep the slot: `report.slot_removed == false`, the mount object survives, and once the injected
+/// failure is cleared a re-run drains the leftover debris.
+TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     String debris_key;
@@ -1291,10 +1298,13 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlot)
     backend->latch();
 
     /// The engine reissues an unresolved delete until its own retry window closes, measured on this
-    /// clock, so the latched fault reaches a genuine give-up with no real time passing.
+    /// clock, so the latched fault reaches a genuine give-up with no real time passing. The admin's lease
+    /// TTL outlasts that fast-forward, as in `FailedDrainKeepsSlotThenResumes`, so its farewell lands.
     auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
     const auto first = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+        backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "a1", .mount_lease_ttl_ms = std::chrono::milliseconds(300'000)},
+        "victim",
         /*sink=*/{}, /*request_gc_round=*/{},
         [clock]
         {
@@ -1311,6 +1321,16 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlot)
         << "slot kept -- resume anchor";
     EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
         << "the failing object is left behind (untouched) so a re-run can retry it";
+
+    /// Once the injected failure is cleared, a re-run drains the leftover debris. The slot stays: the
+    /// victim's catalog row is `Removing` and nothing drains it (known gap since #4).
+    backend->disarm();
+    const auto second = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
+    EXPECT_EQ(second.namespaces_already_removed, 1u);
+    EXPECT_EQ(second.manifest_debris_removed, 1u);
+    EXPECT_FALSE(second.slot_removed);
+    EXPECT_FALSE((*raw_op).head(debris_key, Retry::once()).has_value());
 }
 
 /// CI run 7 (PR #2300): `drain_now_fn` fakes the drain's own request clock, but the mount lease's

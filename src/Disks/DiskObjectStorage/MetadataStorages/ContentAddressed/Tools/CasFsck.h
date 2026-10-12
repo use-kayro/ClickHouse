@@ -22,17 +22,13 @@ using FsckProgress = std::function<void(std::string_view phase, uint64_t objects
 /// Classification assigned to each object examined by `runFsck`.
 ///
 /// The reachability classes are derived only from authoritative refs and the physical object listing.
-/// `Condemned` and `Unreferenced` split the present-but-unreferenced blobs by their `.meta`; that label
-/// can never make a referenced object appear safe. Integrity classes are hard findings: the report
-/// remains unclean when any of them is present.
+/// Integrity classes are hard findings: the report remains unclean when any of them is present.
 enum class FsckClass : uint8_t
 {
     Reachable,     /// reachable from a live ref AND present in the object store
     Dangling,      /// reachable from a live ref but the object is MISSING — INV-NO-LOSS violation
     Unreachable,   /// pre-precommit manifest debris (labeled reclaimable / in-flight)
-    Condemned,     /// unreferenced blob whose `.meta` is `Condemned`: GC condemned it and keeps the marker
-                   /// until its exact-token delete, or until a writer re-uploads the blob
-    Unreferenced,  /// unreferenced blob with no `Condemned` marker
+    Unaccounted,   /// present blob that no live ref references
     /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
     /// object; the row's `key` identifies the exact log where the walk stopped or the checkpoint-named
     /// snapshot base whose required triple could not be validated.
@@ -79,16 +75,11 @@ struct FsckReport
 {
     uint64_t reachable = 0;
     uint64_t dangling = 0;
-    /// TOTAL of everything present-but-unreferenced (the two blob classes below + manifest debris).
+    /// TOTAL of everything present-but-unreferenced (unaccounted blobs + manifest debris).
     /// Kept as the sum so residual-settling loops (soak) keep one monotone number to watch.
     uint64_t unreachable = 0;
-    uint64_t pending_gc = 0;     /// unreferenced blobs with `.meta = Condemned` (`FsckClass::Condemned`)
-    uint64_t unaccounted = 0;    /// unreferenced blobs without that marker (`FsckClass::Unreferenced`)
-    /// Never counted. They remain only because the `SYSTEM CAS FSCK` row
-    /// (`InterpreterSystemQuery.cpp`'s `appendContentAddressedFsckRow`) still reads them.
-    uint64_t awaiting_gc = 0;
-    uint64_t stale_edge = 0;
-    uint64_t corrupted_runs = 0;
+    uint64_t pending_gc = 0;     /// blobs in the GC's retired set (none since the S3-listing round was deleted)
+    uint64_t unaccounted = 0;    /// present blobs no live ref references (`FsckClass::Unaccounted`)
 
     /// The per-hash `.meta` descriptor sibling of a blob body:
     /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.

@@ -38,7 +38,7 @@ TEST(CASFormatBattery, PoolMeta)
         .encode = [&] { return sealObject(FormatId::PoolMeta, encodePoolMeta(pm)); },
         .decode = [](std::string_view s) { decodePoolMeta(std::string(openObject(FormatId::PoolMeta, s))); },
         .golden = currentFormatHeader("cas_pool_meta") +
-                  "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"gc_shards\":1,\"min_reader_generation\":1,\"algos_used\":[\"ch128\"]}\n"});
+                  "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"min_reader_generation\":1,\"algos_used\":[\"ch128\"]}\n"});
 }
 
 TEST(CASPoolMeta, RejectsInvalidAlgoArrays)
@@ -46,7 +46,7 @@ TEST(CASPoolMeta, RejectsInvalidAlgoArrays)
     const auto decode = [](std::string_view algos_used)
     {
         return decodePoolMeta("{\"type\":\"cas_pool_meta\",\"v\":1}\n"
-            "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"gc_shards\":1,\"min_reader_generation\":1,\"algos_used\":" + String(algos_used) + "}\n");
+            "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"min_reader_generation\":1,\"algos_used\":" + String(algos_used) + "}\n");
     };
 
     /// The first value is the field's PREVIOUS encoding -- a comma-joined string inside one JSON

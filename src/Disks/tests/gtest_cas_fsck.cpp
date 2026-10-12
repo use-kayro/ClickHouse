@@ -1097,30 +1097,6 @@ TEST(CASFsck, ReclaimablePrePrecommitBodyIsInfo)
     EXPECT_GE(rep.unreachable, 1u);      // counted as info/unreachable
 }
 
-/// An unreferenced blob is labeled by its `.meta`: `Condemned` when GC condemned it, `Unreferenced`
-/// otherwise (no marker, or a `Clean` one). Neither is a finding.
-TEST(CASFsck, UnreferencedBlobIsLabeledByItsMeta)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(5));   /// no `.meta`
-    writeBlobBody(*backend, store->layout(), DB::UInt128(6));
-    writeMetaClean(*backend, store->layout(), DB::UInt128(6), /*size*/ 1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(7));
-    writeMetaClean(*backend, store->layout(), DB::UInt128(7), /*size*/ 1);
-    condemnMeta(*backend, store->layout(), DB::UInt128(7), /*condemn_round*/ 1);
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.unreachable, 3u);
-    EXPECT_EQ(rep.pending_gc, 1u);
-    EXPECT_EQ(rep.unaccounted, 2u);
-    const String condemned_key = store->layout().blobKey(legacyMetaTestRef(DB::UInt128(7)));
-    for (const FsckObject & o : rep.objects)
-        if (o.kind == ObjectKind::Blob && o.key.starts_with(store->layout().blobsPrefix()))
-            EXPECT_EQ(o.cls, o.key == condemned_key ? FsckClass::Condemned : FsckClass::Unreferenced) << o.key;
-}
-
 /// A `.meta` descriptor whose body is missing is ADVISORY (meta_without_body), NOT a hard finding:
 /// GC deletes the body FIRST and drops the `.meta` afterwards on a bounded, error-suppressed advisory
 /// pool that may drop the op, so a single raw LIST legitimately observes a body-less `.meta` mid-

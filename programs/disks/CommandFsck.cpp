@@ -69,10 +69,6 @@ public:
         /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
         std::cout << Cas::formatFsckSummary(report) << "\n";
 
-        if (report.pending_gc > 0)
-            std::cout << "note: " << report.pending_gc
-                      << " unreferenced blob(s) carry `.meta = Condemned`: GC condemned them and deletes them "
-                         "exact-token, or a writer re-uploads them (listed as `condemned` rows under --detail)\n";
         /// `unchecked` is not a finding and does not exit nonzero — it says the audit could not PROVE
         /// those namespaces either way, which is a statement about coverage. Saying so out loud is the
         /// whole point: a silent verdict of "no complaints" would read as a clean bill of health.
@@ -84,8 +80,7 @@ public:
                          "under --detail\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
-                      << " unreferenced blob(s) carry no `Condemned` marker (listed as `unreferenced` rows "
-                         "under --detail)\n";
+                      << " present blob(s) no live ref references (listed as `unaccounted` rows under --detail)\n";
         /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is debris
         /// of a removed namespace.
         if (report.namespace_janitor_pending > 0)
@@ -105,8 +100,7 @@ public:
                     case Cas::FsckClass::Reachable:   c = "reachable"; break;
                     case Cas::FsckClass::Dangling:    c = "dangling"; break;
                     case Cas::FsckClass::Unreachable: c = "unreachable"; break;
-                    case Cas::FsckClass::Condemned:   c = "condemned"; break;
-                    case Cas::FsckClass::Unreferenced: c = "unreferenced"; break;
+                    case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
                     case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
                     case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
                     case Cas::FsckClass::LifelessKey: c = "lifeless-key"; break;

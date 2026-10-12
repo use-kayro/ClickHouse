@@ -41,7 +41,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::PoolMeta:
         case FormatId::MountLease:
         case FormatId::Blob:
-        case FormatId::GcState:
         case FormatId::Roster:
         case FormatId::PartManifest:
         case FormatId::PartFiles:
@@ -120,7 +119,6 @@ constexpr FormatTraits TRAITS[] =
     /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`). The caps only bound
     /// decoding (the manifest's); what bounds a record in practice is Keeper's request size.
     {FormatId::PartFiles,    "cas_part_files",    TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256 * kMiB, 64 * kKiB},
-    {FormatId::GcState,      "cas_gc_state",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::Owner,        "cas_owner",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},

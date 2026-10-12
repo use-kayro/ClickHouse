@@ -14,8 +14,8 @@ namespace DB::Cas
 /// involved.
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
-/// `cas/ns/stream/` and `cas/ns/state/` roots, the `/mount` suffix, then the pool-wide `gc/state`
-/// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
+/// `cas/ns/stream/` and `cas/ns/state/` roots, the `/mount` suffix, then the pool-wide `blobs/`
+/// prefix). u128 and hash fields render as lowercase hex strings (matching
 /// `u128ToHex`); nothing is exposed as an array of bytes or a raw struct dump.
 ///
 /// Throws `ErrorCodes::BAD_ARGUMENTS` when `key` matches none of the recognized CA layouts. Any

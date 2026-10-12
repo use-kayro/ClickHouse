@@ -525,7 +525,6 @@ disk-level and server-level settings surface.
   fails closed instead of silently turning the pool mixed-algorithm.
 - `cas_gc_enabled` — `true` by default. Enables the background garbage collector for this disk.
 - `cas_gc_interval_sec` — `60` by default; must be `>= 1`. Interval between background GC rounds.
-- `cas_gc_shards` — `1` by default; must be `>= 1`. Unused.
 - Every physical blob materialization starts with `HEAD`. A present non-condemned blob is adopted;
   an absent or condemned blob is published unconditionally and its freshness metadata is reconciled
   to `Clean`. A genuine fresh miss issues no metadata GET before publication.

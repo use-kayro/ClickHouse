@@ -16,7 +16,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
-| `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
+| `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
 | `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer |
@@ -26,7 +26,6 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Keeper, not S3: `<zookeeper_path>/cas_parts/<part>` (one copy per part) | descriptor `pool`; the part's Inline entries (entry `path`, `place`=`inline`, `size`, then the payload zone); Blob entries are derived from the inline `checksums.txt` | `CasPartManifestFormat` (`encodePartFiles`) | `ReplicatedMergeTree` part commit |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state` | state of the retired S3-listing GC round (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) | `CasGcStateFormat` | none (`round` read at namespace removal; rendered by inspect; GC is `Gc/CasKeeperGc.h`) |
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 

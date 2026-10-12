@@ -21,9 +21,9 @@ special cases supporting all of this are scattered widely through the `MergeTree
 Content-addressed storage (`CAS`) is a `MetadataStorage` back-end for object-storage disks
 (`metadata_type = cas`) that takes the same sharing goal and collapses it onto one system: every
 `MergeTree` part file is stored once, keyed by the hash of its content, in the object-storage pool
-itself. There is no `CAS` state in `Keeper` at all — a commit is one conditional write against a
-single object in the pool — and the reachability accounting is a derived in-degree edge set folded
-from append-only deltas, not a mutable refcount a lost message can corrupt.
+itself. A commit is one conditional write against a single object in the pool, and blob liveness
+is derived from the part records `ReplicatedMergeTree` keeps in `Keeper`, not from a mutable
+refcount a lost message can corrupt.
 
 ```mermaid
 graph LR
@@ -34,15 +34,14 @@ graph LR
         R2 -.->|"shares bytes"| S1
     end
     subgraph cas["CAS: content-addressed pool"]
-        C1["Replica 1"] -->|"publish a ref"| P["S3 pool<br/>(refs, leases, GC — all in-bucket)"]
+        C1["Replica 1"] -->|"publish a ref"| P["S3 pool<br/>(refs, leases — all in-bucket)"]
         C2["Replica 2"] -->|"publish a ref"| P
     end
 ```
 
-Every CAS bookkeeping object — refs, mount leases, GC leadership, fencing tokens — lives in the
-bucket. There is no external coordinator, and no `Keeper` usage inside the pool protocol; `Keeper`
-stays exactly where `ReplicatedMergeTree` already used it, for replication log and part-set
-consensus, and its load does not grow with pool size.
+Every CAS bookkeeping object — refs, mount leases, fencing tokens — lives in the bucket. `GC` reads
+blob liveness from the part records `ReplicatedMergeTree` keeps in `Keeper` (one per part, next to
+its replication log and part set).
 
 ## Deployment guidance {#deployment-guidance}
 

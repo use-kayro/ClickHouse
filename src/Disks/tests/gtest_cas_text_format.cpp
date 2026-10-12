@@ -62,7 +62,7 @@ TEST(CASFormatIds, NewIdsExistWithFrozenValues)
 TEST(CASFormatTraits, CompleteUniqueAndGated)
 {
     /// Completeness: every FormatId except the reserved Roster has traits.
-    const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
+    const FormatId all[] = {FormatId::Blob, FormatId::PoolMeta,
                             FormatId::PartManifest, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
                             FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta,
                             FormatId::RefCkpt, FormatId::RefCatalog, FormatId::PartFiles};
@@ -302,8 +302,8 @@ TEST(CASZstdArm, SealOpenPolicyAndCaps)
 TEST(CASTextValueEscaping, ForwardSlashPinnedUnescaped)
 {
     /// Goes RED if the global escape_forward_slashes default ever leaks back into CAS string values.
-    /// CAS values are dense with '/' (ref-paths, fold-seal keys); their bytes must be CAS-owned so
-    /// cas_fold_seal byte-determinism and every golden text file are independent of the global default.
+    /// CAS values are dense with '/' (ref-paths, object keys); their bytes must be CAS-owned so every
+    /// golden text file is independent of the global default.
     CasJsonWriter out;
     writeStringValue(out, "ns/shard/all_1_2_0");
     EXPECT_EQ(std::move(out).take(), "\"ns/shard/all_1_2_0\"");

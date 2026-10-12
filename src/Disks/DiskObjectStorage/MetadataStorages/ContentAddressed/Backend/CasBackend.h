@@ -186,8 +186,8 @@ public:
     /// by reading the key back, and which this seam must never report as corruption.
     virtual std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                      const std::optional<String> & expected_value, TransportAccess &) = 0;
-    /// A forward-only read of a WRITE-ONCE object (runs, seals): nothing is materialized by the seam.
-    /// MUTABLE objects (root shards, gc/state, mounts) MUST use `read` -- their bytes may change
+    /// A forward-only read of a WRITE-ONCE object: nothing is materialized by the seam.
+    /// MUTABLE objects (checkpoints, the catalog, mounts) MUST use `read` -- their bytes may change
     /// under an open stream. Null when the key is absent.
     virtual std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess &) = 0;
     /// Executes one unconditional blob publication and returns once the complete destination is

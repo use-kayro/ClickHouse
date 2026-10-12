@@ -79,9 +79,6 @@ struct PoolConfig
     /// the cache and every catalog write reads first. 16 MiB: the catalog is under 1 MiB, and the
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
-    /// The `cas_gc_shards` setting, which nothing uses: the wiring still sets it and the ref ledger still
-    /// passes it to `CasRefCatalog::createNamespace`, which ignores it.
-    uint64_t gc_shards = 1;
     /// Bounded pool size for the per-hash freshness
     /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
     /// take hours sequential). Every job internally catches its own exceptions (never wedges the round;
@@ -237,7 +234,6 @@ struct PoolConfig
     {
         return RefLedgerConfig{
             .server_root_id = server_root_id,
-            .gc_shards = gc_shards,
             .snapshot_log_count_threshold = snapshot_log_count_threshold,
             .snapshot_log_bytes_threshold = snapshot_log_bytes_threshold,
             .snapshot_publish_backoff_initial_ms = snapshot_publish_backoff_initial_ms,
@@ -536,9 +532,9 @@ public:
     void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RefPublishedAtUpdate &)> mutator);   /// one set_published_at txn
     /// The catalog transition to `Removing` happens first, then one ref-log transaction naming every
-    /// owner's exact removal followed by `remove_namespace`. Performs no physical deletion: GC records
-    /// folded terminal evidence and later removes the exact catalog row, while the perpetual janitor
-    /// reclaims dead-life stream, checkpoint, and namespace-file bytes independently.
+    /// owner's exact removal followed by `remove_namespace`. Performs no physical deletion, and nothing
+    /// later removes the `Removing` catalog row or the dead life's stream, checkpoint and namespace-file
+    /// bytes (known gap).
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
     /// Decommission-only exact-life overload; never re-resolves by namespace name.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);

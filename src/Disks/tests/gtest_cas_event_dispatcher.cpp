@@ -100,7 +100,7 @@ TEST(CASEventDispatcher, ReentrantSinkDoesNotDeadlock)
         if (e.type == CasEventType::BlobPut && !reentered_once.exchange(true))
         {
             CasEvent second;
-            second.type = CasEventType::BlobDelete;
+            second.type = CasEventType::BlobForget;
             disp.emit(std::move(second));
         }
     });
@@ -111,7 +111,7 @@ TEST(CASEventDispatcher, ReentrantSinkDoesNotDeadlock)
 
     ASSERT_EQ(delivered.size(), 2u) << "both the original and the reentrant event must be delivered";
     EXPECT_EQ(delivered[0], CasEventType::BlobPut);
-    EXPECT_EQ(delivered[1], CasEventType::BlobDelete)
+    EXPECT_EQ(delivered[1], CasEventType::BlobForget)
         << "the reentrant event is drained AFTER the current sink returns, not recursively";
 }
 

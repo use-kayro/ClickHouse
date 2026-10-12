@@ -371,8 +371,7 @@ RefCatalog CasRefCatalog::casAdmitEntry(
 }
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
-    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    uint64_t removal_started_round)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed)
 {
     if (observed.state != NsState::Live || observed.creator || observed.removal_started_round)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -391,7 +390,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
         RefCatalog next = cur;
         CatalogEntry & entry = next.entries[it - cur.entries.begin()];
         entry.state = NsState::Removing;
-        entry.removal_started_round = removal_started_round;
+        entry.removal_started_round = 0;
         return next;
     };
 
@@ -504,7 +503,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
-    CasOperation & op, const Layout & layout, uint64_t /*gc_shards*/,
+    CasOperation & op, const Layout & layout,
     const RootNamespace & ns, const CreatorFence & creator, const Retry & policy)
 {
     /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already

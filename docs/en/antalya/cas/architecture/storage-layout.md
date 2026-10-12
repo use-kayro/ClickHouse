@@ -33,16 +33,10 @@ namespace's shape and never interprets its contents.
 | `blobs/<algo>/<hex[0:2]>/<hex>` | blob envelope + payload | `cas_blob` | uploads |
 | `blobs/<algo>/<hex[0:2]>/<hex>.meta` | blob freshness sidecar | `cas_blob_meta` | dedup/GC |
 | `cas/ns/stream/<life_id>/_log/<epoch-hex>-<seq-hex>.zst` | ref transaction log | `cas_ref_log` | writer commit path |
-| `cas/ns/stream/<life_id>/_snap/<epoch-hex>-<seq-hex>.zst` | complete ref table snapshot | `cas_ref_snap` | writer/GC fold |
-| `cas/ns/state/<life_id>/_ckpt` | mutable per-life checkpoint | `cas_ref_ckpt` | writer/GC fold |
+| `cas/ns/stream/<life_id>/_snap/<epoch-hex>-<seq-hex>.zst` | complete ref table snapshot | `cas_ref_snap` | writer |
+| `cas/ns/state/<life_id>/_ckpt` | mutable per-life checkpoint | `cas_ref_ckpt` | writer |
 | `cas/ns/state/<life_id>/_files/<relative-name>` | namespace-owned verbatim file | — (raw passthrough) | upper layers |
 | `cas/manifests/<namespace>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `cas_part_manifest` | part build |
-| `gc/state` | GC state (incl. GC lease) | `cas_gc_state` | GC |
-| `gc/hb` | GC leader heartbeat | `cas_gc_hb` | GC |
-| `gc/maintenance_state` | leak-only namespace-janitor cursor | `cas_gc_maintenance_state` | future janitor |
-| `gc/gen/<gen>/attempt/<att>/fold_seal` | fold seal (deterministic) | `cas_fold_seal` | GC |
-| `gc/gen/<gen>/attempt/<att>/blob_target/<shard>/<seq>` | GC source-edge run segment | `cas_run` | GC |
-| `gc/gen/<gen>/attempt/<att>/outcomes/<round>/<shard>.zst` | GC outcome log | `cas_gc_outcomes` | GC |
 | `gc/server-roots/<server_root_id>/owner` | server-root owner singleton | `cas_owner` | mount |
 | `gc/server-roots/<server_root_id>/epoch` | server-root epoch singleton | `cas_epoch` | mount |
 | `gc/server-roots/<server_root_id>/mount` | mount lease (incl. `min_active_build_sequence` watermark) | `cas_mount_lease` | mount |
@@ -51,9 +45,7 @@ namespace's shape and never interprets its contents.
 
 `<algo>` is `ch128`, `xxh3`, or `sha256` — the hash algorithm is a path segment because one pool may
 legally hold blobs under several algorithms at once. `<hex[0:2]>` is a flat two-character S3 key
-shard for request-fan-out, unrelated to the separate `cas_gc_shards` GC-internal reduction fan-out
-(which appears only inside `gc/gen/…` keys and routes by the digest's high 64 bits, read
-big-endian). Discovery LISTs use fixed prefixes: `cas/ns/stream/`, `cas/ns/`, `cas/manifests/`,
+shard for request-fan-out. Discovery LISTs use fixed prefixes: `cas/ns/stream/`, `cas/ns/`, `cas/manifests/`,
 `blobs/` (deliberately without the algorithm segment, so one recursive LIST covers every
 algorithm), `roots/`, `gc/server-roots/`. `staging/` is a top-level sibling that no GC LIST ever
 touches — it is reclaimed only by its own server's next mount.
@@ -73,8 +65,8 @@ Every persisted CAS metadata object is text: a header line, a body, and an optio
 `UNKNOWN_FORMAT_VERSION`, checked before the body. A `.zst` key suffix means, exactly, that the
 object kind's compression policy is `Always`: the object is stored as one zstd frame with the
 checksum flag on, and its declared content size is checked against a per-kind cap before
-allocation. Always-small and deterministic kinds (`cas_ref_ckpt`, `cas_blob_meta`, `cas_fold_seal`,
-`cas_run`, …) are stored raw, with no `.zst` suffix.
+allocation. Always-small kinds (`cas_ref_ckpt`, `cas_blob_meta`, `cas_mount_lease`, …) are stored
+raw, with no `.zst` suffix.
 
 The blob envelope is a special case of the header/body shape: a JSON descriptor padded with ASCII
 spaces to a pool-constant `blob_header_len` (256 bytes, a `cas_pool_meta` field), terminated by
@@ -98,22 +90,15 @@ Condensed from the authoritative traits table in `CasFormat.cpp` (`TRAITS`, asse
 | `cas_ref_ckpt` | `Control` | strict | never |
 | `cas_ref_catalog` | `Control` | strict | never |
 | `cas_part_manifest` | `PayloadHybrid` | tolerant | always (`.zst`) |
-| `cas_run` | `RecordStream` | strict | pinned raw |
-| `cas_fold_seal` | `Control` | strict | pinned raw |
-| `cas_gc_state` | `Control` | tolerant | never |
-| `cas_gc_hb` | `Control` | tolerant | never |
-| `cas_gc_outcomes` | `Control` | tolerant | always (`.zst`) |
-| `cas_gc_maintenance_state` | `Control` | strict | never |
+| `cas_part_files` | `PayloadHybrid` | tolerant | never (a Keeper znode value) |
 | `cas_owner` | `Control` | tolerant | never |
 | `cas_epoch` | `Control` | tolerant | never |
 | `cas_mount_lease` | `Control` | tolerant | never |
 
 "Strict" means unknown keys are rejected rather than skipped, used for objects where every field
-decides a durability or cleanup decision (`cas_ref_ckpt`, `cas_ref_catalog`, `cas_fold_seal`,
-`cas_run`, `cas_gc_maintenance_state`); a `!`-prefixed key is always critical regardless of the
-kind's strictness. "Pinned raw" objects (`cas_run`, `cas_fold_seal`) need stable bytes across
-re-encodes for deterministic-artifact adoption, so their bytes are never recompressed once
-written. `cas_blob` and `cas_part_manifest` are the `PayloadHybrid` family: a text descriptor
+decides a durability or cleanup decision (`cas_ref_ckpt`, `cas_ref_catalog`); a `!`-prefixed key is
+always critical regardless of the kind's strictness. `cas_blob`, `cas_part_manifest` and
+`cas_part_files` are the `PayloadHybrid` family: a text descriptor
 followed by a raw payload zone, rather than a single JSON body.
 
 ## Worked example tree {#worked-example}
@@ -135,12 +120,7 @@ ca-pool/blobs/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728.meta
 
 ca-pool/roots/srv1/clickhouse_access_check_8f3a1c2d
 
-ca-pool/gc/state
-ca-pool/gc/hb
 ca-pool/gc/server-roots/srv1/{owner,epoch,mount}
-ca-pool/gc/gen/7/attempt/1/fold_seal
-ca-pool/gc/gen/7/attempt/1/blob_target/0/1
-ca-pool/gc/gen/7/attempt/1/outcomes/1/0.zst
 
 ca-pool/staging/srv1/<upload scratch>
 ```

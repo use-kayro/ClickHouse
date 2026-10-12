@@ -264,7 +264,7 @@ TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeep
     EXPECT_TRUE(backend->fired());
     EXPECT_FALSE(report.slot_removed);
     ASSERT_FALSE(report.warnings.empty());
-    EXPECT_NE(report.warnings.front().find("pool member decommission underway: 1 namespace(s)"), String::npos)
+    EXPECT_NE(report.warnings.front().find("pool member decommission incomplete: 1 namespace(s)"), String::npos)
         << report.warnings.front();
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);

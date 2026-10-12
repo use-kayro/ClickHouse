@@ -13,8 +13,8 @@ A blob is the unit of content-addressed storage: one part file's bytes, keyed by
 own content. This page covers how a blob is observed or published, how a duplicate write is
 turned into a no-op, and how a writer and a `GC` round racing over the same blob are kept safe
 without ever comparing multi-gigabyte bodies. Object layout and the four durable object kinds
-are covered on the [overview page](/antalya/cas/architecture/); `GC`'s fold and round structure
-is covered on the GC page.
+are covered on the [overview page](/antalya/cas/architecture/); `GC`'s round is covered on the
+[GC page](/antalya/cas/architecture/garbage-collection).
 
 ## HEAD-then-publication sequence {#conditional-write-sequence}
 
@@ -124,29 +124,25 @@ sequenceDiagram
     participant S3 as Object store
     participant GC as GC leader
 
-    Note over GC: round n -- fold finds in-degree 0
+    Note over GC: round n -- no remaining record references the blob
     GC->>S3: HEAD blob -- capture exact token t1
-    GC->>S3: write .meta = Condemned round n
+    GC->>S3: write .meta = Condemned
 
     rect rgba(120,160,255,0.12)
     Note over W,S3: a writer arrives wanting this content
-    W->>S3: append ref-log PRECOMMIT (durable +1 edge)
+    W->>S3: append ref-log PRECOMMIT (durable edge)
     W->>S3: HEAD blob (present, token t1)
     W->>S3: GET .meta
     alt meta is Clean
         W->>W: adopt t1 as dependency
-        Note over GC: next fold sees in-degree >= 1 -- spared
+        Note over GC: the build existed at condemnation -- no delete until it retires, and its part's record then references the blob
     else meta is Condemned
         W->>S3: PUT blob unconditional re-upload of writer own source, fresh incarnation tag -- token t2 not t1
         W->>S3: CAS .meta back to Clean
     end
     end
 
-    Note over GC: round n+1 -- graduation, only if still zero
-    GC->>S3: re-verify in-degree, requires confirmed durable Condemned evidence for hash+token t1
-    Note over GC: publishes delete_pending
-
-    Note over GC: round n+2 -- the single content-delete site
+    Note over GC: a later round -- no record references the blob, every build that existed at condemnation retired
     GC->>S3: deleteExact(blob, t1)
     alt writer republished
         S3-->>GC: TokenMismatch -- nothing deleted, blob is live at t2
@@ -163,16 +159,14 @@ and a writer never trusts a body it did not itself just write.
 
 Why this closes the race in both directions:
 
-- A writer that **adopts** a present body must have read a non-`Condemned` marker, and its precommit
-  edge was durable *before* that read. The next fold therefore sees in-degree ≥ 1 and spares the
-  blob.
+- A writer that **adopts** a present body read a non-`Condemned` marker. If `GC` condemned the blob
+  after that read, the writer's build existed at the condemnation, so the blob is not deleted until
+  the build retires — by which time its committed part has a Keeper record referencing the blob.
 - A writer that **replaces a condemned incarnation** changes the token. A stale `deleteExact(t1)` then returns
   `TokenMismatch` and reclaims nothing — the delete names an exact incarnation, never "the object
   at this key".
-- The delete lags condemnation by at least two full rounds, and publishing the one edge that
-  authorizes an irreversible delete requires confirmed durable `Condemned` evidence for that
-  exact `(hash, token)` pair. Without it `GC` never throws — it carries the entry and retries the
-  marker write on the next round.
+- `GC` keeps a condemnation only once the `Condemned` marker for that exact `(hash, token)` pair is
+  confirmed durable. Without it `GC` never throws — it condemns the blob again on the next round.
 
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.
@@ -184,47 +178,14 @@ in RAM at a time. Native object storage streams and can use multipart.
 ### The `.meta` sidecar {#meta-sidecar}
 
 `.meta` has exactly two states: `Clean` (body present, may be referenced) and `Condemned`
-(`GC` observed zero in-degree; the body is still present and a writer may replace it). An
-*absent* `.meta` reads exactly like `Clean` — there is no third "unaccounted" state in the
-stored format; `unaccounted` is an `ca-fsck` classification, not something `GC` ever writes.
+(`GC` found no record referencing the blob; the body is still present and a writer may replace it).
+An *absent* `.meta` reads exactly like `Clean` — there is no third state in the stored format;
+`unaccounted` is a `cas-fsck` classification, not something `GC` ever writes.
 
 The record carries `state`, `condemn_round`, and `size`, and deliberately carries **no token**:
 it is a per-hash hint, not a per-incarnation fact. All safety comes from the body's in-envelope
 `incarnation_tag` plus exact-token deletes; a stale marker costs at worst one spurious re-upload,
 never a lost delete or a false revival.
-
-## Deterministic artifacts and the adoption pin {#deterministic-artifacts}
-
-Some CAS objects are a pure function of their inputs: the `GC` source-edge run files (`cas_run`)
-and fold seals (`cas_fold_seal`). For these, `putDeterministicArtifact`
-(`Gc/CasBlobInDegree.cpp:341-352`) is the write-once helper:
-
-```cpp
-if (backend.putIfAbsent(key, bytes).outcome == PutOutcome::PreconditionFailed)
-{
-    const auto existing = backend.get(key);
-    if (!existing || existing->bytes != bytes)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, ...);
-    /// byte-equal => our own deterministic replay; adopt (no-op).
-}
-```
-
-The idempotency argument: identical inputs produce byte-identical output, so a replayed round —
-leader deposed mid-round, round `CAS` aborted, crash-restart — re-derives exactly the same bytes.
-A 412 therefore means "already occupied by our own replay", verified by comparing the fetched
-bytes, not inferred from occupancy alone as blob uploads do. Divergent bytes are impossible under
-correct operation and fail closed as `CORRUPTED_DATA`.
-
-This is the format-evolution **adoption pin**, documented in the persisted-format registry
-(`Formats/README.md`): on a `putDeterministicArtifact` conflict, the writer re-encodes at the `v`
-of the *existing* object rather than at its own current build's version, so two writers on
-different builds replaying the same deterministic round still land on byte-identical output.
-
-The helper is explicitly **not** for observation-bearing artifacts — `GC` outcome logs carry
-`HEAD`-observed tokens on which two observers may legitimately disagree, so those use
-first-durable-write-wins byte-adopt semantics instead. And a blob body can never use this path:
-the fresh-tag rule means two attempts at the same logical create are allowed to legitimately
-differ, which is exactly what `putDeterministicArtifact`'s divergence check would reject.
 
 ## Settings {#settings}
 
@@ -238,7 +199,3 @@ The disk configuration element is shared by several consumers. The `CAS` setting
 | `cas_staging_backend` | Blob staging backend (`local` \| `s3`); `s3` is opt-in | `local` |
 | `cas_scratch_path` | Server-local scratch directory for the local-staging write-buffer spill; a relative value is anchored to the server data path | `<clickhouse-path>/disks/<disk_name>/cas_scratch/` |
 | `gcs_max_conditional_put_bytes` | Largest conditional non-blob `PUT` on a generation-token store, covering create-if-absent artifacts and conditional replacements; unconditional blob publication is not subject to this cap | 1 GiB |
-
-`GC`-round budgets that gate condemnation and reclaim of these same blobs (graduation, redelete,
-sweep budgets) live on the GC architecture page, not here — they govern the `GC` side of the race
-in [Writer-versus-GC race](#writer-gc-race), not the write path.

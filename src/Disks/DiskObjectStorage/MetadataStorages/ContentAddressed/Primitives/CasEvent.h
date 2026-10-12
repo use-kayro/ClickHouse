@@ -16,16 +16,11 @@ namespace DB::Cas
 /// successful user-visible operations.
 enum class CasEventType
 {
-    BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobRetire, BlobRetireReplaced, BlobDelete, BlobForget,
-    ManifestPut, ManifestDelete,
-    RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
-    GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
-    GcFence, GcCursorAdvance, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
-    /// One GC round anomaly, with the context of the decision it forced. `gc_fold_end` reports only a
-    /// COUNT of anomalies, which cannot even distinguish a ref-prefix enumeration disagreement from an
-    /// undecodable ref-log body -- so every investigation had to fall back on the rotated text log, which
-    /// is how a masked permission error once produced a confident "no occurrences". An anomaly aborts ref
-    /// folding; that decision deserves a queryable record, not a counter.
+    BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobForget,
+    ManifestPut,
+    RefPublish, RefDrop, RefRepoint, RootRepoint,
+    GcRetireDecision, GcCursorAdvance, GcShardReclaim,
+    /// One GC round anomaly, with the context of the decision it forced.
     GcAnomaly,
     GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
@@ -58,8 +53,7 @@ enum class CasEventObjectKind { None, Blob, Manifest, Root, Snap };
 /// `token` identifies an object incarnation on events about a stored object (`object_kind` is Blob or
 /// Manifest); the part-build lifecycle events that carry a token at all (`BuildStart`, `Precommit`,
 /// `BuildPublish`, `BuildAbort`) reuse it for the 128-bit build id in hex and leave `object_kind` at
-/// `None`. The numeric fields
-/// identify GC rounds, snapshot generations, or the manifest journal version as applicable.
+/// `None`. `at_version` is the manifest journal version, when applicable.
 struct CasEvent
 {
     CasEventType type = CasEventType::BlobPut;
@@ -68,8 +62,6 @@ struct CasEvent
     CasEventObjectKind object_kind = CasEventObjectKind::None;
     String object_hash;         /// lowercase hex (empty if N/A)
     String token;               /// incarnation token; the hex build id on build lifecycle events (empty if N/A)
-    UInt64 round = 0;
-    UInt64 gen = 0;
     UInt64 at_version = 0;
     String outcome;             /// e.g. "ok","adopt","deleted","zeroed" (empty if N/A)
     String reason;              /// REQUIRED: the human-readable WHY of the decision

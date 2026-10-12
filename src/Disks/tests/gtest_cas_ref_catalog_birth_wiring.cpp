@@ -389,7 +389,7 @@ TEST(CASRefCatalogBirthWiring, ASiblingsFullCreateInsideCreateNamespacesOwnPreCh
     /// that observes the sibling's `Live` row.
     CasRefCatalog::setCreateNamespacePreCheckHookForTest([&]
     {
-        const auto sibling_outcome = CasRefCatalog::createNamespace(sibling_op, layout, 1, ns, sibling_fence);
+        const auto sibling_outcome = CasRefCatalog::createNamespace(sibling_op, layout, ns, sibling_fence);
         ASSERT_EQ(sibling_outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
     });
 

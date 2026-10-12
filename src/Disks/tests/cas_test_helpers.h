@@ -10,7 +10,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -406,11 +405,6 @@ inline DB::Cas::BlobRef writeBlobRaw(
     return id;
 }
 
-/// Forward declaration: `appendOwnerEvent` (below) calls `registerNamespaceRaw`, which after Task 4
-/// is a no-op (LIST-based discovery needs no explicit registration) defined further down.
-inline void registerNamespaceRaw(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns);
-
 /// Write a part-manifest body object directly via the manifest codec, exactly as PartWriteTxn::stageManifest
 /// emits it. Returns the ManifestId. Used by GC fold/retire/fsck tests to stage owner targets.
 inline DB::Cas::ManifestId writeManifestRaw(
@@ -592,14 +586,6 @@ inline void deleteManifestBody(
     OperationForTest op(backend);
     if (const auto h = (*op).head(key, DB::Cas::Retry::standard()))
         (*op).remove(key, h->etag, DB::Cas::Retry::standard());
-}
-
-/// Formerly wrote the namespace into `gc/registry`. Real write helpers now admit the authoritative
-/// catalog row themselves, so this legacy fixture hook has no independent registration work.
-inline void registerNamespaceRaw(
-    DB::Cas::Backend & /*backend*/, const DB::Cas::Layout & /*layout*/, const DB::Cas::RootNamespace & /*ns*/)
-{
-    /// No-op: Task 4 deleted the registry; `cas/ref_catalog` is now the discovery authority.
 }
 
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).

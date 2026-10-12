@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -253,27 +252,6 @@ String renderMountLease(const MountLease & m)
         .str();
 }
 
-String renderGcLease(const GcLease & l)
-{
-    return JsonObj()
-        .add("owner", jsonHex(l.owner))
-        .add("seq", jsonUInt(l.seq))
-        .str();
-}
-
-String renderGcState(const GcState & s)
-{
-    return JsonObj()
-        .add("round", jsonUInt(s.round))
-        .add("gc_shards", jsonUInt(s.gc_shards))
-        .add("snap_generation", jsonUInt(s.snap_generation))
-        .add("snap_pruned_through", jsonUInt(s.snap_pruned_through))
-        .add("snap_attempt", jsonUInt(s.snap_attempt))
-        .add("manifest_sweep_cursor", jsonEscape(s.manifest_sweep_cursor))
-        .add("lease", renderGcLease(s.lease))
-        .str();
-}
-
 String renderProvenance(const Provenance & p)
 {
     return JsonObj()
@@ -355,9 +333,6 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "cas-inspect: unhandled ref-object kind for key '{}'", key);
     }
 
-    if (key == layout.gcStateKey())
-        return renderGcState(decodeGcState(bytes));
-
     if (key.ends_with("/mount"))
         return renderMountLease(decodeMountLease(bytes));
 
@@ -372,7 +347,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
         "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
-        "gc/server-roots/*/mount, gc/state, blobs, blobs/*.meta)", key);
+        "gc/server-roots/*/mount, blobs, blobs/*.meta)", key);
 }
 
 }

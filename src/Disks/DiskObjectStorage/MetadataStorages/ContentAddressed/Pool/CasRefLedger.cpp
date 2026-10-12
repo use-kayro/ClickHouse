@@ -1329,7 +1329,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
             const auto outcome = CasRefCatalog::createNamespace(
-                op, layout, config.gc_shards, ns, our_fence, policy);
+                op, layout, ns, our_fence, policy);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
@@ -5192,8 +5192,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         else if (entry_it->state == NsState::Live)
         {
             observed_live = *entry_it;
-            /// `removal_started_round` stays in the row format, sealed at 0: its only reader was the deleted GC.
-            switch (CasRefCatalog::beginRemoving(removal_op, layout, *observed_live, /*removal_started_round=*/ 0))
+            switch (CasRefCatalog::beginRemoving(removal_op, layout, *observed_live))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
@@ -5330,8 +5329,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         });
     }
 
-    /// The writer performs no physical deletion of ref-log/snapshot objects or namespace files. Once
-    /// the catalog row is drained, those objects are dead-life debris for the perpetual janitor.
+    /// The writer performs no physical deletion of ref-log/snapshot objects or namespace files, and
+    /// nothing reclaims them later (known gap).
     return stats;
 }
 

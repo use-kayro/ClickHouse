@@ -58,8 +58,7 @@ reclaimed by `GC`.
 `system.cas_log` carries the audit trail. `CASGCRetiredCondemned` counts condemned blobs.
 
 `SYSTEM CAS FSCK` / `clickhouse-disks cas-fsck` distinguish `dangling` — referenced but missing,
-data loss — from present, unreferenced blobs, which it labels by their `.meta`: `condemned` or
-`unreferenced`.
+data loss — from `unaccounted`: present, unreferenced blobs.
 
 ## Operational surface {#operational-surface}
 

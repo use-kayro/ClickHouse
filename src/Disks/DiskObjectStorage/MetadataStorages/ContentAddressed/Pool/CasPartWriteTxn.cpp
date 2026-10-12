@@ -881,14 +881,12 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
             /// NO writer-side view refresh here:
             /// Gate A): promote-time view freshness is not load-bearing — `Materialized` leaves are
-            /// edge-protected (EDGE-BEFORE-OBSERVE), while `TrustedManifest` relies on the live source edge.
+            /// protected by this unretired build, while `TrustedManifest` relies on the live source record.
 
-            /// The `WPromote` owner guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits
-            /// NO blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the
-            /// precommit is STILL the live owner of the ref: if an abandon or GC reclaim already appended
-            /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
-            /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
-            /// manifest (INV_NO_DANGLE). `RefTableState::getPrecommits` materializes live ownership directly:
+            /// The `WPromote` owner guard (`owner[m] = bld`): a promote is a PURE owner MOVE. It is only
+            /// sound while the precommit is STILL the live owner of the ref: if an abandon already appended
+            /// a removal of the precommit binding, a move would re-publish a committed ref the build no
+            /// longer owns (INV_NO_DANGLE). `RefTableState::getPrecommits` materializes live ownership directly:
             /// `id.ref` alone identifies the build (there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
             if (!state.getPrecommits().contains({final_ref_name, id.ref}))
@@ -899,13 +897,11 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     final_ref_name, u128ToHex(promote_build_id)));
 
             /// Blob-leaf revalidation. `Materialized` leaves are
-            /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
-            /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
-            /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
-            /// view under that edge. They are not re-checked here. `TrustedManifest` records a
-            /// committed-source adoption. There is no per-file probe on this path: that leaf is trusted via the
-            /// durable manifest edge (the live source pins the blob, in-degree >= 1, not condemnable) and this
-            /// build's precommit edge is durable — matching the relink trust model (ordinary
+            /// protected by this build: GC deletes a condemned blob only once every build that existed at
+            /// its condemnation has retired (`Pool::minActive`), and this build has not. They are not
+            /// re-checked here. `TrustedManifest` records a committed-source adoption. There is no per-file
+            /// probe on this path: that leaf is trusted via its source part's Keeper record, which GC reads
+            /// as liveness, and this build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
             for (const ManifestEntry & e : body.entries)
@@ -928,10 +924,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
                         /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
                         /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
-                        /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
-                        /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
-                        /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
-                        /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
+                        /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner, and this build has
+                        /// not retired, so GC cannot delete a blob it condemned while the build runs. The backstop for
                         /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
                         /// (`CasFsck.cpp`, `++report.dangling`), not this gate.
                         ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);

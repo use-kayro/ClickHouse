@@ -146,7 +146,7 @@ def test_drop_dead_pool_member():
     assert fields[0] == SRID2, report_tsv
     assert int(fields[1]) >= 1, report_tsv  # namespaces_removed: the drop half did its work
     assert int(fields[8]) == 0, report_tsv  # slot_removed: t2's `Removing` row is still owned
-    assert "pool member decommission underway" in fields[9], report_tsv
+    assert "pool member decommission incomplete" in fields[9], report_tsv
 
     # (7) node1's own data survives the decommission untouched.
     assert int(node1.query("SELECT count() FROM t1")) == n1_count

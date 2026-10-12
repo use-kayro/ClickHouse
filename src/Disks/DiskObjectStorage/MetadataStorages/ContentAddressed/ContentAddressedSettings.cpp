@@ -58,7 +58,6 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_interval_sec, 60, "Seconds between background GC rounds (>= 1)", 0) \
     DECLARE(String, blob_hash, "cityhash128", "Pool blob content-hash function (cityhash128 | xxh3-128 | sha256); fixed at pool creation", 0) \
     DECLARE(Bool,   blob_hash_allow_new, false, "Explicit opt-in to admit a NEW hash algo into an existing pool's algos_used", 0) \
-    DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, mount_lease_ttl_ms, 30000, "Mount lease validity after a successful claim or renewal, in milliseconds", 0) \
     DECLARE(UInt64, mount_renew_period_ms, 10000, "Interval between background mount lease renewals, in milliseconds", 0) \
     DECLARE(Bool, unsafe_remount_no_delay, false, "Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same server_uuid (a copied uuid file, a stalled predecessor): after such a reclaim the predecessor can still start conditional writes until its own cutoff (confirmed deadline − margin − 2 × envelope) or until its next renewal meets the token guard, and a request it already sent may materialize later. Ref-log keys carry (writer_epoch, sequence) and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles stragglers -- the exposure is availability, not data: recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions. Intended for test stands and deployments that guarantee one process per uuid", 0) \
@@ -215,10 +214,10 @@ void ContentAddressedSettings::validate()
 {
     auto & settings = *this;
 
-    if (settings[ContentAddressedSetting::gc_interval_sec] == 0 || settings[ContentAddressedSetting::gc_shards] == 0)
+    if (settings[ContentAddressedSetting::gc_interval_sec] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "content_addressed disk: cas_gc_interval_sec and cas_gc_shards must be >= 1 (got {}, {})",
-            settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value);
+            "content_addressed disk: cas_gc_interval_sec must be >= 1 (got {})",
+            settings[ContentAddressedSetting::gc_interval_sec].value);
 
     if (settings[ContentAddressedSetting::attempt_timeout_ms] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

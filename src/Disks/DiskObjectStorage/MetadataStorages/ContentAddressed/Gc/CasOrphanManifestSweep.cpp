@@ -1,38 +1,20 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Common/Exception.h>
-#include <Common/ProfileEvents.h>
-#include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 #include <algorithm>
-#include <map>
-#include <memory>
 #include <set>
 #include <limits>
-
-namespace ProfileEvents
-{
-    extern const Event CASGCEnumerationPages;
-}
 
 namespace DB::Cas
 {
 
 namespace
 {
-
-/// Hook used by this file's GC-owned enumeration calls to `forEachListedKey` and `recoverRefTable`.
-/// It increments once per physical LIST page, never once per listed key.
-void onGcEnumerationPage()
-{
-    ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
-}
 
 /// The durable build floor is stored in the per-server mount lease together with the writer epoch. A
 /// namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain slashes.
@@ -138,7 +120,7 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        const std::set<String> & listed_server_roots, std::vector<String> * warnings)
+                        const std::set<String> & listed_server_roots, std::vector<String> & warnings)
 {
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
@@ -148,10 +130,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
     /// ordered view throws, causing the sweep to skip deletion and surface the error; it never substitutes
     /// an empty owner set. Skip this namespace's deletions on such a throw rather than deleting against a
-    /// wrong (empty) view. When a
-    /// caller opted in (`warnings != nullptr`), this "cannot confirm emptiness" also lands in `*warnings`
-    /// -- not just the log -- so a decommission run does not silently report a clean drain that never
-    /// happened; a caller without `warnings` gets the log line only.
+    /// wrong (empty) view. This "cannot confirm emptiness" also lands in `warnings` -- not just the log --
+    /// so a decommission run does not silently report a clean drain that never happened.
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
     const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, ns);
@@ -168,8 +148,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
             const String warning = "CAS orphan sweep: namespace " + ns.string()
                 + " is catalog-named but its required _ckpt is absent; skipped, emptiness not confirmed";
             LOG_WARNING(getLogger("CasOrphanManifestSweep"), "{}", warning);
-            if (warnings)
-                warnings->push_back(warning);
+            warnings.push_back(warning);
             return 0;
         }
         active = activeManifestKeys(op, layout, *catalog_entry, ckpt->ckpt);
@@ -179,8 +158,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                     "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping its deletions",
                     ns.string(), e.message());
-        if (warnings)
-            warnings->push_back("CAS orphan sweep: namespace " + ns.string() + " protection view unavailable ("
+        warnings.push_back("CAS orphan sweep: namespace " + ns.string() + " protection view unavailable ("
                                  + e.message() + "); skipped, emptiness not confirmed");
         return 0;
     }
@@ -199,11 +177,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         /// Exact-token delete: HEAD for the current incarnation, then remove exactly it -- never
         /// `removeCurrent`, whose re-head would delete whatever a fresh owner put there instead. A
         /// `Gone` (a 404 between the two) or a `Mismatch` (a fresh owner reclaimed the key) is
-        /// tolerated, same as always, regardless of `warnings` -- that is the normal "someone else
-        /// already reclaimed it" race, not a failure. A THROWN exception (a transient backend hiccup)
-        /// is the one thing `warnings` changes: opted-in (non-null), it is recorded and the sweep moves
-        /// to the next key; opted-out (nullptr, every pre-existing caller), it propagates exactly as
-        /// before (fail-close).
+        /// tolerated -- the normal "someone else already reclaimed it" race, not a failure. A THROWN
+        /// exception (a transient backend hiccup) is recorded and the sweep moves to the next key.
         try
         {
             const std::optional<Meta> head = op.head(listed.key, Retry::standard());
@@ -214,13 +189,11 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         }
         catch (...)
         {
-            if (!warnings)
-                throw;
-            warnings->push_back("CAS orphan sweep: " + listed.key + " delete failed: "
+            warnings.push_back("CAS orphan sweep: " + listed.key + " delete failed: "
                                  + getCurrentExceptionMessage(/*with_stacktrace=*/false));
         }
         return true;
-    }, Retry::standard(), 1000, onGcEnumerationPage);
+    }, Retry::standard(), 1000);
     return deleted;
 }
 
