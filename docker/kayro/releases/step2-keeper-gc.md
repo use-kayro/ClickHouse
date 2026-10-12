@@ -169,8 +169,8 @@ Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dent
 ### Observado após o deploy
 
 1. **O Keeper fica em ~235 MB de dados.** 3.987 registros de 3.825 partes vivas carregam `statistics*` inline antigos (de antes da decisão de 11/10 que fez `statistics*` virar blob). O GC não recupera isso: só diminui conforme essas partes forem mergeadas.
-2. **O reader compartilhado loga `NOT_IMPLEMENTED` ao remover partes antigas carregadas dos registros.** Ele cai para a remoção recursiva, sem efeito no dado. Correção no fork pendente.
-3. **`NO_REPLICA_HAS_PART` transitório entre 03:09Z e 03:27Z,** depois dos restarts.
+2. **O reader compartilhado loga `NOT_IMPLEMENTED` ao remover partes antigas carregadas dos registros.** Ele cai para a remoção recursiva, sem efeito no dado. **Corrigido pelo PR #8** (`fe7ed58`, merge `7bcf86c` em 12/10 ~04:30Z): remover arquivos de uma parte segurada pelo Keeper edita o que está em memória. Portão: gtests CAS, `test_cas_keeper_part_manifest` 6/6 (novo `test_reader_removes_outdated_record_parts`), `test_cas_reader_pin` 3/3, `test_cas_shared_pool` 2/2, `test_cas_gc_s3` 1/1. Sai na próxima imagem, junto com o PR #6.
+3. **`NO_REPLICA_HAS_PART` transitório entre 03:09Z e 03:27Z,** depois dos restarts. É a corrida esperada entre o log de replicação e os merges de ~0,5 s do writer. No RC3 apareceu 212 vezes desde 06/10, em muitas tabelas; depois do passo 2, 93 vezes numa tabela só (`rioquality.precos_promocionais`, cadeia de merge de 49 partes), com no máximo 4 retries. Sem correção.
 
 ## Imagem de release
 
