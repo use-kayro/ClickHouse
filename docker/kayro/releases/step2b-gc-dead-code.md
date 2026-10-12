@@ -153,3 +153,4 @@ Reconferido às 06:25Z de 12/10. Só fatos medidos.
    | Reader compartilhado | 249 | 917 | 374 |
 
    No writer, PUT e GET já estavam altos antes do restart, por causa da carga de refresh.
+7. **Pausa do GC no writer a partir de 07:21Z:** a partir das 07:21:43Z as rodadas não apagaram nada ("cannot be read this round; removing nothing"), depois do primeiro DROP de uma tabela da época do boot. Nada foi perdido. Causa e correção no [passo 2c](step2c-gc-loaded-tables.md).
