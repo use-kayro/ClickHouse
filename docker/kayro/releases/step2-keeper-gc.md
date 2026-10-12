@@ -10,7 +10,7 @@ O GC do pool deixa de listar o S3 e de reler os ref logs para saber o que está 
 | Base | passo 1 (PR #2, merge `b71585e`), sobre o RC3 |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, de `023e6c4`, push 12/10 02:52Z |
 | Linear | TEC-850 |
-| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); aceite em verificação (checklist de +30 min até ~03:40Z) |
+| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); **aceito nos três às 03:40Z** (+30 min). Rollback não usado |
 
 Commits:
 - `7c6c4c8` teste `test_cas_reader_pin`;
@@ -148,11 +148,29 @@ Antes: readers no RC3 (`sha256:6469a0c1…`), writer no passo 1 (`sha256:250b6ed
 
 | Nó | Apply | Rodando | Saudável | Aceite |
 |---|---|---|---|---|
-| Writer `i-02e3809e0b416b25e` | 03:00:30Z | 03:00:38Z | 03:03:10Z (3.948 queries ok) | em verificação |
-| Reader-mdb `i-0bc5ccb44d4141059` | 03:03:10Z | 03:03:17Z | 03:03:34Z | em verificação |
-| Reader compartilhado `i-02369cef982eb67d2` | 03:03:34Z | não registrado | 03:09:48Z | em verificação |
+| Writer `i-02e3809e0b416b25e` | 03:00:30Z | 03:00:38Z | 03:03:10Z (3.948 queries ok) | aceito 03:40Z |
+| Reader-mdb `i-0bc5ccb44d4141059` | 03:03:10Z | 03:03:17Z | 03:03:34Z | aceito 03:40Z |
+| Reader compartilhado `i-02369cef982eb67d2` | 03:03:34Z | 03:03:42Z | 03:09:48Z | aceito 03:40Z |
 
-Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dentro dos 10 min da regra. Checklist de +30 min em andamento até ~03:40Z.
+Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dentro dos 10 min da regra. Rollback não usado.
+
+### Aceite (+30 min, 03:40Z)
+
+| Evidência | Resultado |
+|---|---|
+| Rodadas do GC no writer | 03:11:34Z, 03:22:00Z, 03:32:06Z: condenaram 1.159 / 76 / 135 blobs e apagaram 0 / 398 / 76 |
+| LIST no S3 por rodada | exatamente 1 (o heartbeat floor) |
+| Registros de partes removidas | 89 removidos em 30 min |
+| Attach pelo registro no reader compartilhado | 173 partes, com 0 PUT, 0 LIST e 2 GET |
+| GC nos readers | nenhuma rodada |
+| Inserts | 161 OK, 0 falhas |
+| Replicação | readonly 0, fila 0, atraso 0 |
+
+### Observado após o deploy
+
+1. **O Keeper fica em ~235 MB de dados.** 3.987 registros de 3.825 partes vivas carregam `statistics*` inline antigos (de antes da decisão de 11/10 que fez `statistics*` virar blob). O GC não recupera isso: só diminui conforme essas partes forem mergeadas.
+2. **O reader compartilhado loga `NOT_IMPLEMENTED` ao remover partes antigas carregadas dos registros.** Ele cai para a remoção recursiva, sem efeito no dado. Correção no fork pendente.
+3. **`NO_REPLICA_HAS_PART` transitório entre 03:09Z e 03:27Z,** depois dos restarts.
 
 ## Imagem de release
 
