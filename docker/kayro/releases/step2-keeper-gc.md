@@ -10,7 +10,7 @@ O GC do pool deixa de listar o S3 e de reler os ref logs para saber o que está 
 | Base | passo 1 (PR #2, merge `b71585e`), sobre o RC3 |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, de `023e6c4`, push 12/10 02:52Z |
 | Linear | TEC-850 |
-| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); **aceito nos três às 03:40Z** (+30 min). Rollback não usado |
+| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); **aceito nos três às 03:40Z** (+30 min). Rollback não usado. Substituído pelo [passo 2b](step2b-gc-dead-code.md) entre 05:48Z e 06:07Z |
 
 Commits:
 - `7c6c4c8` teste `test_cas_reader_pin`;

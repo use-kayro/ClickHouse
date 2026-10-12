@@ -14,7 +14,7 @@ Algumas remoções do PR #6 mudam o que o operador vê e o que sobe (abaixo). A 
 | Base | passo 2 (merge `59caa36`, código `023e6c4`) |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`, de `a6355a99` |
 | Linear | TEC-850 (PR #6), TEC-849 (PR #8) |
-| Em produção | nenhum nó |
+| Em produção | nos três nós desde 12/10 06:07:16Z (writer → reader-mdb → reader). Rollback não usado |
 
 ## Regra de deploy
 
@@ -107,10 +107,20 @@ O build ThinLTO de release, a paridade de features, o harness fault/RLS na image
 
 ## Imagem de release
 
-`474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`, construída do commit `a6355a9986b8c9caaef7829a8873168e89859c2a`.
+`474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:1912bde084b7a39c86af8498715628da23be3554d42da1341aeafcb0cd34ba03`, construída do commit `a6355a9986b8c9caaef7829a8873168e89859c2a` no builder `tec849c`: início 04:34:19Z, imagem pronta 05:40:58Z (66,7 min do fonte à imagem: 8 min de compilação, 57 min de link), push 05:45:55Z.
 
 - `compare-features.py`: idêntico ao build do passo 2 (`023e6c4`): 76 build_options, 1.842 funções, 114 formatos, 81 engines, 91 table functions, 1.713 settings.
 - Link ThinLTO: ~57 min a 16.000 IOPS num host sem outra carga (primeira fase ~50 min em uma thread, ~58 GB de RSS; segunda fase ~6 min multi-thread com swap, pico de 45,8 GB de swap). O build do passo 2 levou ~79 min a 3.000 IOPS com outra carga no host. A diferença não é atribuída ao IOPS: na fase de swap o disco leu só ~1.600/s.
-- Harness fault/RLS nesta imagem: não registrado.
+- Harness fault/RLS nesta imagem: passou (05:41:02Z → 05:45:49Z).
 
-Deploy: não registrado ainda.
+## Deploy (12/10)
+
+Por `configure-image.py`, um nó por vez. Rollback preparado: a imagem do passo 2 (`sha256:9347ff1c…`); não foi usado.
+
+| Nó | Apply | Saudável | Observação |
+|---|---|---|---|
+| Writer `i-02e3809e0b416b25e` | 05:48:49Z | 05:51:41Z | primeira rodada do GC com 1 LIST; 0 inserts falhos; liberado às 06:00:09Z |
+| Reader-mdb `i-0bc5ccb44d4141059` | 06:00:09Z | 06:00:36Z | |
+| Reader compartilhado `i-02369cef982eb67d2` | 06:00:36Z | 06:07:16Z | |
+
+Sequência encerrada às 06:07:16Z.
