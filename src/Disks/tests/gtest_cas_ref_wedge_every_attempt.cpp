@@ -377,7 +377,7 @@ void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, c
         .incarnation = DB::Cas::tests::fixture::fixtureLife(ns).incarnation,
         .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1},
     };
-    CasRefCatalog::casAdmitEntry(op, layout, /*gc_shards=*/1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
 
     ASSERT_EQ(CasRefCatalog::completeCreation(op, layout, creating),
               CasRefCatalog::NamespaceCreationOutcome::Live);

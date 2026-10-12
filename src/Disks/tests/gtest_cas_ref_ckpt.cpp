@@ -490,29 +490,6 @@ TEST(CASRefCheckpoint, KeyIsTheLifeLeafAndParsesBack)
     EXPECT_FALSE(layout.parseRefCkptKey("q" + layout.refCkptKey(ns_id).substr(1)).has_value());
 }
 
-/// The hot stream grouping accepts logs and snapshots while ignoring a checkpoint from the separate
-/// state tree. An unrecognized key inside the stream tree still aborts the round.
-TEST(CASRefCheckpoint, GroupRefKeysScopesHotIntakeToTheStreamTree)
-{
-    const Layout layout{"p"};
-    const RootNamespace ns{"srv1/ckpt_group"};
-    const std::vector<String> keys = {
-        layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), ID_1_1),
-        layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), ID_1_1),
-        layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)),
-    };
-
-    const auto grouped = groupRefKeys(layout, keys);
-    ASSERT_EQ(grouped.size(), 1u);
-    const RefTableListing & listing = grouped.at(DB::Cas::tests::fixture::fixtureLife(ns).incarnation);
-    EXPECT_EQ(listing.logs, std::vector<RefTxnId>{ID_1_1});
-    EXPECT_EQ(listing.snapshots, std::vector<RefTxnId>{ID_1_1});
-
-    /// A genuinely unrecognizable key inside this life stream is still corruption.
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { groupRefKeys(layout, {layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_bogus"}); });
-}
-
 /// ---------------------------------------------------------------------------------------------
 /// The merge -- per field, both directions
 /// ---------------------------------------------------------------------------------------------

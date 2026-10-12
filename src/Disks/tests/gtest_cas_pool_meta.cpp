@@ -40,7 +40,7 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
 
     auto create_op = requests.admit();
     const PoolMeta created = PoolMeta::createOrValidate(
-        create_op, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        create_op, layout, /*blob_header_len=*/256,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     EXPECT_EQ(created.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 
@@ -70,7 +70,7 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         (void)PoolMeta::createOrValidate(
-            admit_op, layout, 256, /*gc_shards=*/1,
+            admit_op, layout, 256,
             BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
     });
     /// Bounded by the deadline, not a live-lock: it paced its retries rather than spinning.

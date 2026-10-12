@@ -15,16 +15,15 @@ using namespace DB::Cas;
 /// Closed-set pin: the registry's complete set of object `type` strings. `allRegisteredFormatIds`
 /// is the registry's own enumeration accessor, so this walks the SAME set the codecs and the object
 /// header gate see -- a registered class with no test coverage here is a registered class this test
-/// cannot see either, which is the point: a 17th, 18th, ... entry the spec's closed set does not
+/// cannot see either, which is the point: a 14th, 15th, ... entry the spec's closed set does not
 /// name would show up as a set-size mismatch instead of passing unnoticed.
 TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
 {
     const std::set<std::string_view> expected{
         "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
         "cas_ref_ckpt", "cas_ref_catalog", "cas_part_manifest",
-        "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb",
-        "cas_owner", "cas_epoch", "cas_mount_lease", "cas_part_files"};
-    ASSERT_EQ(expected.size(), 16u);
+        "cas_gc_state", "cas_owner", "cas_epoch", "cas_mount_lease", "cas_part_files"};
+    ASSERT_EQ(expected.size(), 13u);
 
     std::set<std::string_view> actual;
     for (const auto id : allRegisteredFormatIds())

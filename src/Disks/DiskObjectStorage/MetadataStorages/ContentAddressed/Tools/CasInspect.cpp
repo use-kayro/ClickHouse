@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
@@ -12,21 +11,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/Exception.h>
 #include <fmt/format.h>
 #include <cstdint>
-#include <set>
 #include <vector>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int CORRUPTED_DATA;
-}
-}
 
 namespace DB::Cas
 {
@@ -285,71 +274,6 @@ String renderGcState(const GcState & s)
         .str();
 }
 
-/// A recorded incarnation's value is an opaque backend-native string (e.g. an S3 ETag) — NOT a
-/// 128-bit hash — so it renders verbatim (escaped), not hex-converted; `type` is the dialect word,
-/// naming which backend family minted it.
-String renderPersistedEtag(const PersistedEtag & inc)
-{
-    return JsonObj()
-        .add("value", jsonEscape(inc.value))
-        .add("type", jsonEscape(inc.dialect))
-        .str();
-}
-
-String renderRunRef(const RunRef & r)
-{
-    return JsonObj()
-        .add("key", jsonEscape(r.key))
-        .add("checksum", jsonHex(r.checksum))
-        .add("shard", jsonUInt(r.shard))
-        .add("generation", jsonUInt(r.key_generation))
-        .str();
-}
-
-String renderRefCoverage(const RefCoverage & c)
-{
-    return JsonObj()
-        .add("classification", jsonEscape(coverageClassToWord(c.classification)))
-        .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
-        .str();
-}
-
-String renderFoldSeal(const CasFoldSeal & seal)
-{
-    JsonObj ref_lives;
-    for (const auto & [life_id, state] : seal.ref_lives)
-        ref_lives.add(renderIncarnation(life_id), JsonObj()
-            .add("coverage", renderRefCoverage(state.coverage))
-            .add("cleanup_evidence", state.cleanup_evidence
-                ? JsonObj().add("remove_txn_id", renderRefTxnIdObj(state.cleanup_evidence->remove_txn_id)).str()
-                : "null")
-            .str());
-
-    std::vector<String> blob_target_runs;
-    blob_target_runs.reserve(seal.blob_target_runs.size());
-    for (const auto & r : seal.blob_target_runs)
-        blob_target_runs.push_back(renderRunRef(r));
-
-    /// A fold seal carries per-GC-shard totals for `RunMarker::Condemned` rows in its source runs. Render the
-    /// summary from the seal itself; the older separate retired-reference object is no longer part
-    /// of the current layout.
-    JsonObj condemned_summary;
-    for (const auto & [shard, cs] : seal.condemned_summary)
-        condemned_summary.add(std::to_string(shard), JsonObj()
-            .add("condemned_total", jsonUInt(cs.condemned_total))
-            .add("pending_total", jsonUInt(cs.pending_total))
-            .add("oldest_nonpending_condemn_round", jsonUInt(cs.oldest_nonpending_condemn_round))
-            .str());
-
-    return JsonObj()
-        .add("generation", jsonUInt(seal.generation))
-        .add("parent_generation", jsonUInt(seal.parent_generation))
-        .add("ref_lives", ref_lives.str())
-        .add("blob_target_runs", jsonArray(blob_target_runs))
-        .add("condemned_summary", condemned_summary.str())
-        .str();
-}
-
 String renderProvenance(const Provenance & p)
 {
     return JsonObj()
@@ -389,104 +313,13 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
         .str();
 }
 
-/// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `mark` field
-/// words (`runMarkerToWireWord`) so cas-inspect speaks the same vocabulary
-/// as the on-disk format rather than inventing a second one.
-String sourceEdgeRowKindName(RunMarker marker)
-{
-    return String(runMarkerToWireWord(marker));
-}
-
-String renderCondemnedRow(const CondemnedRow & r)
-{
-    return JsonObj()
-        .add("delete_pending", jsonBool(r.delete_pending))
-        .add("token", renderPersistedEtag(r.token))
-        .add("size", jsonUInt(r.size))
-        .add("condemn_round", jsonUInt(r.condemn_round))
-        .add("marker_confirmed", jsonBool(r.marker_confirmed))
-        .str();
-}
-
-/// Renders one blob-target source-edge run segment (`Layout::blobTargetRunKey`): every row (edge,
-/// zero-marker, or condemned sentinel), plus a summary. `parsed` carries the run's own coordinates
-/// recovered from the key; `bytes` is decoded with the same typed `SourceEdgeRunView` reader the fold /
-/// `zeroInDegree` / `fsck` consumers use (the memory overload, since `caInspectToJson` is a pure
-/// function of (key, bytes) with no backend access here). A malformed key or payload propagates the
-/// codec's own `CORRUPTED_DATA` (`SourceEdgeKeyCodec::parse`, `decodeCondemnedRow`) -- rows are never
-/// silently skipped.
-String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_view bytes)
-{
-    SourceEdgeRunView reader = openSourceEdgeRun(bytes);
-
-    std::vector<String> rows;
-    std::set<BlobRef> distinct_blobs;
-    uint64_t edge_count = 0;
-    uint64_t condemned_count = 0;
-    uint64_t zero_marker_count = 0;
-
-    String key;
-    String payload;
-    while (reader.next(key, payload))
-    {
-        BlobRef ref;
-        UInt128 source_id;
-        SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-        if (payload.empty())
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "cas-inspect: source-edge run row for blob {} has an empty payload", blobIdOf(ref));
-        const RunMarker marker = runMarkerFromByte(payload[0], "cas-inspect: source-edge run row");
-
-        distinct_blobs.insert(ref);
-        JsonObj row;
-        row.add("blob", jsonEscape(blobIdOf(ref)))
-           /// `source_id` is a `CityHash128` of (namespace, writer_epoch, build_sequence,
-           /// manifest_ordinal, path) -- not invertible here, so it renders as plain hex, exactly like
-           /// every other opaque u128 identifier in this file.
-           .add("source_id", jsonHex(source_id))
-           .add("kind", jsonEscape(sourceEdgeRowKindName(marker)));
-
-        switch (marker)
-        {
-            case RunMarker::Edge:
-                ++edge_count;
-                break;
-            case RunMarker::Zero:
-                ++zero_marker_count;
-                break;
-            case RunMarker::Condemned:
-                ++condemned_count;
-                row.add("condemned", renderCondemnedRow(decodeCondemnedRow(payload)));   // CORRUPTED_DATA on malformed (fail-closed)
-                break;
-        }
-        rows.push_back(row.str());
-    }
-
-    return JsonObj()
-        .add("object", jsonEscape("blob_target_run"))
-        .add("generation", jsonUInt(parsed.generation))
-        .add("attempt", jsonUInt(parsed.attempt))
-        .add("shard", jsonUInt(parsed.shard))
-        .add("seq", jsonUInt(parsed.seq))
-        .add("rows", jsonArray(rows))
-        .add("summary", JsonObj()
-            .add("rows", jsonUInt(rows.size()))
-            .add("distinct_blobs", jsonUInt(distinct_blobs.size()))
-            .add("edges", jsonUInt(edge_count))
-            .add("condemned", jsonUInt(condemned_count))
-            .add("zero_markers", jsonUInt(zero_marker_count))
-            .str())
-        .str();
-}
-
 }
 
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes,
                        const std::optional<NamespaceLifeId> & resolved_life)
 {
     /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/ns/stream/`
-    /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
-    /// and the `.meta` sibling suffix before the bare `blobs/` prefix it also matches.
+    /// prefix, and the `.meta` sibling suffix before the bare `blobs/` prefix it also matches.
     if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(storedSuffix(FormatId::PartManifest)))
         return renderPartManifest(decodePartManifest(openObject(FormatId::PartManifest, bytes)));
 
@@ -528,16 +361,6 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     if (key.ends_with("/mount"))
         return renderMountLease(decodeMountLease(bytes));
 
-    if (key.ends_with("/fold_seal"))
-        return renderFoldSeal(decodeFoldSeal(bytes));
-
-    /// Blob-target source-edge run segments (`Layout::blobTargetRunKey`) are the ground truth for
-    /// every in-degree question, so they get a typed decode too, not just the fold seal that names
-    /// them. Checked before the pool-wide `blobs/` prefix below (disjoint anyway -- these keys live
-    /// under `gc/gen/`, never `blobs/` -- but most-specific-first stays the dispatch's rule).
-    if (const auto parsed = layout.parseBlobTargetRunKey(key))
-        return renderBlobTargetRun(*parsed, bytes);
-
     /// `blobMetaKey(id) == blobKey(id) + ".meta"`, so a meta descriptor also matches
     /// `blobsPrefix()` below. Check it first or it would be decoded incorrectly as an envelope. A
     /// non-`.meta` blob body still carries its envelope.
@@ -549,8 +372,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
         "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
-        "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
-        "retired, blobs, blobs/*.meta)", key);
+        "gc/server-roots/*/mount, gc/state, blobs, blobs/*.meta)", key);
 }
 
 }

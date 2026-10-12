@@ -467,9 +467,8 @@ TEST(CASFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
 }
 
 /// A COMPLETE, canonical namespace-life key (a real `_files` write under a real admitted life) whose
-/// catalog row is then removed entirely -- exactly what a fenced GC's exact-CAS row deletion leaves
-/// behind, before the perpetual namespace janitor's next page reaches it -- must classify as
-/// `janitor_pending`, a SOFT finding, never `lifeless_keys`. The report stays clean.
+/// catalog row is then removed entirely must classify as `janitor_pending`, a SOFT finding, never
+/// `lifeless_keys`. The report stays clean.
 TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -478,12 +477,9 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
     const NamespaceLifeId life = store->namespaceLife(ns);
     store->putNamespaceFile(life, "format_version.txt", "1\n");
 
-    /// Simulate a fenced GC's exact-CAS catalog-row deletion: the row is gone, the life-owned physical
-    /// object above survives it (the janitor's own job, not GC's own round). `casUpdate` deliberately
-    /// refuses to add or delete rows (there is no generic catalog remove-by-name API -- deletion is
-    /// only `deleteCompletedRemoving`/`cancelStalledCreating`, both requiring the full fenced-GC
-    /// protocol this fixture is not driving), so inject the post-deletion catalog snapshot directly,
-    /// mirroring `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
+    /// The row is gone, the life-owned physical object above survives it. `casUpdate` deliberately
+    /// refuses to add or delete rows, so inject the post-deletion catalog snapshot directly, mirroring
+    /// `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
     {
         CasOperation op = store->openRequests().admit();
         CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, store->layout());
@@ -532,7 +528,7 @@ public:
             /// same backend from here cannot deadlock.
             CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
             CasOperation op = requests.admit();
-            CasRefCatalog::casAdmitEntry(op, Layout("p"), /*gc_shards*/1,
+            CasRefCatalog::casAdmitEntry(op, Layout("p"),
                 CatalogEntry{.ns = protected_life.ns, .state = NsState::Live,
                     .incarnation = protected_life.incarnation});
         }
@@ -1101,18 +1097,28 @@ TEST(CASFsck, ReclaimablePrePrecommitBodyIsInfo)
     EXPECT_GE(rep.unreachable, 1u);      // counted as info/unreachable
 }
 
-/// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
-/// is AwaitingGc ("GC has not run yet"), never a false Unaccounted alarm.
-TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
+/// An unreferenced blob is labeled by its `.meta`: `Condemned` when GC condemned it, `Unreferenced`
+/// otherwise (no marker, or a `Clean` one). Neither is a finding.
+TEST(CASFsck, UnreferencedBlobIsLabeledByItsMeta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(5));   /// present, never referenced, no gc/state
+    writeBlobBody(*backend, store->layout(), DB::UInt128(5));   /// no `.meta`
+    writeBlobBody(*backend, store->layout(), DB::UInt128(6));
+    writeMetaClean(*backend, store->layout(), DB::UInt128(6), /*size*/ 1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(7));
+    writeMetaClean(*backend, store->layout(), DB::UInt128(7), /*size*/ 1);
+    condemnMeta(*backend, store->layout(), DB::UInt128(7), /*condemn_round*/ 1);
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.awaiting_gc, 1u);
-    EXPECT_EQ(rep.unaccounted, 0u);
+    EXPECT_EQ(rep.unreachable, 3u);
+    EXPECT_EQ(rep.pending_gc, 1u);
+    EXPECT_EQ(rep.unaccounted, 2u);
+    const String condemned_key = store->layout().blobKey(legacyMetaTestRef(DB::UInt128(7)));
+    for (const FsckObject & o : rep.objects)
+        if (o.kind == ObjectKind::Blob && o.key.starts_with(store->layout().blobsPrefix()))
+            EXPECT_EQ(o.cls, o.key == condemned_key ? FsckClass::Condemned : FsckClass::Unreferenced) << o.key;
 }
 
 /// A `.meta` descriptor whose body is missing is ADVISORY (meta_without_body), NOT a hard finding:
@@ -1120,7 +1126,7 @@ TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
 /// pool that may drop the op, so a single raw LIST legitimately observes a body-less `.meta` mid-
 /// graduation and no finite grace makes a persistent one hard evidence. It is still counted/reported;
 /// it must NOT be a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
-/// pipeline classes (the `.meta` key is excluded from body classification entirely). `clean()` stays TRUE.
+/// classes (the `.meta` key is excluded from body classification entirely). `clean()` stays TRUE.
 TEST(CASFsck, MetaWithoutBodyIsAdvisoryNotHard)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1133,13 +1139,12 @@ TEST(CASFsck, MetaWithoutBodyIsAdvisoryNotHard)
     EXPECT_EQ(rep.dangling, 0u);
     EXPECT_EQ(rep.unreachable, 0u);
     EXPECT_EQ(rep.pending_gc, 0u);
-    EXPECT_EQ(rep.awaiting_gc, 0u);
     EXPECT_EQ(rep.unaccounted, 0u);
     EXPECT_TRUE(rep.clean());   // meta_without_body is advisory — excluded from clean()
 }
 
 /// A body with no `.meta` sibling is a BENIGN not-yet-adopted (or crashed-birth) artifact — NOT a
-/// dangle, and it must still classify through the ordinary present-but-unreferenced pipeline.
+/// dangle, and it must still classify through the ordinary present-but-unreferenced classes.
 TEST(CASFsck, BodyWithoutMetaIsBenign)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1178,7 +1183,7 @@ TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
 }
 
 /// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
-/// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
+/// pool-wide unreferenced-blob classification, since that needs the whole pool.
 TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1207,7 +1212,7 @@ TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     /// pass stays active for the scoped namespaces, so `unreachable` here counts THEIR orphan
     /// manifest bodies — zero in this clean setup, legitimately nonzero on a churned pool.
     EXPECT_EQ(scoped.unreachable, 0u);
-    EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
+    EXPECT_EQ(scoped.pending_gc + scoped.unaccounted, 0u);
 }
 
 /// B207: the ref-walk and the HEAD-confirm run minutes apart with no snapshot. A ref that gets
@@ -1415,9 +1420,7 @@ TEST(CASFsckRunning, FsckOnNotLiveDiskRefusesTransientRetryableAndIdentityLostTe
 
 /// The summary line is the ONLY thing most consumers ever read: the soak harness parses it, an operator
 /// eyeballs it, and `exit_code` gates CI on it. So a field that `clean()` treats as a hard finding but the
-/// summary omits is invisible in practice, however faithfully it is counted -- which is exactly what
-/// happened to `corrupted_runs`: counted since the seal check landed, part of `clean()`, rendered in
-/// `--detail` rows, and absent from the summary, so no run has ever reported one.
+/// summary omits is invisible in practice, however faithfully it is counted.
 ///
 /// This test ITERATES `kFsckHardFindings` -- the list `clean()` is computed from -- and never names a
 /// finding itself, so a term added to that list and not rendered fails HERE. It used to claim exactly
@@ -1454,9 +1457,8 @@ TEST(CASFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
     EXPECT_FALSE(rep.clean());
 }
 
-/// A zero must be PRINTED, not omitted. The harness's `stale_edge_verdict` fails closed on an absent key
-/// precisely because "field missing" and "field zero" are different facts, and a formatter that skips
-/// zeros would turn every clean pool into an unparseable one.
+/// A zero must be PRINTED, not omitted: "field missing" and "field zero" are different facts, and a
+/// formatter that skips zeros would turn every clean pool into an unparseable one.
 TEST(CASFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
 {
     const String line = formatFsckSummary(FsckReport{});

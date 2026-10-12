@@ -30,18 +30,6 @@ TEST(CASFormatBattery, GcState)
         "\"lease_owner\":\"00000000000000000000000000000001\",\"lease_seq\":\"12\"}\n"});
 }
 
-CAS_BATTERY_COVERS(GcHeartbeat);
-
-TEST(CASFormatBattery, GcHeartbeat)
-{
-    GcHeartbeat hb{UInt128(1), 1741};
-    runFormatBattery({FormatId::GcHeartbeat,
-        [&] { return sealObject(FormatId::GcHeartbeat, encodeGcHeartbeat(hb)); },
-        [](std::string_view d) { decodeGcHeartbeat(std::string(openObject(FormatId::GcHeartbeat, d))); },
-        currentFormatHeader("cas_gc_hb") +
-        "{\"owner\":\"00000000000000000000000000000001\",\"hb_seq\":\"1741\"}\n"});
-}
-
 /// ---------- field round-trips (migrated from gtest_cas_gc_formats.cpp, re-pointed at the text codec) ----------
 
 TEST(CASGCStateFormat, RoundTripsCoreFields)
@@ -141,43 +129,4 @@ TEST(CASGCStateFormat, GarbageFailsClosed)
 {
     EXPECT_THROW(decodeGcState(String("")), DB::Exception);
     EXPECT_THROW(decodeGcState(String("not a cas object\n")), DB::Exception);
-}
-
-TEST(CASGCHeartbeatFormat, RoundTripAndBoundaries)
-{
-    GcHeartbeat hb;
-    hb.owner = hexToU128("0123456789abcdeffedcba9876543210");
-    hb.hb_seq = 12345;
-    GcHeartbeat d = decodeGcHeartbeat(encodeGcHeartbeat(hb));
-    EXPECT_EQ(d.owner, hb.owner);
-    EXPECT_EQ(d.hb_seq, 12345u);
-
-    GcHeartbeat z;
-    z.owner = hexToU128("ffffffffffffffffffffffffffffffff");
-    z.hb_seq = 0;
-    EXPECT_EQ(decodeGcHeartbeat(encodeGcHeartbeat(z)).owner, z.owner);
-    EXPECT_THROW(decodeGcHeartbeat(String("short")), DB::Exception);
-}
-
-TEST(CASGCHeartbeatFormat, RejectsMissingIdentityFields)
-{
-    /// `v:1` is the baseline generation, so it always passes the header gate -- the BODY is what has
-    /// to fail here.
-    const String header = "{\"type\":\"cas_gc_hb\",\"v\":1}\n";
-
-    const auto expectCorrupted = [](const String & data)
-    {
-        try
-        {
-            decodeGcHeartbeat(data);
-            FAIL() << "expected CORRUPTED_DATA";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-        }
-    };
-
-    expectCorrupted(header + "{\"hb_seq\":\"1741\"}\n");
-    expectCorrupted(header + "{\"owner\":\"00000000000000000000000000000001\"}\n");
 }

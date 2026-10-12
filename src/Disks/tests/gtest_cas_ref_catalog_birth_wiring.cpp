@@ -344,7 +344,7 @@ TEST(CASRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Live, .incarnation = UInt128(0xcafe),
                              .creator = std::nullopt};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = store->writerEpoch(),
         .committed_through = std::nullopt,
@@ -428,7 +428,7 @@ TEST(CASRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     const CreatorFence foreign_creator{.server_root_id = "ghost-server", .writer_epoch = 9, .fence_generation = 1};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(0xdead),
                              .creator = foreign_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
     backend->resetCounts();
     backend->resetWriteCounts();
 
@@ -461,7 +461,7 @@ TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
     const CreatorFence dead_creator{.server_root_id = "dead-server", .writer_epoch = 3, .fence_generation = 1};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(0xbeef),
                              .creator = dead_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
     setWatermarkMinActive(*backend, layout, "dead-server", /*writer_epoch=*/3,
                           /*min_active_build_sequence=*/std::numeric_limits<uint64_t>::max());
 
@@ -495,7 +495,7 @@ TEST(CASRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutati
         .state = NsState::Creating,
         .incarnation = UInt128{0xd001},
         .creator = CreatorFence{.server_root_id = "unproven-live", .writer_epoch = 7, .fence_generation = 1}};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
     backend->resetCounts();
     backend->resetWriteCounts();
 
@@ -518,7 +518,7 @@ TEST(CASRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptFo
         .state = NsState::Creating,
         .incarnation = UInt128{0xd002},
         .creator = CreatorFence{.server_root_id = "dead-creator", .writer_epoch = 8, .fence_generation = 1}};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
     setWatermarkMinActive(*backend, layout, "dead-creator", 8, std::numeric_limits<uint64_t>::max());
     const NamespaceLifeId old_life = NamespaceLifeId::fromCatalogEntry(ns, creating.incarnation);
     const String ckpt_key = layout.refCkptKey(old_life);
@@ -548,7 +548,7 @@ TEST(CASRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithout
         .server_root_id = "dead-racing-creator", .writer_epoch = 9, .fence_generation = 1};
     const CatalogEntry creating{
         .ns = ns, .state = NsState::Creating, .incarnation = UInt128{0xd003}, .creator = old_creator};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
     setWatermarkMinActive(
         *backend, layout, old_creator.server_root_id, old_creator.writer_epoch,
         std::numeric_limits<uint64_t>::max());
@@ -589,7 +589,7 @@ TEST(CASRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
         .state = NsState::Creating,
         .incarnation = UInt128{0xd004},
         .creator = CreatorFence{.server_root_id = "dead-fenced-creator", .writer_epoch = 11, .fence_generation = 1}};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
     setWatermarkMinActive(*backend, layout, "dead-fenced-creator", 11, std::numeric_limits<uint64_t>::max());
     backend->resetCounts();
     backend->resetWriteCounts();
@@ -624,7 +624,7 @@ TEST(CASRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreati
         .state = NsState::Creating,
         .incarnation = UInt128{0xd006},
         .creator = CreatorFence{.server_root_id = "dead-successor-creator", .writer_epoch = 12, .fence_generation = 1}};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, successor);
+    CasRefCatalog::casAdmitEntry(op, layout, successor);
     setWatermarkMinActive(*backend, layout, "dead-successor-creator", 12, std::numeric_limits<uint64_t>::max());
     const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation));
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(ckpt_key, "successor-ckpt", Retry::standard())));
@@ -702,7 +702,7 @@ TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWit
         .state = NsState::Creating,
         .incarnation = UInt128{0xc001},
         .creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1}};
-    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, creating);
 
     auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     backend->churning = true;

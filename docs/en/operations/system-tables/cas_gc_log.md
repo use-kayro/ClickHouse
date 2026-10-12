@@ -85,7 +85,6 @@ The phases, in execution order:
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
 | `manifest_deletes` | Exact-token deletes of owner-removed manifest bodies, after their decrements were adopted. | one `DELETE` per body |
-| `namespace_cleanup` | Run one bounded `cas/ns/` page across the stream and state subtrees for the perpetual dead-life janitor. This phase is physical reclamation, not a lifecycle gate. | one namespace-root page `LIST`, catalog cut, exact-token deletes |
 | `ref_object_cleanup` | Delete ref logs covered by both the durable fold cursor and a durable snapshot, plus superseded snapshots. | one `HEAD` + one `DELETE` per deletable object |
 | `orphan_sweep` | The budgeted, cursor-paced orphan part-manifest backstop. | budgeted `LIST` and deletes |
 

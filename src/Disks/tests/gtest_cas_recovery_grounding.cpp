@@ -365,7 +365,7 @@ TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
         CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation catalog_op = catalog_requests.admit();
         CasRefCatalog::casAdmitEntry(
-            catalog_op, layout, 1, CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = 8});
+            catalog_op, layout, CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = 8});
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
     }
     {
@@ -373,7 +373,7 @@ TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
         CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation catalog_op = catalog_requests.admit();
         const CatalogEntry live{.ns = ns, .state = NsState::Live, .incarnation = 9};
-        CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, live);
+        CasRefCatalog::casAdmitEntry(catalog_op, layout, live);
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(live.ns, live.incarnation);
         ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), "not a sealed checkpoint", Retry::once())));
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
@@ -384,7 +384,7 @@ TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
         CasOperation catalog_op = catalog_requests.admit();
         CatalogEntry creating{.ns = ns, .state = NsState::Creating, .incarnation = 7,
             .creator = CreatorFence{"srv1", 1, 1}};
-        CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, creating);
+        CasRefCatalog::casAdmitEntry(catalog_op, layout, creating);
         catalog_op.create(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation)),
             encodeRefCkpt(RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
                                   .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}), Retry::once());

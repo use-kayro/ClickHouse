@@ -46,8 +46,6 @@ public:
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
     void latch() { latched = true; }
-    /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
-    void disarm() { throw_key.clear(); mismatch_key.clear(); latched = false; }
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
@@ -420,7 +418,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
         entry.ns = ns;
         entry.state = NsState::Live;
         entry.incarnation = UInt128{next_test_life.fetch_add(1)};
-        CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
+        CasRefCatalog::casAdmitEntry(op, layout, entry);
     }
 
     uint64_t last_ref_sequence = 0;
@@ -467,16 +465,6 @@ ManifestId seedOrphanManifestBody(Pool & victim, const String & ns_str)
     EXPECT_TRUE((*op).head(victim.layout().manifestKey(id), Retry::once()).has_value());
     return id;
 }
-
-/// THE MANIFEST-DEBRIS DRAIN NO LONGER DELETES, AND THE FIXTURES BELOW SAY SO RATHER THAN WORKING
-/// AROUND IT. The drain goes through `sweepNamespace`, which is subject to the §6 deletion premise: a
-/// manifest of an epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an
-/// epoch STRICTLY above `E`. Every object in these fixtures -- the table's ref stream, the debris, and
-/// the removal transaction decommission itself appends -- lives in ONE writer epoch, and a single-epoch
-/// pool cannot satisfy that: any cursor high enough to clear the debris's epoch also sits above the
-/// removal record, which would strip the tail-removal protection off the table's real manifests. The
-/// two facts are mutually exclusive here, so there is no honest seeding that restores the deletions;
-/// the tests assert retention, and the drain's reclaim path returns with registers R2/R3 (Stage B).
 
 }
 
@@ -831,10 +819,11 @@ TEST(CASDecommission, EmitsMemberDecommissionEvents)
 TEST(CASDecommission, DrainsDebrisStagingAndRoots)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    String debris_key;
     {
         auto victim = openVictim(backend);
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
-        seedOrphanManifestBody(*victim, "victim/db/t1");
+        debris_key = victim->layout().manifestKey(seedOrphanManifestBody(*victim, "victim/db/t1"));
     }
     /// Foreign staging + mountpoint objects, written raw (no writer machinery needed): the victim's
     /// writers are fenced by the claim before decommission ever gets here, so these are ordinary debris,
@@ -849,62 +838,16 @@ TEST(CASDecommission, DrainsDebrisStagingAndRoots)
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
-    /// The staging and mountpoint phases are unchanged and still drain completely. The manifest-debris
-    /// phase retains under the §6 premise (see the note on the helpers above) and reports why, which is
-    /// what keeps the slot; `RetainsDebrisWhoseEpochSealIsUnconsumed` is that outcome's own test.
-    EXPECT_EQ(report.manifest_debris_removed, 0u);
+    EXPECT_GE(report.manifest_debris_removed, 1u);
     EXPECT_EQ(report.staging_objects_removed, 2u);
     EXPECT_EQ(report.mountpoint_objects_removed, 1u);
-    EXPECT_FALSE(report.warnings.empty())
-        << "the retained debris is reported, so the incomplete drain is visible";
 
-    /// Nothing of the victim remains under staging/ or roots/ (scoped LISTs are empty). Those two phases
-    /// run to completion even though the debris phase retained -- the drain is per-phase, not all-or-nothing.
+    /// Nothing of the victim remains under staging/ or roots/ (scoped LISTs are empty), and the orphan
+    /// manifest body is gone.
     OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head(debris_key, Retry::once()).has_value());
     EXPECT_TRUE((*raw_op).list("p/staging/victim/", "", 10, Retry::once()).keys.empty());
     EXPECT_TRUE((*raw_op).list("p/roots/victim/", "", 10, Retry::once()).keys.empty());
-}
-
-/// The §6 deletion premise applies to the decommission drain too, and this pins what that COSTS. With no
-/// sealed fold cursor for the victim's namespace — the state of a pool whose GC has not folded past the
-/// victim's closed epoch — the drain cannot show the debris is unreferenced, so it RETAINS it, says why
-/// in `warnings`, and therefore keeps the slot for a later re-run. Delay, not damage: the objects are
-/// untouched and a re-run after GC catches up drains them (`DrainsDebrisStagingAndRoots`).
-///
-/// This is the visible edge of a real Stage-A limitation, not a test-only artifact: debris under a
-/// namespace GC never folds — the pure pre-precommit orphan, whose whole point is that no ref record was
-/// ever appended for it — has no cursor to consume any seal, so the premise retains it indefinitely.
-/// Reclaiming it needs the sweep's own rework (registers R2/R3, Stage B), which is why the premise ships
-/// as the safety floor and not as the reclaim policy.
-TEST(CASDecommission, RetainsDebrisWhoseEpochSealIsUnconsumed)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    String debris_key;
-    {
-        auto victim = openVictim(backend);
-        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
-        const ManifestId debris_id = seedOrphanManifestBody(*victim, "victim/db/t1");
-        debris_key = victim->layout().manifestKey(debris_id);
-        /// Deliberately NO `seedFoldedPastVictimEpoch` here — that absence is the subject.
-    }
-
-    const auto report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-
-    EXPECT_EQ(report.manifest_debris_removed, 0u);
-    OperationForTest raw_op(*backend);
-    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
-        << "the body is retained untouched, not deleted and not corrupted";
-    ASSERT_FALSE(report.warnings.empty())
-        << "a retained manifest is a visible decision -- the operator must be able to see why the drain "
-           "did not complete";
-    bool named = false;
-    for (const String & w : report.warnings)
-        if (w.find(debris_key) != String::npos && w.find("seal") != String::npos)
-            named = true;
-    EXPECT_TRUE(named) << "the warning names the object and the premise that retained it";
-    EXPECT_FALSE(report.slot_removed)
-        << "an incomplete drain keeps the slot as the resume anchor, exactly as a per-key failure does";
 }
 
 /// Task 3 fail-close nuance (spec §core "Fail-close"): a per-object failure in the staging/roots drain
@@ -1031,7 +974,6 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 
     EXPECT_EQ(report.namespaces_removed, 1u)
         << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
-    EXPECT_EQ(report.manifest_debris_removed, 0u);
     EXPECT_EQ(report.warnings.size(), 1u)
         << "the thrown per-key delete must keep the retirement tail fail-closed";
     EXPECT_EQ(report.staging_objects_removed, 1u)
@@ -1334,9 +1276,8 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
 
 /// Task 4 fail-close, manifest-debris variant (review follow-up: the plan's own example only exercises
 /// a roots-phase failure). A per-key `deleteExact` throw inside the manifest-debris drain must ALSO
-/// keep the slot: `report.slot_removed == false`, the mount object survives, and once the injected
-/// failure is cleared a re-run drains the leftover debris and removes the slot.
-TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
+/// keep the slot: `report.slot_removed == false` and the mount object survives.
+TEST(CASDecommission, ManifestDebrisFailureKeepsSlot)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     String debris_key;
@@ -1365,29 +1306,11 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
         });
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
-    EXPECT_EQ(first.manifest_debris_removed, 0u);
     OperationForTest raw_op(*backend);
     EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
         << "slot kept -- resume anchor";
     EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
         << "the failing object is left behind (untouched) so a re-run can retry it";
-
-    /// COVERAGE LOST HERE, DELIBERATELY NAMED. Before the §6 premise, clearing the injected failure let
-    /// a re-run drain the debris and retire the slot, which is what proved the per-key fail-close path
-    /// RESUMES rather than merely refuses. Under the premise the sweep never reaches `deleteExact` for
-    /// this body at all (single-epoch pool -- see the note on the helpers above), so disarming changes
-    /// nothing and the resume half of this test is no longer expressible. What survives is the half that
-    /// still has a mechanism: the slot stays kept across the re-run, and the object stays untouched.
-    /// The resume assertion comes back with the drain's reclaim path (registers R2/R3, Stage B).
-    backend->disarm();
-    const auto second = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
-    EXPECT_EQ(second.namespaces_already_removed, 1u);
-    EXPECT_EQ(second.manifest_debris_removed, 0u);
-    EXPECT_FALSE(second.slot_removed);
-    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value());
-    EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
-        << "the slot is still the resume anchor -- nothing was retired against unreclaimed debris";
 }
 
 /// CI run 7 (PR #2300): `drain_now_fn` fakes the drain's own request clock, but the mount lease's

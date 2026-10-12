@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -535,9 +534,8 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// closed instead (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
+        meta_op, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/!config.read_only);
-    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -954,9 +952,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// minting a fresh identity here (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
+        meta_op, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/false);
-    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -1130,7 +1127,6 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// right severity, not a release fail-close.
     const ThreadName tn = getThreadName();
     chassert(tn != ThreadName::CAS_REMOUNT && tn != ThreadName::CAS_GC_SCHEDULER
-             && tn != ThreadName::CAS_GC_HEARTBEAT
              && "SYSTEM CAS FORGET must not run on a CAS pool thread (self-join deadlock)");
 
     /// Idempotent: an already-terminal `Vanished` pool (a second FORGET, or a pool that naturally vanished
@@ -1833,18 +1829,6 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
         {
         }
     }
-}
-
-uint64_t Pool::currentGcRound() const
-{
-    /// Read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
-    /// GC advance only makes the returned round larger, which is strictly more conservative for the
-    /// `precommitAdd` self-floor). Returns 0 when absent (pool never GC'd — no round to floor to).
-    CasOperation op = gc_requests.admit();
-    const auto state_bytes = op.read(pool_layout.gcStateKey(), Retry::standard());
-    if (!state_bytes)
-        return 0;
-    return decodeGcState(state_bytes->bytes).round;
 }
 
 void Pool::removeNamespaceFile(const NamespaceLifeId & life, const String & name)

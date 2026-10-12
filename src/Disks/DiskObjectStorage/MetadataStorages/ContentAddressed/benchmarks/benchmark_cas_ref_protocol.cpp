@@ -13,10 +13,8 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteBufferFromVector.h>
 #include <IO/WriteHelpers.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -594,157 +592,16 @@ static void BM_Materialize(benchmark::State & state)
 BENCHMARK(BM_Materialize)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
 /// -------------------------------------------------------------------------------------------------
-/// Wire-key-cut instrument (Task 7): encode AND decode for the five formats the campaign's wire-key
-/// rename touched most (`cas_run`, `cas_ref_snap`, `cas_part_manifest`, `cas_fold_seal`,
-/// `cas_ref_catalog`), plus a byte/cap oracle (below `reportFormatCaps`). This section only BUILDS the
+/// Wire-key-cut instrument (Task 7): encode AND decode for the formats the campaign's wire-key
+/// rename touched most (`cas_ref_snap`, `cas_part_manifest`, `cas_ref_catalog`), plus a byte/cap
+/// oracle (below `reportFormatCaps`). This section only BUILDS the
 /// instrument -- it does not take the before/after measurement itself, which is a later task run
 /// against this same binary built on both sides of the cut. The "before" side is the pre-cut worktree
-/// at `/home/mfilimonov/workspace/ClickHouse/cas-p2-before`, pinned at commit `65ec8688cdb`; the
-/// recorded patch that adapts this file's one incompatible call site (`foldedClassification`/
-/// `clampedClassification` below) for that build lives under
-/// `docs/superpowers/cas/bench-wire-keys-phase3/`. Every other line in this section is byte-identical
-/// on both sides -- confirmed against the before-side headers, which differ from these only in
-/// comment text (the retired terse wire spellings) and in `RefCoverage::classification`'s type.
+/// at `/home/mfilimonov/workspace/ClickHouse/cas-p2-before`, pinned at commit `65ec8688cdb`.
 /// -------------------------------------------------------------------------------------------------
 
 namespace
 {
-
-/// `cas_run` fixture: `n` distinct blobs in strictly ascending digest order (`SourceEdgeRunWriter`
-/// requires non-decreasing `(ref, source_id)` keys, and a monotonically increasing digest alone
-/// satisfies that regardless of `source_id`). Marker mix models one healthy in-degree run: the
-/// overwhelming majority of tracked blobs simply carry a live edge this generation (98% `Edge`); a
-/// blob losing its LAST edge (`Zero`) or actually condemned for deletion (`Condemned`, carrying the
-/// full retired-incarnation token) is comparatively rare at any one round -- 1% each here, not 0 and
-/// not half. `source_id` is a synthetic per-record counter rather than a real backend id: the codec's
-/// cost is driven by the DIGEST's hex width, not the id's numeric value. The condemned token mirrors a
-/// real S3 ETag's width (a quoted 32-hex value) and `size` a realistic single-blob byte count (64 KiB,
-/// a typical compressed column chunk). Record count ranges 100 to 100,000 (`RangeMultiplier(10)`),
-/// matching every `Complexity()` benchmark already in this file.
-std::vector<SourceEdgeRecord> makeSourceEdgeRecords(size_t n)
-{
-    std::vector<SourceEdgeRecord> records;
-    records.reserve(n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(i + 1))};
-        SourceEdgeRecord rec;
-        rec.ref = ref;
-        if (i % 100 == 0)
-        {
-            rec.source_id = UInt128(0);
-            rec.marker = RunMarker::Condemned;
-            rec.delete_pending = (i % 200 == 0);
-            rec.token = PersistedEtag{"etag", "\"e1b2c3d4e5f6071829300a0b0c0d0e0f\""};
-            rec.size = 64 * 1024;
-            rec.condemn_round = 7;
-        }
-        else if (i % 100 == 50)
-        {
-            rec.source_id = UInt128(0);
-            rec.marker = RunMarker::Zero;
-        }
-        else
-        {
-            rec.source_id = UInt128(i + 1);
-            rec.marker = RunMarker::Edge;
-        }
-        records.push_back(rec);
-    }
-    return records;
-}
-
-/// Runs the real `SourceEdgeRunWriter` over `records`, exactly as `CASRecordStream`'s own
-/// `encodeRun` helper does -- so decode below always consumes real encoder output, never a
-/// hand-built string.
-String encodeSourceEdgeRun(const std::vector<SourceEdgeRecord> & records)
-{
-    DB::WriteBufferFromOwnString out;
-    SourceEdgeRunWriter writer(out);
-    for (const auto & r : records)
-        writer.append(r);
-    writer.finish();
-    /// `str()` returns a `std::string &`, so returning it plainly would copy-construct the whole
-    /// encoded run on every call (no NRVO is available for a reference) -- `std::move` here moves it
-    /// instead, matching the four other encoders, which all end with `std::move(out).take()` and copy
-    /// nothing. `str()` finalizes `out` itself, so no separate `finalize()` call is needed first.
-    return std::move(out.str());
-}
-
-/// The ONE call site whose TYPE differs across the wire-key-rename cut this benchmark spans: on this
-/// (AFTER) side `RefCoverage::classification` is the closed `CoverageClass` enum; at the pre-cut
-/// commit it is a raw `uint8_t` whose CLAMPED value is ALSO renumbered (4 there, 3 here -- see
-/// `CasFoldSealFormat.h`'s own history comment on `CoverageClass`). A bare numeric literal at the call
-/// site would therefore silently measure the WRONG row shape on the before-side build, so the Step-4
-/// patch touches only this pair of one-line functions; every benchmark body in this file stays
-/// byte-identical on both sides.
-CoverageClass foldedClassification() { return CoverageClass::Folded; }
-CoverageClass clampedClassification() { return CoverageClass::Clamped; }
-
-/// Not the record axis under test (`n` below is `ref_lives` row count): fixed at a representative
-/// multi-shard pool size. A single-shard fixture would fold `blob_target_runs`/`condemned_summary` to
-/// one degenerate entry each, understating the per-shard fan-out a real multi-shard pool carries in
-/// both sections.
-constexpr uint64_t kFoldSealGcShards = 4;
-
-/// `cas_fold_seal` fixture: `n` `ref_lives` rows keyed by ascending life id, split base/hold-bearing/
-/// cleanup-evidence 90%/5%/5%. Per the spec's byte table, a hold-bearing row adds 33 bytes and a
-/// cleanup-evidence row adds 16 bytes over a base row's 22-plus-class-word bytes; at this 90/5/5 mix
-/// the recovered uplift over an all-base fixture is 0.05*33 + 0.05*16 = 2.45 bytes/row, about 8% over
-/// a base row's own ~30 bytes (the full one-third the spec's deltas imply is the all-clamped extreme,
-/// not this mix) -- still enough that omitting the two minority shapes entirely would misstate the
-/// row-average cost in the wrong direction. The 90/5/5 split models a healthy pool: most namespaces
-/// fold cleanly every round (base: `Folded`, no hold, no cleanup evidence); a minority sit behind a
-/// transient barrier (hold-bearing: `Clamped`, `ManifestBodyMissing`); a minority are mid-teardown
-/// (cleanup evidence: `Folded` plus a terminal `remove_namespace` fold). Neither minority shape is the
-/// common case, but neither is negligible either -- both recur every round in a live pool.
-/// `RefTxnId` epoch/sequence pairs and the hold's `retry_count`/`next_retry_round` are multi-digit
-/// (a pool old enough to have restarted its writer dozens of times and folded past its 100,000th
-/// ref-log transaction; a hold retried past its first round but nowhere near abandoned) rather than
-/// the single-digit illustrative values the spec's byte table uses to name the three row SHAPES --
-/// matching the shapes, not the spec table's example digits, is what keeps the value-byte denominator
-/// realistic (see `makeSyntheticSnapshot`'s doc comment for why that denominator matters). Record
-/// count ranges 100 to 100,000, matching every `Complexity()` benchmark in this file.
-CasFoldSeal makeFoldSeal(size_t n)
-{
-    CasFoldSeal seal;
-    seal.generation = 7;
-    seal.parent_generation = 6;
-    for (size_t i = 0; i < n; ++i)
-    {
-        RefLifeFoldState row;
-        if (i % 20 == 0)
-        {
-            row.coverage = RefCoverage{
-                .classification = clampedClassification(),
-                .last_folded_ref_id = RefTxnId{42, 103482},
-                .hold = RefHold{
-                    .reason = HoldReason::ManifestBodyMissing,
-                    .offending_position = RefTxnId{42, 103500},
-                    .retry_count = 14,
-                    .next_retry_round = 1042}};
-        }
-        else if (i % 20 == 1)
-        {
-            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{42, 118203}};
-            row.cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{42, 118190}};
-        }
-        else
-        {
-            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{42, 100123}};
-        }
-        seal.ref_lives.emplace(UInt128(i + 1), std::move(row));
-    }
-    for (uint64_t shard = 0; shard < kFoldSealGcShards; ++shard)
-    {
-        seal.blob_target_runs.push_back(RunRef{
-            .key = fmt::format("p/gc/gen/7/attempt/1/blob_target/{}/0", shard),
-            .checksum = UInt128(0x1000 + shard), .shard = shard, .key_generation = 7});
-        seal.condemned_summary[shard] = CondemnedSummary{
-            .condemned_total = 1000 + shard, .pending_total = 10 + shard, .oldest_nonpending_condemn_round = 4};
-    }
-    return seal;
-}
 
 /// `cas_part_manifest` fixture: `n` entries in path order, 90% `Blob` (the column/mark/index files
 /// that dominate a real MergeTree part) and every 10th `Inline` (small metadata files like
@@ -819,39 +676,6 @@ RefCatalog makeRefCatalog(size_t n)
 
 }
 
-/// `cas_run` is streamed (`object_cap == 0`; see `CasRecordStreamFormat.h`) and never materialized
-/// whole in production, but the benchmark still needs one complete encoded run to time and to decode:
-/// `encodeSourceEdgeRun` drives the real `SourceEdgeRunWriter`/`SourceEdgeRunReader` pair over an
-/// in-memory buffer, the same pair the streaming production path uses over its own `WriteBuffer`/
-/// `ReadBuffer`.
-static void BM_CasRunEncode(benchmark::State & state)
-{
-    const size_t n = static_cast<size_t>(state.range(0));
-    const std::vector<SourceEdgeRecord> records = makeSourceEdgeRecords(n);
-    for (auto _ : state)
-        benchmark::DoNotOptimize(encodeSourceEdgeRun(records));
-    state.SetComplexityN(static_cast<int64_t>(n));
-}
-BENCHMARK(BM_CasRunEncode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
-
-static void BM_CasRunDecode(benchmark::State & state)
-{
-    const size_t n = static_cast<size_t>(state.range(0));
-    const String encoded = encodeSourceEdgeRun(makeSourceEdgeRecords(n));
-    for (auto _ : state)
-    {
-        DB::ReadBufferFromMemory in(encoded.data(), encoded.size());
-        SourceEdgeRunReader reader(in);
-        SourceEdgeRecord rec;
-        size_t count = 0;
-        while (reader.next(rec))
-            ++count;
-        benchmark::DoNotOptimize(count);
-    }
-    state.SetComplexityN(static_cast<int64_t>(n));
-}
-BENCHMARK(BM_CasRunDecode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
-
 /// `BM_SnapshotEncode` above already exists (for the E4 contiguous-scan investigation) and has no
 /// decode counterpart. This pair is the one the wire-key-cut measurement uses: same fixture, but named
 /// and shaped to match the other four formats' encode/decode pairs in this section.
@@ -897,27 +721,6 @@ static void BM_CasPartManifestDecode(benchmark::State & state)
 }
 BENCHMARK(BM_CasPartManifestDecode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
-static void BM_CasFoldSealEncode(benchmark::State & state)
-{
-    const size_t n = static_cast<size_t>(state.range(0));
-    const CasFoldSeal seal = makeFoldSeal(n);
-    for (auto _ : state)
-        benchmark::DoNotOptimize(encodeFoldSeal(seal));
-    state.SetComplexityN(static_cast<int64_t>(n));
-}
-BENCHMARK(BM_CasFoldSealEncode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
-
-static void BM_CasFoldSealDecode(benchmark::State & state)
-{
-    const size_t n = static_cast<size_t>(state.range(0));
-    const CasFoldSeal seal = makeFoldSeal(n);
-    const String encoded = encodeFoldSeal(seal);
-    for (auto _ : state)
-        benchmark::DoNotOptimize(decodeFoldSeal(encoded));
-    state.SetComplexityN(static_cast<int64_t>(n));
-}
-BENCHMARK(BM_CasFoldSealDecode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
-
 static void BM_CasRefCatalogEncode(benchmark::State & state)
 {
     const size_t n = static_cast<size_t>(state.range(0));
@@ -945,8 +748,7 @@ namespace
 /// Binary search on record count with the real encode -> `sealObject` -> `openObject` pipeline as the
 /// oracle. `openObject` (`CasTextFormat.cpp`) enforces the registry's `object_cap` on BOTH the raw and
 /// the zstd-frame-header path, so this one pipeline works whether or not the format compresses; a
-/// format's OWN pre-put gate (e.g. fold-seal's `checkFoldSealObjectBytes`) may throw earlier, at the
-/// encode step itself. Either `LIMIT_EXCEEDED` or `CORRUPTED_DATA` at this boundary means "does not
+/// format's OWN pre-put gate may throw earlier, at the encode step itself. Either `LIMIT_EXCEEDED` or `CORRUPTED_DATA` at this boundary means "does not
 /// fit" and steers the search; any other exception is a fixture bug, not a capacity signal, and is
 /// left to propagate rather than being misread as "found the cap".
 ///
@@ -1004,7 +806,7 @@ uint64_t maxRecordCountUnderCap(FormatId id, uint64_t known_fits_n, uint64_t kno
 }
 
 /// One format's report line: decompressed bytes at `report_n`, stored bytes under the format's REAL
-/// registered compression policy (or `n/a` for a policy that stores raw -- `Never`/`PinnedRaw` -- since
+/// registered compression policy (or `n/a` for a policy that stores raw -- `Never` -- since
 /// there is no separate compressed form to report, and a `0` there would read as a measurement rather
 /// than "not applicable"), and the largest record count the real encoder admits under the format's
 /// object cap.
@@ -1033,21 +835,10 @@ void reportFormatCaps()
     constexpr uint64_t kReportN = 1000;
     fmt::print("=== cas format byte/cap report (n={}) ===\n", kReportN);
 
-    /// `cas_run` is `object_cap == 0` (streamed, `RunFile` family): never materialized whole in
-    /// production, so there is no whole-object cap to search for and no compressed form to report.
-    {
-        const String encoded = encodeSourceEdgeRun(makeSourceEdgeRecords(kReportN));
-        fmt::print("{:<18} decompressed={:>10} bytes (n={})  stored=n/a (PinnedRaw, never compressed)  "
-                   "max_n_under_object_cap=n/a (object_cap=0: streamed one line at a time, never materialized whole)\n",
-                   "cas_run", encoded.size(), kReportN);
-    }
-
     reportSealedFormat("cas_ref_snap", FormatId::RefSnapshot, kReportN,
         [](uint64_t n) { return encodeRefTableSnapshot(makeSyntheticSnapshot(n)); });
     reportSealedFormat("cas_part_manifest", FormatId::PartManifest, kReportN,
         [](uint64_t n) { return encodePartManifest(makePartManifest(n)); });
-    reportSealedFormat("cas_fold_seal", FormatId::FoldSeal, kReportN,
-        [](uint64_t n) { return encodeFoldSeal(makeFoldSeal(n)); });
     reportSealedFormat("cas_ref_catalog", FormatId::RefCatalog, kReportN,
         [](uint64_t n) { return encodeRefCatalog(makeRefCatalog(n)); });
 }

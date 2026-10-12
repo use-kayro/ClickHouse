@@ -63,18 +63,6 @@ struct ParsedNamespaceFileKey
     bool operator==(const ParsedNamespaceFileKey &) const = default;
 };
 
-/// The result of `Layout::parseBlobTargetRunKey`: the (generation, attempt, shard, seq) coordinates
-/// recovered from a listed blob-target in-degree/delta run segment key.
-struct ParsedBlobTargetRunKey
-{
-    uint64_t generation = 0;
-    uint64_t attempt = 0;
-    uint64_t shard = 0;
-    uint64_t seq = 0;
-
-    bool operator==(const ParsedBlobTargetRunKey &) const = default;
-};
-
 /// Builds and parses object-storage keys for one content-addressed pool.
 ///
 /// `Layout` owns only the pool prefix; it does not own storage, cache state, or a pool-wide blob hash
@@ -322,50 +310,6 @@ public:
     {
         return prefix + "/gc/state";
     }
-
-    /// GC heartbeat (advisory liveness pulse): `<prefix>/gc/hb`.
-    String gcHbKey() const
-    {
-        return prefix + "/gc/hb";
-    }
-
-    /// Prefix that covers EVERY per-round artifact of one generation (all attempts): <prefix>/gc/gen/<generation>/
-    /// The wholesale retention prune reclaims a whole generation (every attempt's debris) by this prefix.
-    String gcGenPrefix(uint64_t generation) const
-    {
-        return prefix + "/gc/gen/" + std::to_string(generation) + "/";
-    }
-
-    /// Prefix that covers one (generation, attempt)'s artifacts: <prefix>/gc/gen/<generation>/attempt/<attempt>/
-    /// `attempt` is the folding leader's monotonic per-round id; only the adopted attempt is reader-visible.
-    String gcGenAttemptPrefix(uint64_t generation, uint64_t attempt) const
-    {
-        return gcGenPrefix(generation) + "attempt/" + std::to_string(attempt) + "/";
-    }
-
-    /// Per-(generation, attempt) FOLD seal (write-once): <prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal.
-    String foldSealKey(uint64_t generation, uint64_t attempt) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "fold_seal";
-    }
-
-    /// One blob-target in-degree/delta run segment:
-    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/blob_target/<shard>/<seq>
-    String blobTargetRunKey(uint64_t generation, uint64_t attempt, uint64_t shard, uint64_t seq) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "blob_target/"
-               + std::to_string(shard) + "/" + std::to_string(seq);
-    }
-
-    /// Inverse of `blobTargetRunKey`: parses
-    /// `<prefix>/gc/gen/<generation>/attempt/<attempt>/blob_target/<shard>/<seq>`. Strict: rejects a
-    /// missing/foreign top-level prefix, a missing `attempt`/`blob_target` literal segment, a missing
-    /// generation/attempt/shard/seq segment, a non-canonical decimal component (empty, non-digit, a
-    /// leading zero other than a bare "0", or a value that overflows `uint64_t`), or trailing garbage.
-    /// Foreign/malformed keys return `std::nullopt`, never throw -- callers (`cas-inspect`) classify by
-    /// key shape, not by validity. Defined out-of-line in `CasLayout.cpp`, where the key construction
-    /// and parsing helpers remain together.
-    std::optional<ParsedBlobTargetRunKey> parseBlobTargetRunKey(std::string_view key) const;
 
     /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).
     String rootsPrefix() const

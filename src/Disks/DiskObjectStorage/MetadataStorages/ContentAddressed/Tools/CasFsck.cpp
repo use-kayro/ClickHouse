@@ -1,13 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
@@ -585,7 +583,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             o.cls = FsckClass::JanitorPending;
             o.size = candidate.size;
             o.reachable_from = {"physical life id is absent from a catalog cut taken after this listing; "
-                                 "janitor-pending, not corruption"};
+                                 "debris of a removed namespace, not corruption"};
             report.objects.push_back(std::move(o));
         }
         report.namespace_janitor_pending_lives = pending_lives.size();
@@ -723,7 +721,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// (`blobMetaKey(id) == blobKey(id) + ".meta"`) lives under the SAME
     /// `blobsPrefix()` as the body, so partition the raw LIST into bodies vs `.meta` objects up
     /// front — a `.meta` key must never be classified as a content body (it would otherwise be
-    /// misread as an unreferenced blob and fall into the dangling/pending/unaccounted pipeline
+    /// misread as an unreferenced blob and fall into the unreferenced-blob classes
     /// below), and a body must never be misread as a `.meta`.
     std::unordered_map<String, uint64_t> present_all;
     listAll(op, layout.blobsPrefix(), present_all, on_progress, deadline, "listing blobs");
@@ -790,242 +788,34 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
-    /// suspicious "unreachable" lump (the multi-stage graduation keeps a nonzero churning
-    /// set here on ANY active pool, and beta testers read "unreachable" as a leak). The GC state is
-    /// read for LABELING ONLY — reachability above never consults it.
-    std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
-    std::unordered_set<BlobRef, BlobRefHash> unref_hashes;
-    std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
-    /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob, collected in
-    /// `detail` mode only. `in_run_hashes` alone answers "does GC still see this blob at all"; the
-    /// stale-edge cross-check below needs the edge IDENTITIES so it can ask whether their source
-    /// manifests still exist. Sentinel rows (`source_id == 0` — `RunMarker::Zero`/`RunMarker::Condemned`) are not
-    /// edges and are excluded.
-    std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> unref_edge_sources;
-    bool have_gc_state = false;
-
-    for (const auto & [bkey, sz] : present_blobs)
-        if (!reachable_blobs.contains(bkey))
-        {
-            if (const std::optional<BlobRef> ref = layout.parseBlobKey(bkey))
-                unref_hashes.insert(*ref);
-        }
-
-    if (!unref_hashes.empty())
-    {
-        if (const auto state_got = op.read(layout.gcStateKey(), Retry::standard()))
-        {
-            have_gc_state = true;
-            const GcState gc_state = decodeGcState(state_got->bytes);
-            /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
-            /// construction. Every row whose hash is in our candidate set marks "known to GC" —
-            /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
-            /// `RunMarker::Condemned` sentinel row that carries the condemned state (retired-in-snapshot):
-            /// the `RunMarker::Condemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
-            /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
-            ///
-            /// These sets are keyed by the full `BlobRef`, not a narrowed digest. The run's own
-            /// algorithm-prefixed key is parsed by `SourceEdgeKeyCodec` and compared directly with
-            /// the full identity parsed from the listed blob key. This is required for mixed-algorithm
-            /// pools: a 64-hex digest must not be truncated or compared as though it used the pool's
-            /// local write algorithm, or its true GC state could be hidden as `Unaccounted`.
-            if (const auto seal_got = op.read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), Retry::standard()))
-            {
-                uint64_t rows = 0;
-                for (const RunRef & run : decodeFoldSeal(seal_got->bytes, gc_state.snap_generation).blob_target_runs)
-                {
-                    checkDeadline(deadline, "reading gc snapshot runs");
-                    /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON
-                    /// header gates type == cas_run + kind == source_edge). Fsck keys off the row's hash
-                    /// (the record's own algo-prefixed key, never from pool meta).
-                    SourceEdgeRunView reader = openSourceEdgeRun(op, run.key);
-                    String key;
-                    String payload;
-                    while (reader.next(key, payload))
-                    {
-                        BlobRef ref;
-                        UInt128 source_id;
-                        SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-                        if (unref_hashes.contains(ref))
-                        {
-                            in_run_hashes.insert(ref);
-                            if (detail && source_id != UInt128{0})
-                                unref_edge_sources[ref].push_back(source_id);
-                            if (!payload.empty() && runMarkerFromByte(payload[0], "CAS source-edge run") == RunMarker::Condemned)
-                            {
-                                const CondemnedRow row = decodeCondemnedRow(payload);
-                                RetiredEntry e;
-                                e.kind = ObjectKind::Blob;
-                                e.ref = ref;
-                                e.token = row.token;
-                                e.size = row.size;
-                                e.condemn_round = row.condemn_round;
-                                e.delete_pending = row.delete_pending;
-                                retired_by_hash.emplace(ref, std::move(e));
-                            }
-                        }
-                        if (on_progress && ++rows % 65536 == 0)
-                            on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
-                    }
-                    /// Whole-file seal checksum: compare the drained run's accumulated
-                    /// checksum to the seal's `RunRef::checksum`. Fsck is a read-only auditor — instead of
-                    /// throwing (which would abort the whole scan on the first corrupt run), catalogue the
-                    /// mismatch as a `CorruptedRun` finding (with the run key) and continue so the audit
-                    /// enumerates every problem in one pass. The deletion-deriving consumer
-                    /// (`zeroInDegree`) still fails closed on the same mismatch.
-                    if (reader.accumulatedChecksum() != run.checksum)
-                    {
-                        ++report.corrupted_runs;
-                        if (detail)
-                            report.objects.push_back(FsckObject{.key = run.key, .cls = FsckClass::CorruptedRun, .reachable_from = {}});
-                    }
-                }
-            }
-        }
-    }
-
-    /// STALE-EDGE cross-check. A residual `+1` whose matching `-1` never folded pins its blob at
-    /// in-degree 1 forever: every GC round recomputes the same nonzero in-degree and never nominates
-    /// the blob, so the `AwaitingGc` "expected, no action needed" label is a lie — nothing will ever
-    /// reclaim it. The edge names its source, so the check is to ask whether that source still exists:
-    /// build the set of source ids that every manifest body PRESENT in the pool would contribute, and
-    /// treat an edge outside that set as one whose source manifest is gone.
-    ///
-    /// COST: one LIST per namespace plus one GET per manifest body. It is therefore gated on `detail`
-    /// — the cheap summary path (the ca-soak fixpoint poll calls it in a loop) must not gain a single
-    /// extra request — and additionally on some unreferenced blob actually carrying a real edge, so a
-    /// pool with nothing to cross-check pays nothing.
-    ///
-    /// `stale_edge_check_available` is the fail-closed switch: a manifest body we cannot decode would
-    /// silently withhold its edges from the live set and turn every blob it owns into a false hard
-    /// finding, so one undecodable body disables the whole cross-check for this scan rather than
-    /// manufacture an error. The check may only ever SHRINK to silence, never invent a finding.
-    std::unordered_set<UInt128, UInt128Hash> live_source_ids;
-    bool stale_edge_check_available = detail && !unref_edge_sources.empty();
-    if (stale_edge_check_available)
-    {
-        const NamespaceListing stale_edge_listing = store.listNamespaces(namespace_prefix);
-        recordLifelessKeys(stale_edge_listing);
-        for (const String & ns_str : stale_edge_listing.namespaces)
-        {
-            const RootNamespace ns{ns_str};
-            std::unordered_map<String, uint64_t> manifest_bodies;
-            listAll(op, layout.manifestNamespacePrefix(ns), manifest_bodies, on_progress, deadline,
-                    "listing manifests for the stale-edge check");
-            for (const auto & [mkey, _] : manifest_bodies)
-            {
-                checkDeadline(deadline, "reading manifests for the stale-edge check");
-                const std::optional<ManifestId> id = layout.parseManifestKey(mkey);
-                if (!id)
-                    continue;   /// foreign/malformed key under `manifests/` — contributes no source edge
-                const auto got = op.read(mkey, Retry::standard());
-                if (!got)
-                    continue;   /// gone between the LIST and the read — genuinely not a live source
-                try
-                {
-                    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
-                    for (const ManifestEntry & e : body.entries)
-                        if (e.placement == EntryPlacement::Blob)
-                            live_source_ids.insert(sourceEdgeId(*id, e.path));
-                }
-                catch (...)
-                {
-                    stale_edge_check_available = false;   /// incomplete live set — do not accuse anyone
-                    break;
-                }
-            }
-            if (!stale_edge_check_available)
-                break;
-        }
-    }
-
+    /// Present-but-unreferenced blobs, labeled by what the pool holds for them: `.meta = Condemned` (GC
+    /// condemned the blob and keeps the marker until its exact-token delete, or a writer re-uploads it) or
+    /// unreferenced. Labels only — reachability above never consults them. Only a blob with a listed
+    /// `.meta` costs a GET.
     for (const auto & [bkey, sz] : present_blobs)
     {
         if (reachable_blobs.contains(bkey))
             continue;
         ++report.unreachable;
 
-        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) falls back to the default `BlobRef{}`,
-        /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
-        /// `Unaccounted` bucket below, exactly the "debris, not ours" classification `parseBlobKey`
-        /// documents: foreign algorithm segments are debris, not pool objects.
-        const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});
+        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) is debris, not a pool object: unreferenced.
+        const std::optional<BlobRef> ref = layout.parseBlobKey(bkey);
+        std::optional<LoadedMeta> meta;
+        if (ref && present_meta_hashes.contains(*ref))
+            meta = loadMeta(op, layout, *ref);
+        const bool condemned = meta && meta->meta.state == MetaState::Condemned;
 
-        FsckClass cls = FsckClass::Unaccounted;
-        String note;
-        const auto rit = retired_by_hash.find(hash);
-        /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
-        const std::optional<Meta> retired_head
-            = rit != retired_by_hash.end() ? op.head(bkey, Retry::standard()) : std::nullopt;
-        if (retired_head && rit->second.token.matches(retired_head->etag))
-        {
-            /// The PRESENT incarnation is the condemned one — deletion is scheduled. A mismatch
-            /// means the listed entry belongs to a displaced older incarnation and says
-            /// nothing about this object; fall through to the snapshot check.
-            cls = FsckClass::PendingGc;
-            note = rit->second.delete_pending
-                ? "delete_pending: exact-token delete executes next GC round"
-                : "condemned at round " + std::to_string(rit->second.condemn_round)
-                    + "; graduates once every writer acks past it (expected)";
-        }
-        else if (in_run_hashes.contains(hash))
-        {
-            /// `in_run_hashes` only says the GC snapshot still holds SOMETHING for this blob. Split on
-            /// whether any of it is still actionable. One edge whose source manifest is PRESENT keeps
-            /// the ordinary `AwaitingGc` verdict — that manifest's removal still folds its `-1`, and an
-            /// unowned-but-present manifest is reclaimed by the orphan sweep, so the blob is genuinely
-            /// mid-pipeline. When EVERY edge names a manifest that no longer exists, no `-1` is left to
-            /// fold: the in-degree is pinned above zero for good and only a rebuild can clear it.
-            uint64_t stale_edges = 0;
-            bool all_edges_stale = false;
-            if (const auto eit = unref_edge_sources.find(hash);
-                stale_edge_check_available && eit != unref_edge_sources.end() && !eit->second.empty())
-            {
-                for (const UInt128 & source_id : eit->second)
-                    if (!live_source_ids.contains(source_id))
-                        ++stale_edges;
-                all_edges_stale = stale_edges == eit->second.size();
-            }
-
-            if (all_edges_stale)
-            {
-                cls = FsckClass::StaleEdge;
-                note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
-                       "exist — unreclaimable by the incremental GC; NOT expected, investigate";
-            }
-            else
-            {
-                cls = FsckClass::AwaitingGc;
-                note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
-            }
-        }
-        else if (!have_gc_state)
-        {
-            cls = FsckClass::AwaitingGc;
-            note = "GC has not run on this pool yet";
-        }
+        if (condemned)
+            ++report.pending_gc;
         else
-        {
-            note = "not in the current GC view — transient for a fast create+drop between rounds; "
-                   "PERSISTENT occurrences violate INV-2 (reachability-before-content), investigate";
-        }
-
-        switch (cls)
-        {
-            case FsckClass::PendingGc:   ++report.pending_gc;   break;
-            case FsckClass::AwaitingGc:  ++report.awaiting_gc;  break;
-            case FsckClass::StaleEdge:   ++report.stale_edge;   break;
-            default:                     ++report.unaccounted;  break;
-        }
+            ++report.unaccounted;
         if (detail)
         {
             FsckObject o;
             o.key = bkey;
             o.kind = ObjectKind::Blob;
             o.size = sz;
-            o.cls = cls;
-            o.reachable_from = {std::move(note)};
+            o.cls = condemned ? FsckClass::Condemned : FsckClass::Unreferenced;
             report.objects.push_back(std::move(o));
         }
     }
@@ -1034,7 +824,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// body is an INV-META-BODY violation (the fixed meta/body lifecycle never leaves a meta
     /// orphaned of its body) — a real ERROR, distinct from `dangling` (which is reachability-driven).
     /// A body with no `.meta` is a benign not-yet-adopted (or interrupted-birth) artifact, NOT a dangle
-    /// — it still classifies through the ordinary present-but-unreferenced pipeline above.
+    /// — it still classifies through the ordinary present-but-unreferenced classes above.
     std::unordered_set<BlobRef, BlobRefHash> present_body_hashes;
     present_body_hashes.reserve(present_blobs.size());
     for (const auto & [bkey, _] : present_blobs)
@@ -1051,7 +841,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     else
     {
         /// Scoped mode: dangling-only for the selected namespaces. Each blob named by a scoped ref
-        /// is HEAD-verified (O(scoped refs), no pool-wide LIST); the unreachable/pending pipeline
+        /// is HEAD-verified (O(scoped refs), no pool-wide LIST); the unreferenced-blob
         /// classification needs the whole pool and is intentionally skipped.
         for (const String & bkey : reachable_blobs)
         {
@@ -1160,10 +950,7 @@ String formatFsckSummary(const FsckReport & report)
         << " dangling=" << report.dangling
         << " unreachable=" << report.unreachable
         << " pending_gc=" << report.pending_gc
-        << " awaiting_gc=" << report.awaiting_gc
         << " unaccounted=" << report.unaccounted
-        << " stale_edge=" << report.stale_edge
-        << " corrupted_runs=" << report.corrupted_runs
         << " chain_broken=" << report.chain_broken
         << " lifeless_keys=" << report.lifeless_keys
         << " janitor_pending=" << report.namespace_janitor_pending

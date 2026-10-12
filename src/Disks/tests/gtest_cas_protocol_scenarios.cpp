@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -44,7 +43,6 @@ using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::displaceBlobToken;
 using DB::Cas::tests::idOf;
-using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
@@ -147,42 +145,9 @@ void assertPartReads(
 
 }
 
-TEST(CASProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
-{
-    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification, Phase A): a blob leaf whose
-    /// CURRENT token is condemned at the promote gate, but which THIS build putBlob'd (`Materialized` proof under
-    /// the durable precommit closure), is EDGE-PROTECTED — the condemnation is doomed (the next fold spares
-    /// it) and promote does NOT revalidate or re-upload the materialized leaf. promote COMMITS with the blob's
-    /// token UNCHANGED; the premature condemn is invisible to the client.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openPool(b);
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// Wiring order: stage + precommit (durable edge) BEFORE putBlob observes X (records token t0).
-    auto build = startBuildFor(s, ns, "part_1");
-    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
-    build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-
-    const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Etag t0 = currentIncarnation(*b, blob_key);
-
-    /// GC condemns X at t0 in round 1 and fences the namespace to round 1.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
-
-    /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), but the materialized leaf is
-    /// edge-protected — skipped, not re-validated ⇒ commit, token unchanged.
-    build->promote(ns, "part_1", build->buildId(), id);
-
-    /// The ref is committed and reads back; the blob still rides t0 (no re-upload).
-    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
-    EXPECT_EQ(currentIncarnation(*b, blob_key), t0);
-}
-
 TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 {
-    /// A blob dedup-adopted (`Materialized` proof) under the precommit closure; an EMPTY retire set at round 1.
+    /// A blob dedup-adopted (`Materialized` proof) under the precommit closure.
     /// Under EDGE-BEFORE-OBSERVE the materialized leaf is NOT re-observed at the promote gate at all — it is
     /// edge-protected — so promote commits in place with the token UNCHANGED (no HEAD, no rewrite).
     auto b = std::make_shared<InMemoryBackend>();
@@ -199,10 +164,6 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
-
-    /// GC advanced the round to 1 with an EMPTY retired set; fence to 1. X is NOT condemned and its
-    /// token is unchanged.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
 
     /// promote: the materialized leaf is edge-protected (not re-observed) ⇒ commit in place (KEEP).
     build->promote(ns, "part_1", build->buildId(), id);
@@ -236,16 +197,13 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
     EXPECT_NE(t1, t0);
 
-    /// GC advanced to round 1 with an EMPTY retired set; fence to 1.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
-
     /// promote refreshes ⇒ revalidate X ⇒ HEAD current t1 not condemned ⇒ commit. The dep rides t1.
     build->promote(ns, "part_1", build->buildId(), id);
     assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
     EXPECT_EQ(currentIncarnation(*b, blob_key), t1);
 
     /// Black-box proof the part reads the t1 incarnation: re-publish the same blob into a SECOND
-    /// namespace with NO new GC injection. The blob is already present at t1; nothing is re-uploaded.
+    /// namespace. The blob is already present at t1; nothing is re-uploaded.
     publishBlobPart(s, RootNamespace{"srv1/tbl/copy"}, "part_2", "data.bin", "payload-X");
     EXPECT_EQ(currentIncarnation(*b, blob_key), t1);
     assertPartReads(b, s, RootNamespace{"srv1/tbl/copy"}, "part_2", "data.bin", "payload-X");
@@ -253,46 +211,6 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// Independent discriminator that the blob rides t1, not the stale t0: t0 is DEAD. A deleteExact
     /// against t0 must TokenMismatch (INV-NO-RETURN — t0 was displaced and can never be current again).
     EXPECT_EQ(removeAtIncarnation(*b, blob_key, t0), Removal::Mismatch);
-}
-
-TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
-{
-    /// A blob whose OWN current token t0 is LIVE, but a DIFFERENT phantom token t_other for the same
-    /// hash IS condemned. The build records `Materialized` proof for t0, so promote does not re-observe it
-    /// (edge-protected) and commits in place: the blob keeps t0 (no upload, no displacement). The phantom
-    /// condemnation is for a different incarnation and never touches t0.
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    DB::Cas::Layout layout("p");
-    {
-        auto s0 = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
-    }
-    const String blob_key = layout.blobKey(idOf("payload-X"));
-    const Etag t0 = currentIncarnation(*b, blob_key);
-    const PersistedEtag t_other{"emulated", "emulated-phantom"};
-    ASSERT_FALSE(t_other.matches(t0)) << "the phantom must name a DIFFERENT incarnation than the live one";
-
-    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t_other, .size = 9}});
-    /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
-    /// round 1 already populated.
-
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});   /// open-time refresh ⇒ view round 1
-    /// Wiring order: stage + precommit (durable edge) BEFORE the adopting putBlob.
-    auto build = startBuildFor(s, ns, "part_1");
-    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
-    build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
-
-    /// promote: the materialized leaf is edge-protected (not re-observed) ⇒ commit. Lands. t0 untouched.
-    build->promote(ns, "part_1", build->buildId(), id);
-
-    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
-
-    /// The object was NOT displaced — it STAYS at t0 (no re-upload, only re-validated).
-    EXPECT_EQ(currentIncarnation(*b, blob_key), t0);
 }
 
 /// (DELETED, Phase A) RevalidateAbsentTokenedBlobResurrectsFromSource — see the file-header note: a
@@ -341,38 +259,6 @@ TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(hex));
     ASSERT_TRUE(lm_after.has_value());
     EXPECT_EQ(lm_after->meta.state, MetaState::Condemned) << "trust must not flip the meta";
-}
-
-TEST(CASProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
-{
-    /// A build whose watermark never renews finds its OWN putBlob'd upload condemned by full GC while its
-    /// precommit is STILL the live owner (this setup injects only the retire set + fence, no owner-removal
-    /// — the false-positive-freeze window BEFORE any GC reclaim). The materialized leaf is EDGE-PROTECTED: the
-    /// precommit closure named it before putBlob observed it, so the condemnation is doomed and promote
-    /// does NOT re-validate it — promote COMMITS with the token UNCHANGED, closing the window invisibly.
-    /// The genuine dead-build case (precommit reclaimed ⇒ owner check aborts, NO re-upload) is covered
-    /// separately by CaWiringResurrect.PromoteAbandonedPrecommitAbortsWithoutResurrect.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openPool(b);
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// Wiring order: stage + precommit (durable edge) BEFORE putBlob observes X.
-    auto build = startBuildFor(s, ns, "part_1");
-    const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
-    build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-
-    const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Etag t0 = currentIncarnation(*b, blob_key);
-
-    /// Full GC condemned the build's OWN upload.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
-
-    /// promote: the materialized leaf is edge-protected — skipped, not revalidated ⇒ commit, token unchanged.
-    build->promote(ns, "part_1", build->buildId(), id);
-    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
-    EXPECT_EQ(currentIncarnation(*b, blob_key), t0);
 }
 
 TEST(CASProtocol, AbandonLeavesDebrisAndDisables)
@@ -491,10 +377,6 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
     ASSERT_NE(t1, t0);
-
-    /// The view still condemns the OLD t0 at round 1, fenced.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
     /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);

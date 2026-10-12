@@ -93,12 +93,12 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   `CasProbe` (mount-time capability probe).
 - **`Pool/`** — the pool engine: `CasPool` (composition root), `CasPartWriteTxn`
   (one-part write transaction), `CasRefLedger` + `CasRefProtocol` (ref-table
-  log/snapshot/replay + intake), `CasServerRoot` (mount-claim protocol +
+  log/snapshot/replay), `CasServerRoot` (mount-claim protocol +
   single-writer slot + staging sweeper), `CasPoolMeta`, `CasBlobMeta`,
   `CasManifestReader`, `CasPlainObjects` (the `roots/...` verbatim
   passthrough), `CasMountRuntime` (fence state shared with lanes).
 - **`Gc/`** — garbage collection: `CasGcScheduler` (pacing thread), `CasKeeperGc`
-  (the round, see `Gc/CasKeeperGc.h`), `CasBlobInDegree`, `CasOrphanManifestSweep`.
+  (the round, see `Gc/CasKeeperGc.h`), `CasOrphanManifestSweep`.
 - **`Tools/`** — operator verbs (`clickhouse-disks`): `CasFsck`,
   `CasDecommission`, `CasInspect`.
 - **`Parts/`** — part semantics over the pool: `PartPathParser` (the

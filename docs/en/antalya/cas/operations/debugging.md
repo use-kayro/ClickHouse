@@ -174,10 +174,11 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 `unaccounted`, `stale_edge`, `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`,
 `namespace_janitor_pending` (+`_bytes`/`_lives`), `ref_records_walked`, `physical_bytes`,
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
-means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
-moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
-`chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
-GC source-edge run that failed its checksum, respectively. This summary-only form has no
+means data loss — `unreachable` counts every present, unreferenced object, of which `pending_gc`
+are blobs whose `.meta` is `Condemned` and `unaccounted` the other blobs; not a problem on their own.
+`awaiting_gc`, `stale_edge` and `corrupted_runs` are always `0`. `chain_broken` and
+`lifeless_keys` are the other hard findings: a hole in a ref-log stream and a key no writer could
+have produced, respectively. This summary-only form has no
 per-object `--detail` equivalent yet — for that, the offline `cas-fsck --detail` below is still
 needed.
 
@@ -232,23 +233,19 @@ own local view of one disk.
 ## Offline tools {#offline-tools}
 
 When the server cannot answer — it is down, or the access needs to be read-only forensic against the
-bucket directly, disaster recovery of `gc/state`, or a raw object decode — `clickhouse-disks` runs
-these against the pool's backend without a live server. All five require the disk to be opened with
+bucket directly, or a raw object decode — `clickhouse-disks` runs these against the pool's backend
+without a live server. Both require the disk to be opened with
 `<readonly>true</readonly>` in the `clickhouse-disks` config; they must never claim a live server's
 mount.
 
 | Command | Use it for |
 |---|---|
-| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
-| `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
-| `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
-| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats |
+| `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `condemned`, `unreferenced`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
+| `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`) straight to JSON |
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-fsck --detail
-clickhouse-disks -C config.xml --disk cas cas-gc-dryrun
 clickhouse-disks -C config.xml --disk cas cas-inspect '<raw-object-key>'
-clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
 `cas-drop-member` — the offline twin of `SYSTEM CAS DROP POOL MEMBER` — is covered on the

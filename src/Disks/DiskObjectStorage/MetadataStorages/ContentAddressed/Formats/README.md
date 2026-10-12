@@ -1,15 +1,13 @@
 # CAS persisted formats — the living registry
 
 Every persisted CAS object is a text file: header line `{"type":"cas_<object>","v":N}`, body
-(one JSON object / sorted NDJSON records / raw payload zone), optional `{"n":…}` trailer.
+(one JSON object / sorted records / raw payload zone), optional `{"n":…}` trailer.
 Can-grow-large types are stored under a **`.zst` key suffix** and are ALWAYS one zstd frame
-(checksum on; declared content size checked against the cap before allocation); always-small and
-deterministic types are raw. `CasTextFormat.{h,cpp}` is the only code that knows this shape.
+(checksum on; declared content size checked against the cap before allocation); always-small
+types are raw. `CasTextFormat.{h,cpp}` is the only code that knows this shape.
 
 The object inventory is text end to end — there are no binary CAS formats and no protobuf
-dependency. The GC source-edge data plane (`cas_run`) is sorted NDJSON written and read as a
-stream (no seek); its integrity check is the whole-file seal checksum. The part manifest is the
-one `PayloadHybrid` object: text header + descriptor meta + sorted entry records + `{"n":…}`
+dependency. The part manifest is the one `PayloadHybrid` object: text header + descriptor meta + sorted entry records + `{"n":…}`
 trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 **Rule:** any change to a persisted format lands in the SAME commit as its row here.
@@ -20,17 +18,15 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
 | `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
-| `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
-| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer/GC fold |
+| `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer |
+| `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
 | `cas/ref_catalog` | namespace lifecycle catalog (`kind:"entry"`, `ns`, `state`, `life`, `remove_round`, `creator`, `creator_epoch`, `creator_fence`) | `CasRefCatalogFormat` | namespace admission/removal |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
 | Keeper, not S3: `<zookeeper_path>/cas_parts/<part>` (one copy per part) | descriptor `pool`; the part's Inline entries (entry `path`, `place`=`inline`, `size`, then the payload zone); Blob entries are derived from the inline `checksums.txt` | `CasPartManifestFormat` (`encodePartFiles`) | `ReplicatedMergeTree` part commit |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
-| `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic; `generation`/`parent_generation`, `kind`: `ref_life`/`blob_run`/`condemned`) | `CasFoldSealFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
-| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | none (read by fsck/inspect; GC is `Gc/CasKeeperGc.h`) |
+| `gc/state` | state of the retired S3-listing GC round (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) | `CasGcStateFormat` | none (`round` read at namespace removal; rendered by inspect; GC is `Gc/CasKeeperGc.h`) |
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
@@ -73,7 +69,6 @@ use the corresponding `old_*` and `new_*` key bundles.
   until the pool floor rises (an old writer's fresh re-encode drops it).
 - Breaking change = `v` bump + `changePoints` + write-down-to-floor; the floor raise is what
   fences old builds out (mount gates: `min_reader_generation` forward, pool-meta `v` backward).
-- Deterministic formats (`cas_fold_seal`, `cas_run`): strict keys, pinned raw.
 - A key prefixed `!` is critical: a reader that does not understand it fails closed.
 - Padding zones (blob header pad, manifest banners) are deterministic and verified — no
   unaccounted bytes in any object.

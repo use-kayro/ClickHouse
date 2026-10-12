@@ -30,29 +30,26 @@ enum class FormatId : uint16_t
     /// root-local part manifest, while the former mutable `cas_ref_shard` class was replaced by the
     /// immutable `RefSnapshot` and `RefLog` objects. Keep all three values unused.
     GcState = 5,
-    /// Value 6 is retired: condemned state now rides source-edge runs and the fold-seal
-    /// `condemned_summary`. Keep it unused. Value 7 is also retired: the build-watermark floor is
-    /// carried by the `MountLease` beat rather than a standalone object.
+    /// Value 6 (the condemned-state object) is retired. Keep it unused. Value 7 is also retired: the
+    /// build-watermark floor is carried by the `MountLease` beat rather than a standalone object.
     PoolMeta = 8,
     Roster = 9,
     /// Value 10 is retired: discovery authority is the pool-wide `cas/ref_catalog` object rather
     /// than a roots registry object or a physical stream listing. Value 11 (the GC outcome log) is
     /// retired with the S3-listing GC round. Keep both unused.
     PartManifest = 12,    /// Immutable root-local `cas_part_manifest` payload-hybrid text object.
-    RunFile = 13,         /// Deterministic, uncompressed `cas_run` GC source-edge NDJSON stream.
-    FoldSeal = 14,        /// Write-once `cas_fold_seal` coverage and blob-target/cleanup-run object.
-    /// Value 15 is retired: the fold seal is the sole per-generation coverage record after the
-    /// one-pass GC round. The following three classes are per-server-root mount-safety objects.
+    /// Values 13 (the GC source-edge run), 14 (the fold seal) and 15 are retired with the S3-listing
+    /// GC round. Keep them unused. The following three classes are per-server-root mount-safety objects.
     Owner = 16,           /// `cas_owner` anchor from server-root ID to server UUID.
     ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch`.
     MountLease = 18,      /// Live `cas_mount_lease` object.
     /// These identifiers cover objects that were added to the registry after their initial codecs:
-    /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.
-    /// Their values are frozen and must never be reused.
+    /// the ref transaction log, complete ref snapshot and blob freshness sidecar. Their values are
+    /// frozen and must never be reused. Value 22 (the GC heartbeat) is retired with the S3-listing GC
+    /// round. Keep it unused.
     RefLog = 19,          /// cas_ref_log     — ref transaction log object
     RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
     BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
-    GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
     /// Value 25 (the namespace-janitor cursor) is retired with the S3-listing GC round. Keep it unused.
@@ -95,20 +92,20 @@ std::span<const FormatChangePoint> changePoints(FormatId id);
 /// for the header-line `type`, body family, unknown-key policy, compression policy, and fail-closed
 /// size caps. A format missing from this registry cannot be decoded.
 
-/// The shape of a text object body: a materialized control object, a streamed sorted record sequence,
-/// or a descriptor followed by raw payload bytes.
-enum class TextFamily : uint8_t { Control = 1, RecordStream = 2, PayloadHybrid = 3 };
+/// The shape of a text object body: a materialized control object, or a descriptor followed by raw
+/// payload bytes. Value 2 (the streamed record sequence) is retired with the GC source-edge run.
+enum class TextFamily : uint8_t { Control = 1, PayloadHybrid = 3 };
 
 /// Whether a decoder skips unknown ordinary keys or rejects them. Critical keys prefixed with `!`
 /// are rejected by all families because they signal a required extension.
 enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
 
 /// Deterministic storage policy. `Always` uses whole-object zstd and a `.zst` key suffix; `Never`
-/// remains raw; `PinnedRaw` is raw because byte adoption compares the serialized bytes.
-enum class CompressionPolicy : uint8_t { Never = 1, Always = 2, PinnedRaw = 3 };
+/// remains raw.
+enum class CompressionPolicy : uint8_t { Never = 1, Always = 2 };
 
 /// Codec metadata for one registered text object. The byte caps apply to decompressed object content
-/// and individual text lines; `object_cap == 0` means a streamed format has no whole-object cap.
+/// and individual text lines.
 struct FormatTraits
 {
     FormatId id;
@@ -116,7 +113,7 @@ struct FormatTraits
     TextFamily family;
     KeyStrictness strictness;
     CompressionPolicy compression;
-    uint64_t object_cap;        /// max DECOMPRESSED object bytes; 0 = uncapped (streamed)
+    uint64_t object_cap;        /// max DECOMPRESSED object bytes
     uint64_t line_cap;          /// max bytes of one text line
 };
 
@@ -130,9 +127,7 @@ std::span<const FormatId> allRegisteredFormatIds();
 
 /// The largest number of STORED bytes any materialized object may occupy: the largest whole-object
 /// cap in the registry, expanded by zstd's worst-case bound because the `Always` policy stores those
-/// objects compressed. A materialized read refuses anything larger rather than allocating it. A
-/// format with no whole-object cap is streamed rather than materialized, so it does not raise this
-/// bound.
+/// objects compressed. A materialized read refuses anything larger rather than allocating it.
 uint64_t casMaxStoredObjectBytes();
 /// Returns the storage-key suffix for `id`: `.zst` for `Always`, and an empty suffix otherwise.
 /// Key builders use this policy directly so a point lookup never has to inspect the object body or

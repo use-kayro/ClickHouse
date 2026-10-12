@@ -234,12 +234,11 @@ bool replaceForTest(const BackendPtr & backend, const String & key, const String
     return std::holds_alternative<Committed>(op.replace(key, bytes, expected, Retry::standard()));
 }
 
-void casAdmitEntryForTest(const BackendPtr & backend, const Layout & layout, uint64_t gc_shards,
-                          const CatalogEntry & entry)
+void casAdmitEntryForTest(const BackendPtr & backend, const Layout & layout, const CatalogEntry & entry)
 {
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();
-    CasRefCatalog::casAdmitEntry(op, layout, gc_shards, entry);
+    CasRefCatalog::casAdmitEntry(op, layout, entry);
 }
 
 std::optional<NamespaceLifeId> lifeIfCatalogedForTest(const BackendPtr & backend, const Layout & layout,
@@ -1034,7 +1033,7 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsAliasingIncarnationAdmittedBetw
         thief.incarnation = target_row.incarnation;
         thief.creator = CreatorFence{
             .server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-        casAdmitEntryForTest(backend, layout, 1, thief);
+        casAdmitEntryForTest(backend, layout, thief);
     });
 
     EXPECT_THROW((void)store->listRefs(ns), DB::Exception);
@@ -4029,7 +4028,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaits
     entry.state = NsState::Creating;
     entry.incarnation = UInt128(99);
     entry.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    casAdmitEntryForTest(backend, layout, 1, entry);
+    casAdmitEntryForTest(backend, layout, entry);
 
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
 
@@ -4101,7 +4100,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeNoRowObservationRevalidatesRathe
     born.state = NsState::Creating;
     born.incarnation = UInt128(1234);
     born.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    casAdmitEntryForTest(backend, layout, 1, born);
+    casAdmitEntryForTest(backend, layout, born);
 
     {
         std::lock_guard lock(mutex);
@@ -4166,7 +4165,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeIgnoresUnrelatedCatalogChurnBetw
     born.state = NsState::Creating;
     born.incarnation = UInt128(5678);
     born.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    casAdmitEntryForTest(backend, layout, 1, born);
+    casAdmitEntryForTest(backend, layout, born);
 
     {
         std::lock_guard lock(mutex);
@@ -4311,7 +4310,7 @@ TEST(CASRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutat
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/existing-live-assignment"};
-    casAdmitEntryForTest(backend, store->layout(), 1, CatalogEntry{
+    casAdmitEntryForTest(backend, store->layout(), CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = UInt128{41}});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefCkpt{
         .life_epoch = store->liveWriterEpoch(),

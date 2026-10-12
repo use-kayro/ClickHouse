@@ -45,12 +45,9 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
         case FormatId::Roster:
         case FormatId::PartManifest:
         case FormatId::PartFiles:
-        case FormatId::RunFile:
-        case FormatId::FoldSeal:
         case FormatId::Owner:
         case FormatId::ServerEpoch:
         case FormatId::BlobMeta:
-        case FormatId::GcHeartbeat:
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
@@ -95,8 +92,7 @@ constexpr uint64_t kMiB = 1024 * 1024;
 /// `line_cap` to `object_cap` lets any individually valid record consume the available object budget.
 ///
 /// Compression is per type and deterministic, with no size threshold. `Always` types can grow large
-/// and use a `.zst` key suffix; `PinnedRaw` types need stable bytes for adoption; `Never` types are
-/// small raw singletons.
+/// and use a `.zst` key suffix; `Never` types are small raw singletons.
 constexpr FormatTraits TRAITS[] =
 {
     {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256,        256},
@@ -111,12 +107,10 @@ constexpr FormatTraits TRAITS[] =
     /// reason its decoder is -- every field changes what cleanup may delete, so nothing in it may be
     /// skipped. Raw (`Never`): a small singleton, and `publishCkpt` re-encodes it on every attempt.
     {FormatId::RefCkpt,      "cas_ref_ckpt",      TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::Never,     64 * kKiB,  4 * kKiB},
-    /// `cas_ref_catalog` (INV-3): one object for the whole pool, token-CAS like `gc/state`, read on
-    /// every fold round and every recovery. STRICT for the same reason `cas_ref_ckpt` is -- every
-    /// field decides a namespace's lifecycle, so nothing in it may be skipped. Raw (`Never`): the
-    /// admission gate measures `encodeRefCatalog`'s own output directly, so a compressed size would
-    /// answer the wrong question. The object cap is the fold-seal's own 256 MiB (predicate (2) of the
-    /// additive admission check bounds it further via the entry count); the line cap is tight (4 KiB)
+    /// `cas_ref_catalog` (INV-3): one object for the whole pool, token-CAS, read on every recovery.
+    /// STRICT for the same reason `cas_ref_ckpt` is -- every field decides a namespace's lifecycle, so
+    /// nothing in it may be skipped. Raw (`Never`): the admission gate measures `encodeRefCatalog`'s own
+    /// output directly, so a compressed size would answer the wrong question. The line cap is tight (4 KiB)
     /// because one entry's record is ordinarily small -- but not always small enough: a namespace or
     /// `server_root_id` near their own byte bounds, worst-case escaped, can push a single line past
     /// 4 KiB, and `encodeRefCatalog` REFUSES that entry (`LIMIT_EXCEEDED`, `CasRefCatalogFormat.cpp`'s
@@ -126,10 +120,7 @@ constexpr FormatTraits TRAITS[] =
     /// `cas_part_files` is a Keeper znode value, never an S3 object: raw (`Never`). The caps only bound
     /// decoding (the manifest's); what bounds a record in practice is Keeper's request size.
     {FormatId::PartFiles,    "cas_part_files",    TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256 * kMiB, 64 * kKiB},
-    {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
-    {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},
     {FormatId::GcState,      "cas_gc_state",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::GcHeartbeat,  "cas_gc_hb",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::Owner,        "cas_owner",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},

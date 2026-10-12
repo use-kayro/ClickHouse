@@ -67,25 +67,12 @@ public:
         const Cas::FsckReport report = Cas::runFsck(*ca->store(), detail, on_progress, deadline, partial, namespace_prefix);
 
         /// Built by `Cas::formatFsckSummary` rather than here, so the line is reachable from a unit test.
-        /// It was assembled inline until 2026-07-26, and in that time `corrupted_runs` was added to the
-        /// report and to `clean()` without ever being rendered — a hard finding no run could report.
         std::cout << Cas::formatFsckSummary(report) << "\n";
 
-        /// De-alarm the pipeline classes for humans: on an active pool a nonzero pending/awaiting
-        /// count is the ack-floor deletion pipeline working as designed, not a leak. `stale_edge` is
-        /// deliberately NOT part of this sentence: those blobs look exactly like an `AwaitingGc`
-        /// backlog but will never drain, and being swept into "expected, no action needed" is what
-        /// hid them.
-        if (report.pending_gc + report.awaiting_gc > 0)
-            std::cout << "note: " << report.pending_gc + report.awaiting_gc
-                      << " unreferenced object(s) are inside the normal GC deletion pipeline "
-                         "(condemn -> graduate -> exact-token delete takes ~2-3 rounds) — expected, no action needed\n";
-        if (report.stale_edge > 0)
-            std::cout << "note: " << report.stale_edge
-                      << " unreferenced object(s) carry ONLY source edges naming manifests that no longer "
-                         "exist: their in-degree can never reach zero, so the incremental GC will never "
-                         "reclaim them — NOT expected, investigate (a rebuild of the in-degree state is the "
-                         "only way to clear them)\n";
+        if (report.pending_gc > 0)
+            std::cout << "note: " << report.pending_gc
+                      << " unreferenced blob(s) carry `.meta = Condemned`: GC condemned them and deletes them "
+                         "exact-token, or a writer re-uploads them (listed as `condemned` rows under --detail)\n";
         /// `unchecked` is not a finding and does not exit nonzero — it says the audit could not PROVE
         /// those namespaces either way, which is a statement about coverage. Saying so out loud is the
         /// whole point: a silent verdict of "no complaints" would read as a clean bill of health.
@@ -97,23 +84,16 @@ public:
                          "under --detail\n";
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
-                      << " object(s) are outside the current GC view — normal only as a transient "
-                         "(created+dropped between GC rounds); re-run cas-fsck after the next round and "
-                         "investigate any that persist\n";
-        /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is the
-        /// protocol-produced interval between a fenced GC exact-deleting a `Removing` row and the
-        /// perpetual namespace janitor reaching it on a later bounded page (its own deletes are
-        /// suppressed for the whole of Stage A). Persistent non-convergence is a leak/liveness question
-        /// for `CASGCNamespaceCleanupLeaks` and the `namespace_cleanup` GC-log phase, not this scan.
+                      << " unreferenced blob(s) carry no `Condemned` marker (listed as `unreferenced` rows "
+                         "under --detail)\n";
+        /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is debris
+        /// of a removed namespace.
         if (report.namespace_janitor_pending > 0)
             std::cout << "note: " << report.namespace_janitor_pending
                       << " namespace-life object(s) (" << report.namespace_janitor_pending_bytes
                       << " byte(s) across " << report.namespace_janitor_pending_lives
-                      << " life/lives) are janitor-pending — their catalog row is already gone, and the "
-                         "perpetual namespace janitor is the sole intended reclaimer, but its deletes can "
-                         "be deferred (e.g. a destructive-round suppression policy) — not corruption; "
-                         "investigate only if the same objects persist across many completed janitor "
-                         "cycles (listed as `janitor-pending` rows under --detail)\n";
+                      << " life/lives) belong to a namespace whose catalog row is already gone — not "
+                         "corruption (listed as `janitor-pending` rows under --detail)\n";
 
         if (detail)
         {
@@ -125,11 +105,8 @@ public:
                     case Cas::FsckClass::Reachable:   c = "reachable"; break;
                     case Cas::FsckClass::Dangling:    c = "dangling"; break;
                     case Cas::FsckClass::Unreachable: c = "unreachable"; break;
-                    case Cas::FsckClass::PendingGc:   c = "pending-gc"; break;
-                    case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
-                    case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
-                    case Cas::FsckClass::StaleEdge:   c = "stale-edge"; break;
-                    case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
+                    case Cas::FsckClass::Condemned:   c = "condemned"; break;
+                    case Cas::FsckClass::Unreferenced: c = "unreferenced"; break;
                     case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
                     case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
                     case Cas::FsckClass::LifelessKey: c = "lifeless-key"; break;
@@ -156,16 +133,6 @@ public:
                 "durable id of the same epoch, which contiguity (INV-1) makes impossible without a lost "
                 "record; every transaction above the hole is unreachable (positions are listed as "
                 "`chain-broken` rows under --detail)", report.chain_broken);
-        /// A term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
-        /// nonzero — so a corrupt run was invisible twice over. A seal-checksum mismatch is not debris:
-        /// `zeroInDegree` fails closed on the same run, so a consumer of it cannot make
-        /// progress past it, and the audit deliberately continues only so ONE pass enumerates them all.
-        if (report.corrupted_runs > 0)
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "cas-fsck: {} GC source-edge run(s) failed their whole-file seal checksum — the deletion-"
-                "deriving consumers fail closed on these, so GC cannot advance past them (run keys are "
-                "listed as `corrupted-run` rows under --detail)", report.corrupted_runs);
         /// A key the `Layout` parsers refuse (no current writer can produce it), or a catalog
         /// incarnation that is ambiguous or unreadable, is corruption nothing clears on its own: the
         /// namespace enumeration now reports it instead of aborting, which is what makes an exit code

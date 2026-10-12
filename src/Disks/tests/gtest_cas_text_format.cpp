@@ -45,16 +45,15 @@ TEST(CASFormatBattery, EveryRegisteredFormatIsBatteryCovered)
         << "a registered codec is missing from the common battery (or vice versa)";
 }
 
-/// ---- Task 2: FormatId entries for refsnaplog / blob meta / heartbeat ----
+/// ---- Task 2: FormatId entries for refsnaplog / blob meta ----
 
 TEST(CASFormatIds, NewIdsExistWithFrozenValues)
 {
     EXPECT_EQ(static_cast<uint16_t>(FormatId::RefLog), 19);
     EXPECT_EQ(static_cast<uint16_t>(FormatId::RefSnapshot), 20);
     EXPECT_EQ(static_cast<uint16_t>(FormatId::BlobMeta), 21);
-    EXPECT_EQ(static_cast<uint16_t>(FormatId::GcHeartbeat), 22);
     /// Every id, old and new, has a change-point ladder (BASELINE until a real bump).
-    for (auto id : {FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat})
+    for (auto id : {FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta})
         EXPECT_FALSE(changePoints(id).empty());
 }
 
@@ -64,9 +63,8 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
 {
     /// Completeness: every FormatId except the reserved Roster has traits.
     const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
-                            FormatId::PartManifest, FormatId::RunFile,
-                            FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
-                            FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat,
+                            FormatId::PartManifest, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
+                            FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta,
                             FormatId::RefCkpt, FormatId::RefCatalog, FormatId::PartFiles};
     std::set<std::string_view> types;
     for (FormatId id : all)
@@ -84,18 +82,11 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
     /// CASFormatTraitsDeathTest below proves the abort positively in those builds instead.
     EXPECT_THROW(traitsFor(FormatId::Roster), DB::Exception);
 #endif
-    /// Deterministic formats are pinned raw + strict; spot-check the two.
-    EXPECT_EQ(traitsFor(FormatId::RunFile).compression, CompressionPolicy::PinnedRaw);
-    EXPECT_EQ(traitsFor(FormatId::RunFile).strictness, KeyStrictness::Strict);
-    EXPECT_EQ(traitsFor(FormatId::FoldSeal).compression, CompressionPolicy::PinnedRaw);
-    EXPECT_EQ(traitsFor(FormatId::FoldSeal).strictness, KeyStrictness::Strict);
     /// .zst key suffix is exactly the Always set (can-grow-large types).
     EXPECT_EQ(storedSuffix(FormatId::RefSnapshot), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::RefLog), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::PartManifest), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::PoolMeta), "");
-    EXPECT_EQ(storedSuffix(FormatId::FoldSeal), "");
-    EXPECT_EQ(storedSuffix(FormatId::RunFile), "");
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
@@ -290,10 +281,8 @@ TEST(CASZstdArm, SealOpenPolicyAndCaps)
     EXPECT_LT(sealed.size(), big.size());
     EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed), big);
 
-    /// Never and PinnedRaw formats never compress on write and reject compressed input on read.
-    EXPECT_EQ(sealObject(FormatId::FoldSeal, big), big);
+    /// Never formats never compress on write and reject compressed input on read.
     EXPECT_EQ(sealObject(FormatId::PoolMeta, big), big);
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::FoldSeal, sealed); });
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::PoolMeta, sealed); });
 
     /// Declared content size over the cap fails BEFORE the output allocation: 65 MiB of text

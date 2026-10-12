@@ -72,7 +72,7 @@ public:
             CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
             CasOperation op = requests.admit();
             CasRefCatalog::casAdmitEntry(
-                op, Layout("p"), 1,
+                op, Layout("p"),
                 CatalogEntry{
                     .ns = RootNamespace("victim/db/late"),
                     .state = NsState::Live,
@@ -122,7 +122,7 @@ public:
                 CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
                 CasOperation op = requests.admit();
                 CasRefCatalog::casAdmitEntry(
-                    op, Layout("p"), 1,
+                    op, Layout("p"),
                     CatalogEntry{
                         .ns = RootNamespace("victim/db/late"),
                         .state = NsState::Live,
@@ -151,7 +151,7 @@ TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeeps
             .state = NsState::Live,
             .incarnation = UInt128{701}};
         CasRefCatalog::casAdmitEntry(
-            catalog_op, victim->layout(), victim->poolConfig().gc_shards,
+            catalog_op, victim->layout(),
             live);
         makeRemoving(catalog_op, victim->layout(), live);
     }
@@ -228,7 +228,7 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
             .state = NsState::Live,
             .incarnation = UInt128{713}};
         CasRefCatalog::casAdmitEntry(
-            catalog_op, victim->layout(), victim->poolConfig().gc_shards, broken_live);
+            catalog_op, victim->layout(), broken_live);
         makeRemoving(catalog_op, victim->layout(), broken_live);
         ASSERT_FALSE(catalog_op.head(victim->layout().refCkptKey(
             NamespaceLifeId::fromCatalogEntry(broken_ns, broken_live.incarnation)), Retry::standard()).has_value());

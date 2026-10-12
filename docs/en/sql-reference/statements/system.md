@@ -483,40 +483,6 @@ The command returns one row per disk it ran on (multiple rows when `disk_name` i
 
 A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
-### SYSTEM CAS GC REBUILD {#system-cas-gc-rebuild}
-
-Disaster-recovery command for the content-addressed (CAS) MergeTree garbage collector. It rebuilds a
-CAS disk's `gc/state` baseline from scratch, by re-discovering the whole ref universe and re-folding
-manifest edges into a fresh generation. It writes only the GC plane (`gc/state` and the `gc/gen/*`
-artifacts) and never touches ref shards, manifests, or blobs, and it never deletes anything itself —
-but the rebuilt baseline drives every subsequent GC round's retire decisions, so this is a
-**destructive disaster-recovery tool**, not something to run routinely: a rebuild performed against
-a state that was not actually corrupted discards live bookkeeping, and an incorrect rebuild can make
-a later round delete objects that are still referenced.
-
-```sql
-SYSTEM CAS GC REBUILD [FORCE] [ON CLUSTER cluster_name] disk_name
-```
-
-Unlike `SYSTEM CAS GC RUN`, `disk_name` is **required**: the destructive
-baseline rebuild must never fan out across every content-addressed disk on the node from a bare
-command; targeting a non-content-addressed disk raises an exception.
-
-By default the command refuses to run when the disk's existing `gc/state` and every artifact it
-references decode successfully and are present — a rebuild would needlessly discard healthy live
-bookkeeping. Add `FORCE` to rebuild deliberately even though the existing state looks healthy. The
-command also refuses (regardless of `FORCE`) when another GC leader currently holds the disk's
-lease. In both refusal cases it raises an exception instead of returning a row.
-
-On success it returns one row with columns `disk`, `performed`, `round`, `generation`, `namespaces`,
-`shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`,
-`clamped_shards`, `virgin_by_enumeration`, and `adopted_seal_generation`, describing the freshly
-rebuilt baseline. `virgin_by_enumeration = 1` means the rebuild found no fold seal at all and
-carried no durable hold forward, concluding from enumeration alone that the pool never sealed a
-baseline — on a pool that has ever completed a GC round this means the object listing lied.
-`adopted_seal_generation` names which generation's fold seal the rebuild carried holds from; `0`
-when it carried none.
-
 ### SYSTEM CAS GC STOP / SYSTEM CAS GC START {#system-cas-gc-stop-start}
 
 Pause or resume the background GC scheduler on one content-addressed disk, without affecting reads
@@ -559,9 +525,10 @@ SYSTEM CAS FSCK [ON CLUSTER cluster_name] disk_name
 `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`, `namespace_janitor_pending`,
 `namespace_janitor_pending_bytes`, `namespace_janitor_pending_lives`, `ref_records_walked`,
 `physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, and `total_blob_refs`. `dangling` is
-the one column that means data loss; `unreachable`, `pending_gc`, and `awaiting_gc` are objects
-still moving through the normal condemn/graduate/delete pipeline, not a problem on their own. This
-is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
+the one column that means data loss; `unreachable` counts every present, unreferenced object, of
+which `pending_gc` are blobs whose `.meta` is `Condemned` and `unaccounted` the other blobs — not a
+problem on their own. `awaiting_gc`, `stale_edge` and `corrupted_runs` are always `0`. This is a
+summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
 
 ### SYSTEM CAS FORGET {#system-cas-forget}
 

@@ -28,12 +28,6 @@ namespace GcStateWire
     constexpr WireKey lease_seq{"lease_seq"};
 }
 
-namespace GcHeartbeatWire
-{
-    constexpr WireKey owner{"owner"};
-    constexpr WireKey hb_seq{"hb_seq"};
-}
-
 String encodeGcState(const GcState & state)
 {
     if (state.gc_shards < 1)
@@ -98,51 +92,6 @@ GcState decodeGcState(std::string_view data)
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: trailing bytes");
     return state;
-}
-
-String encodeGcHeartbeat(const GcHeartbeat & hb)
-{
-    CasJsonWriter out(256);
-    writeHeaderLine(out, FormatId::GcHeartbeat);
-    bool first = true;
-    writeHex128Field(out, GcHeartbeatWire::owner, hb.owner, first);
-    writeU64StringField(out, GcHeartbeatWire::hb_seq, hb.hb_seq, first);
-    closeObject(out, first);
-    writeChar('\n', out);
-    return std::move(out).take();
-}
-
-GcHeartbeat decodeGcHeartbeat(std::string_view data)
-{
-    ReadBufferFromMemory in(data.data(), data.size());
-    expectHeaderLine(in, FormatId::GcHeartbeat);
-    const String body = readLine(in, traitsFor(FormatId::GcHeartbeat).line_cap, "gc heartbeat");
-    ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "gc heartbeat");
-
-    GcHeartbeat hb;
-    bool saw_by = false;
-    bool saw_seq = false;
-    String key;
-    while (r.nextKey(key))
-    {
-        if (key == GcHeartbeatWire::owner)
-        {
-            hb.owner = r.readHex128();
-            saw_by = true;
-        }
-        else if (key == GcHeartbeatWire::hb_seq)
-        {
-            hb.hb_seq = r.readU64String();
-            saw_seq = true;
-        }
-        else r.skipUnknown(key);
-    }
-    if (!saw_by || !saw_seq)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc heartbeat: missing identity field");
-    if (!body_in.eof() || !in.eof())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc heartbeat: trailing bytes");
-    return hb;
 }
 
 }

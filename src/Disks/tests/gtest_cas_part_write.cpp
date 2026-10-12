@@ -6,7 +6,6 @@
 #include <mutex>
 #include <thread>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -53,7 +52,6 @@ using namespace DB::Cas;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
-using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
@@ -1011,17 +1009,15 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         build0->abandon();
     }
 
-    /// 2. Condemn (Blob, hash(Y), t0) in the retire view; the object is already absent.
+    /// 2. The object is already absent.
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
-    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-Y"))}, .token = t0, .size = 9}});
     {
         OperationForTest raw_op(*b);
         ASSERT_FALSE((*raw_op).head(blob_key, Retry::once()).has_value());
     }
 
-    /// 3. Open a fresh Pool over a GET-counting wrapper; the retire view sees the condemnation at open.
+    /// 3. Open a fresh Pool over a GET-counting wrapper.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = precommittedBuildForPayload(

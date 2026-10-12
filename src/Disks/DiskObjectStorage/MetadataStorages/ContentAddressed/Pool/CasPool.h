@@ -79,8 +79,8 @@ struct PoolConfig
     /// the cache and every catalog write reads first. 16 MiB: the catalog is under 1 MiB, and the
     /// bound exists so a later opt-in of per-namespace keys has one.
     uint64_t hot_key_cache_bytes = 16ULL << 20;
-    /// Blob target shards for GC. Default 1 (a single shard, i.e. no fan-out). Creation-time only;
-    /// the pool is authoritative on reopen. This is the BLOB-HASH-prefix reducer axis.
+    /// The `cas_gc_shards` setting, which nothing uses: the wiring still sets it and the ref ledger still
+    /// passes it to `CasRefCatalog::createNamespace`, which ignores it.
     uint64_t gc_shards = 1;
     /// Bounded pool size for the per-hash freshness
     /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
@@ -771,11 +771,6 @@ public:
     /// Cheap predicate so query-frequency hooks can skip constructing the CasEvent (+ its detail map)
     /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
-
-    /// Read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
-    /// never GC'd). Best-effort: its one remaining caller is `tryRemountOnce`'s MountRemount audit
-    /// event, which reports round 0 on any read failure rather than let the error escalate.
-    uint64_t currentGcRound() const;
 
 private:
 

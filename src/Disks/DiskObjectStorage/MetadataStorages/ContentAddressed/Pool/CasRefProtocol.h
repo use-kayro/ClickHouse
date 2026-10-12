@@ -8,7 +8,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h>
 #include <base/types.h>
 #include <algorithm>
 #include <cstdint>
@@ -575,175 +574,12 @@ uint64_t encodedRemovalBudgetSize(const RefTableState & state);
 /// reasserts equality on every applied transaction and every `admits` preview.
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
 
-/// Pure ref-log intake primitives for a GC round. None of these read a
-/// manifest body, a snapshot body, or `gc/state`: they turn a global `LIST cas/ns/stream/` result and the
-/// decoded bodies of new transactions into (a) the per-table log/snapshot/marker listing, (b) the
-/// deterministic manifest-edge delta, and (c) the exact ref-object cleanup plan. The GC round that
-/// drove the manifest-body reads, the fold barrier, the durable cursor, and the batch deletions around
-/// these functions is gone; see `Gc/CasKeeperGc.h`. Keeping the delta and cleanup logic pure
-/// makes it directly unit-testable (`gtest_cas_ref_intake.cpp`) without a full round.
-
-/// One `+1`/`-1` manifest edge emitted by one ref-log operation.
-/// `manifest_id` is namespace-qualified (equal `ManifestRef` tuples under two tables stay distinct).
-/// The ordinals locate the exact operation and edge inside the transaction, giving the spec's
-/// `event_id = {namespace, RefTxnId, operation_ordinal, edge_ordinal}` its determinism: replaying the
-/// same logs yields byte-identical edges, so retry and competing GC attempts produce the same delta.
-struct RefManifestEdge
-{
-    ManifestId manifest_id;
-    int change = 0;              /// +1 activation | -1 removal
-    RefOwnerKind owner_kind = RefOwnerKind::Committed;   /// kind of the binding that produced this edge:
-                                 /// the `new_binding` kind for a `+1`, the `old_binding` kind for a `-1`.
-                                 /// The GC fold needs it to classify a missing manifest body -- a removed
-                                 /// precommit that never activated is skipped, every other missing body clamps.
-    uint32_t op_ordinal = 0;     /// index of the op within its transaction
-    uint32_t edge_ordinal = 0;   /// 0 = the removal edge, 1 = the activation edge of one op
-
-    bool operator==(const RefManifestEdge &) const = default;
-};
-
-/// The manifest edges of ONE decoded transaction, in operation order, reading NO manifest body.
-/// `owner_transition` recognizes EXACTLY the four shapes `classifyOwnerTransitionShape`
-/// (Pool/CasRefProtocol.cpp) also uses to drive `RefTableState::applyOwnerTransition` -- the SAME
-/// classification, not a second copy of the shape knowledge:
-///   - add precommit (no old_binding, new_binding.kind == Precommit)     => `+1` for `new.manifest_ref`
-///   - remove precommit / remove committed (old_binding set, no new_binding)
-///                                                                       => `-1` for `old.manifest_ref`
-///   - promote (old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name and
-///     manifest_ref)                                                    => no edge (net zero: the
-///     manifest keeps an owner the whole time)
-///   - `namespace_birth` / `set_published_at` / `remove_namespace`      => no edge
-/// Any other `owner_transition` shape -- neither binding, old+new naming DIFFERENT manifests, a
-/// promote whose old/new ref_name disagree, or any other kind combination -- throws `CORRUPTED_DATA`.
-/// These are exactly the shapes `applyRefLogTxn`/`replay` already reject at the state-machine layer, so
-/// a hand-corrupted or adversarial log body is the only way this branch is reached; a legitimately
-/// written log never produces one. The orphan sweep (`CasOrphanManifestSweep.cpp`) catches it around the whole
-/// `activeManifestKeys` construction and skips (or marks errored) that namespace's deletions rather
-/// than trusting an incomplete protection view.
-/// The `remove_namespace` operation changes lifecycle only; the exact owner removals that must precede
-/// it in the same transaction already emit their own `-1` edges.
-std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn);
-
-/// The GC fold consumes a table's new transactions ONE log at a time, in ascending id order, emitting
-/// each log's `manifestEdgesOfTxn` into `foldManifestEdges` and advancing the durable cursor per fully
-/// folded log (mirroring the legacy per-event journal fold, including its clamp-on-missing-body barrier).
-/// In-batch add+remove cancellation is therefore NOT done as a pre-fold net pass: the idempotent
-/// `(blob, source_id)` in-degree set-merge already cancels a `+edge` and matching `-edge` folded into one
-/// generation, and a pre-fold net pass would be unsafe -- a mid-batch clamp could split a cancelled pair
-/// across the advanced cursor, folding a spurious `-1` in a later round. So there is deliberately no
-/// `netManifestDelta` here.
-
-/// The `remove_txn_id` of a transaction that ends its namespace's life (contains a `remove_namespace`
-/// operation), or `nullopt`. The value equals `txn.txn_id`. The round routes it into the durable
-/// cleanup evidence of that life's fold-state row.
-std::optional<RefTxnId> removalTxnId(const RefLogTxn & txn);
-
-/// One table's surviving ref-object keys from this round's global `LIST`, split by kind and sorted
-/// ascending.
-struct RefTableListing
-{
-    std::vector<RefTxnId> logs;
-    std::vector<RefTxnId> snapshots;
-    bool operator==(const RefTableListing &) const = default;
-};
-
-/// Parse and group a global `LIST` of keys under `layout.casRefsPrefix` by physical life id. Every
-/// key is expected to be one of the three immutable stream-object kinds; checkpoints and namespace
-/// files live in the separate state tree and are never offered by this hot enumeration. An
-/// unrecognized stream key throws `CORRUPTED_DATA`, so the round cannot derive a partial delta or
-/// authorize destructive work from an incomplete classification.
-/// A key outside `casRefsPrefix` is ignored: the caller lists only the stream prefix, and a foreign key
-/// is not this format's concern.
-std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
-    const Layout & layout, const std::vector<String> & listed_keys);
-
-/// The exact ref objects one round may delete for one namespace life.
-/// Pure; acts only on keys THIS round's scan returned, but the scan is never cleanup authority. The
-/// caller may supply `checkpoint` only after exact validation of the `_ckpt`-named recovery triple:
-/// `_ckpt` plus its same-id non-seal `_log` and `_snap`. A later-epoch base also returns the exact
-/// predecessor seal that proved its transition; `retained_log_proof` keeps that log outside the delete
-/// plan while the checkpoint remains authoritative. Without a validated base the plan is empty.
-/// With it, a log `L` is deletable only when `L < checkpoint` and `L <= durable_cursor`; a listed
-/// snapshot is deletable only when its id is `< checkpoint`. The base's same-id `_log` and `_snap`,
-/// and every newer stream object, are retained.
-struct RefCleanupPlan
-{
-    std::vector<RefTxnId> deletable_logs;
-    std::vector<RefTxnId> deletable_snapshots;
-
-    bool operator==(const RefCleanupPlan &) const = default;
-};
-RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              std::optional<RefTxnId> checkpoint = std::nullopt,
-                              std::optional<RefTxnId> retained_log_proof = std::nullopt);
-
-/// Why an epoch crossing failed, or that it was PROVED. See `crossEpochFromSeal`.
-enum class EpochCrossOutcome : uint8_t
-{
-    Proved,             /// `start` is sequence 1 of the epoch that chains from `from_seal`
-    NothingConsumed,    /// `from_seal` is `{0, 0}`: nothing has been consumed, so there is no seal to cross from
-    NotASeal,           /// the record at `from_seal` is KNOWN not to be an `EpochSeal`
-    StartAbsent,        /// an epoch-start record the back-chain needs is not there
-    StartInvalid,       /// an epoch-start record is undecodable (`detail` carries the codec's message)
-    ChainDoesNotReach,  /// the chain names no seal at `from_seal` -- a genesis record, or one that skips it
-};
-
-/// One epoch crossing's outcome plus what it cost, so a caller can attribute the reads it performed.
-struct EpochCrossResult
-{
-    EpochCrossOutcome outcome = EpochCrossOutcome::ChainDoesNotReach;
-    RefTxnId start{};            /// meaningful only on `Proved`
-    RefTxnId probed{};           /// the epoch-start id the walk last read -- names the object in a diagnostic
-    String detail;               /// the decode error, on `StartInvalid`
-    uint64_t body_gets = 0;      /// epoch-start bodies actually fetched
-    uint64_t absent_probes = 0;  /// epoch-start reads that came back absent
-
-    bool proved() const { return outcome == EpochCrossOutcome::Proved; }
-};
-
-/// Cross into the epoch that follows the one `from_seal` closed, and PROVE it rather than guess it.
-///
-/// A listing only NOMINATES a candidate epoch (`witness`). The proof is the back-chain: the target
-/// epoch's sequence-1 record names the seal that must have been consumed before it (INV-2). If it names
-/// a seal ABOVE `from_seal`, an epoch sits in between that the nomination omitted -- the chain is
-/// followed back one epoch and retried, which is what makes a crossing independent of any enumeration.
-/// Anything else -- no sequence 1, an undecodable one, a genesis record (no `prev_epoch_seal`) above a
-/// consumed seal, or a chain that skips the position -- is an unproven crossing and is reported as such.
-///
-/// WHAT THE CHAIN PROVES, EXACTLY: the IDENTITY of the position the next epoch chains from, not its
-/// KIND. Those come apart when a writer names an ordinary record as `prev_epoch_seal`, and the damage is
-/// the one the seal exists to prevent -- epoch `E` declared closed while its writer may still append, so
-/// a later `{E, k}` lands permanently below the cursor. So the kind is checked wherever it is knowable:
-/// `seal_proven` carries `refLogTxnIsEpochSeal` of the record the CALLER applied at `from_seal` (free --
-/// it decoded the body to apply it). Pass `nullopt` only when the caller applied nothing and `from_seal`
-/// is an inherited cursor whose record may since have been cleaned, so its kind is unknowable by any
-/// amount of reading here and the crossing rests on chain-trust.
-///
-/// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch + 1 ==
-/// txn_id.writer_epoch`, so the target epoch decreases one numeric epoch per link and is bounded below
-/// by `from_seal`'s own epoch. The record it proves is read once more by the caller's own walk: one
-/// redundant `GET` per epoch crossed, and crossings happen once per writer-epoch change.
-///
-/// READ-ONLY, and shared deliberately: the GC fold's intake and fsck's audit must not be able to
-/// disagree about when an epoch boundary has been proved -- a rule that says which records a cut
-/// contains cannot have two implementations.
-///
-/// `life`: the namespace's life, REQUIRED -- a `nullopt`-resolves-internally default was tried once
-/// and let two callers resolve `life` independently and disagree, even though one of them
-/// (`CasFsck.cpp`'s walk) already had its OWN resolved `life` in scope one call site above and simply
-/// did not pass it in. Every caller must resolve `life` itself, ONCE, and pass the SAME value here
-/// that it uses for every other read in its own walk -- this function no longer resolves anything on
-/// its own, so there is no second resolution left to disagree with the first.
-EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, const RootNamespace & ns,
-                                    const RefTxnId & from_seal, std::optional<bool> seal_proven,
-                                    const RefTxnId & witness, const NamespaceLifeId & life);
-
 /// Return the one exact successor an immutable `_ckpt.committed_through` range permits after the
 /// decoded record at `current`, or `nullopt` when `current` is the inclusive frontier itself. An
 /// `EpochSeal` ends its numeric epoch, so a strictly-later frontier in that SAME epoch is corrupt:
 /// advancing to `{E+1,1}` and letting ordinary ordering terminate would silently discard the invalid
-/// part of the claimed range. Shared by every checkpoint-bounded reader so recovery, fsck, and the
-/// orphan protection walk cannot disagree about that malformed authority.
+/// part of the claimed range. Shared by every checkpoint-bounded reader so recovery and fsck cannot
+/// disagree about that malformed authority.
 std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
     const RefTxnId & current, bool is_epoch_seal, const RefTxnId & committed_through);
 
@@ -793,12 +629,8 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 /// under this immutable authority. In particular, this read-only API never probes or adopts `F+1`. There
 /// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
 /// frozen catalog cut explicitly.
-///
-/// `reader`, when set, fetches the logs; it may prefetch ids of the current epoch that are in
-/// `listed_logs` -- the caller's own LIST of this life's stream, still no LIST of this function's (see
-/// `hintRefLogsWithinEpoch`). Every decision and every error path is the same with and without it.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader = nullptr, const std::set<RefTxnId> & listed_logs = {});
+    const std::optional<RefCkpt> & ckpt);
 
 }

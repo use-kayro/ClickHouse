@@ -485,7 +485,7 @@ String openObject(FormatId id, std::string_view stored)
     const FormatTraits & t = traitsFor(id);
     if (!looksZstd(stored))
     {
-        if (t.object_cap != 0 && stored.size() > t.object_cap)
+        if (stored.size() > t.object_cap)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS {}: raw object size {} exceeds the {}-byte cap", t.type, stored.size(), t.object_cap);
         return String(stored);
@@ -497,7 +497,7 @@ String openObject(FormatId id, std::string_view stored)
     const uint64_t content = ZSTD_getFrameContentSize(stored.data(), stored.size());
     if (content == ZSTD_CONTENTSIZE_UNKNOWN || content == ZSTD_CONTENTSIZE_ERROR)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: zstd frame without a declared content size", t.type);
-    if (t.object_cap != 0 && content > t.object_cap)
+    if (content > t.object_cap)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: declared decompressed size {} exceeds the {}-byte cap", t.type, content, t.object_cap);
 
