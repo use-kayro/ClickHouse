@@ -272,6 +272,24 @@ def gc_leaders():
     return res
 
 
+def lease_to(node, phase):
+    """LAB SETUP, not a production step: with a 5 s GC interval any restart longer than ~2 intervals hands the old
+    GC's lease to a reader (production's 600 s interval rarely does). To test `node`'s old GC, stop the other
+    members until `node` steals the lease, then start them again."""
+    if gc_leaders()[node] == "1":
+        return
+    others = [n for n in NODES if n != node]
+    t0 = time.time()
+    for n in others:
+        compose("stop", "-t", "60", n)
+    wait_until(lambda: gc_leaders()[node] == "1", 60 * GC_INTERVAL, "{} to take the old GC lease".format(node))
+    took = time.time() - t0
+    for n in others:
+        compose("up", "-d", "--no-deps", n)
+        wait_until(lambda: node_up(n), 300, n)
+    record(phase, "lab setup: old GC lease moved to {}".format(node), True, {"took_s": round(took, 1), "leaders": gc_leaders()})
+
+
 def deleted_by(node, since):
     return sum(v["deleted"] for v in gc_rounds(node, since).values())
 
@@ -480,6 +498,8 @@ def phase_b():
     removed = set(load_state()["removed_before_records"])
     record(ph, "no record for parts removed before step 1", not (removed & recs), {"removed_with_record": sorted(removed & recs)})
 
+    record(ph, "old GC lease after the step-1 writer restart", None, gc_leaders())
+    lease_to("writer", ph)
     since = {n: server_now(n) for n in NODES}
     before = set(active_parts("writer"))
     for p in (10, 11):
@@ -551,37 +571,7 @@ def phase_c():
                all(r["deleted"] == 0 for r in unrec), {"rounds_with_unrecorded": len(unrec),
                                                        "unrecorded_listed": [r["metrics"].get("unrecorded_listed") for r in first]})
 
-        # The guard on a real unrecorded part: MOVE PARTITION TO TABLE commits the part without a record (step-1
-        # comment at StorageReplicatedMergeTree.cpp:10285); a DROP PARTITION in the same window makes records due.
-        create_side_table("writer", TABLE + "_src")
-        q("writer", "INSERT INTO {}_src SELECT 20, number + 900000000 FROM numbers(3000)".format(TABLE))
-        before = set(active_parts("writer"))
-        q("writer", "ALTER TABLE {t}_src MOVE PARTITION 20 TO TABLE {t}".format(t=TABLE))
-        moved = sorted(set(active_parts("writer")) - before)
-        recs = set(records())
-        record(ph, "MOVE PARTITION TO TABLE leaves the moved part without a record", bool(moved) and not (set(moved) & recs),
-               {"moved": moved, "recorded": sorted(set(moved) & recs)})
-        b0 = blob_keys()
-        for _ in range(3):
-            insert(13)
-        p13 = blob_keys() - b0
-        sync()
-        t_guard = server_now("writer")
-        q("writer", "ALTER TABLE {} DROP PARTITION 13".format(TABLE))
-        guard_lines = wait_until(lambda: log_grep("writer", r"listed parts have no Keeper record, so their blobs are unknown; removing nothing", mark),
-                                 OLD_PARTS_LIFETIME + 20 * GC_INTERVAL, "the unrecorded-part guard", step=3)
-        held = keeper_gc_rounds("writer", t_guard)
-        record(ph, "guard: rounds with an unrecorded listed part and due records delete nothing",
-               all(r["deleted"] == 0 for r in held if r["metrics"].get("unrecorded_listed", 0)),
-               {"line": guard_lines[-1][-170:], "rounds": [(r["t"], r["metrics"].get("unrecorded_listed"), r["metrics"].get("due"), r["deleted"]) for r in held]})
-        # A merge records the partition again; once the moved part is unlisted the rounds are normal.
-        q("writer", "OPTIMIZE TABLE {} PARTITION 20 FINAL".format(TABLE), timeout=600)
-        t_merge = time.time()
-        wait_until(lambda: not (p13 & blob_keys()), OLD_PARTS_LIFETIME * 3 + 30 * GC_INTERVAL, "partition 13 reclaimed after the guard", step=3)
-        after = keeper_gc_rounds("writer", t_guard)
-        record(ph, "after the merge the guarded DROP PARTITION is reclaimed", True,
-               {"blobs": len(p13), "reclaimed_s_after_merge": round(time.time() - t_merge),
-                "rounds": [(r["t"], r["metrics"].get("unrecorded_listed"), r["metrics"].get("due"), r["metrics"].get("records_removed"), r["deleted"], r["absent"]) for r in after]})
+        unrecorded_guard(ph, mark)
 
         # A plain DROP PARTITION: reclaimed after the writer's old_parts_lifetime.
         b0 = blob_keys()
@@ -611,6 +601,121 @@ def phase_c():
             l.__exit__(None, None, None)
     for l in loops:
         record(ph, "no {} query failed during c".format(l.node), not l.failures, {"ok": l.ok, "failures": l.failures[:5]})
+    for n in READERS:
+        record(ph, "{} query_log over the whole of c (writer restart included)".format(n), None, query_log_summary(n, t0))
+    inv1 = pool_inventory()
+    record(ph, "old GC artefacts left alone by step 2 (leak, never loss)", None, {"before": inv0, "after": inv1})
+    st = load_state()
+    st["since_c"] = since
+    save_state(st)
+
+
+def unrecorded_guard(ph, mark):
+    """The step-2 guard: no round removes anything while a listed part has no record.
+
+    First try a real operation: the step-1 comment at StorageReplicatedMergeTree.cpp:10398 says MOVE PARTITION TO
+    TABLE commits its parts without a record. If the build records them anyway, fall back to the failpoint the
+    binary ships for this (`cas_part_record_omit`, what test_cas_replicated_relink uses): LAB-ONLY, it makes one
+    insert commit like a build without records."""
+    create_side_table("writer", TABLE + "_src")
+    q("writer", "INSERT INTO {}_src SELECT 20, number + 900000000 FROM numbers(3000)".format(TABLE))
+    before = set(active_parts("writer"))
+    q("writer", "ALTER TABLE {t}_src MOVE PARTITION 20 TO TABLE {t}".format(t=TABLE))
+    moved = sorted(set(active_parts("writer")) - before)
+    recorded = sorted(set(moved) & set(records()))
+    record(ph, "MOVE PARTITION TO TABLE leaves the moved part without a record", None if recorded else True,
+           {"moved": moved, "recorded": recorded})
+    guard_partition = 20
+    if recorded:
+        q("writer", "SYSTEM ENABLE FAILPOINT cas_part_record_omit")
+        try:
+            before = set(active_parts("writer"))
+            q("writer", "INSERT INTO {} SELECT 21, number + 950000000 FROM numbers(3000)".format(TABLE))
+            unrec = sorted(set(active_parts("writer")) - before)
+        finally:
+            q("writer", "SYSTEM DISABLE FAILPOINT cas_part_record_omit")
+        recs = set(records())
+        record(ph, "LAB-ONLY failpoint cas_part_record_omit: one insert commits without a record", bool(unrec) and not (set(unrec) & recs),
+               {"part": unrec, "recorded": sorted(set(unrec) & recs)})
+        guard_partition = 21
+    b0 = blob_keys()
+    for _ in range(3):
+        insert(13)
+    p13 = blob_keys() - b0
+    sync()
+    t_guard = server_now("writer")
+    q("writer", "ALTER TABLE {} DROP PARTITION 13".format(TABLE))
+    guard_lines = wait_until(lambda: log_grep("writer", r"listed parts have no Keeper record, so their blobs are unknown; removing nothing", mark),
+                             OLD_PARTS_LIFETIME + 20 * GC_INTERVAL, "the unrecorded-part guard", step=3)
+    held = keeper_gc_rounds("writer", t_guard)
+    record(ph, "guard: rounds with an unrecorded listed part and due records delete nothing",
+           all(r["deleted"] == 0 for r in held if r["metrics"].get("unrecorded_listed", 0)) and p13 <= blob_keys() | set(),
+           {"line": guard_lines[-1][-170:], "p13_blobs_still_there": len(p13 & blob_keys()), "p13_blobs": len(p13),
+            "rounds": [(r["t"], r["metrics"].get("unrecorded_listed"), r["metrics"].get("due"), r["deleted"]) for r in held if r["writer"]]})
+    # A merge records the partition again; once the unrecorded part is unlisted the rounds are normal.
+    q("writer", "OPTIMIZE TABLE {} PARTITION {} FINAL".format(TABLE, guard_partition), timeout=600)
+    t_merge = time.time()
+    wait_until(lambda: not (p13 & blob_keys()), OLD_PARTS_LIFETIME * 3 + 30 * GC_INTERVAL, "partition 13 reclaimed after the guard", step=3)
+    after = keeper_gc_rounds("writer", t_guard)
+    record(ph, "after the merge the guarded DROP PARTITION is reclaimed", True,
+           {"blobs": len(p13), "reclaimed_s_after_merge": round(time.time() - t_merge),
+            "rounds": [(r["t"], r["metrics"].get("unrecorded_listed"), r["metrics"].get("due"), r["metrics"].get("records_removed"), r["deleted"], r["absent"]) for r in after if r["writer"]]})
+
+
+def query_log_summary(node, since):
+    """Reader queries on the table since `since`, from the server's own query_log: survives a driver crash."""
+    q(node, "SYSTEM FLUSH LOGS")
+    out = q(node, """SELECT toString(type), count(), any(substring(exception, 1, 200)) FROM system.query_log
+                     WHERE event_time_microseconds > '{}' AND has(tables, 'default.{}') AND query_kind = 'Select'
+                     AND type != 'QueryStart' GROUP BY type FORMAT TSV""".format(since, TABLE))
+    return {t: {"count": int(c), "sample_exception": e} for t, c, e in (l.split("\t") for l in out.splitlines())}
+
+
+def phase_c2():
+    """The part of (c) after the writer's boot, rerunnable on a step-2 writer (reader query loops on again)."""
+    ph = "c"
+    rows = [json.loads(l) for l in open(RESULTS)]
+    start = [r for r in rows if r["check"] == "pool inventory before the step-2 writer"][-1]
+    inv0 = start["observed"]
+    t0 = start["t"].replace("T", " ").rstrip("Z")
+    since = {n: t0 for n in NODES}   # the whole of (c): from just before the writer's restart
+    t_boot = t0
+    mark = 0
+    loops = [QueryLoop(n) for n in READERS]
+    for l in loops:
+        l.__enter__()
+    try:
+        unrecorded_guard(ph, mark)
+        # A plain DROP PARTITION: reclaimed after the writer's old_parts_lifetime.
+        b0 = blob_keys()
+        for _ in range(3):
+            insert(14)
+        p14 = blob_keys() - b0
+        sync()
+        t_drop_srv = server_now("writer")
+        q("writer", "ALTER TABLE {} DROP PARTITION 14".format(TABLE))
+        t_drop = time.time()
+        wait_until(lambda: not (p14 & blob_keys()), OLD_PARTS_LIFETIME + 30 * GC_INTERVAL, "partition 14 reclaimed", step=1)
+        took = time.time() - t_drop
+        rounds = keeper_gc_rounds("writer", t_drop_srv)
+        old = old_gc_activity(READERS, since)
+        record(ph, "DROP PARTITION reclaimed after old_parts_lifetime (lab: {} s)".format(OLD_PARTS_LIFETIME),
+               took >= OLD_PARTS_LIFETIME and sum(r["deleted"] for r in rounds) >= len(p14),
+               {"blobs": len(p14), "reclaimed_after_s": round(took, 1),
+                "rounds": [(r["t"], r["metrics"].get("marked"), r["metrics"].get("due"), r["metrics"].get("records_removed"), r["deleted"], r["absent"]) for r in rounds if r["writer"]],
+                "old_gc_on_RC3_readers": old})
+        record(ph, "who runs deleting GC rounds while the readers are on RC3 (cas_gc_enabled=1 as production)", None,
+               {"leaders": gc_leaders(), "old_gc_rounds_on_readers": old_gc_activity(READERS, since),
+                "step2_writer_rounds": {"rounds": len(keeper_gc_rounds("writer", t_boot)),
+                                        "deleted": sum(r["deleted"] for r in keeper_gc_rounds("writer", t_boot))}})
+        consistent(ph, "step-2 writer, RC3 readers")
+    finally:
+        for l in loops:
+            l.__exit__(None, None, None)
+    for l in loops:
+        record(ph, "no {} query failed during c".format(l.node), not l.failures, {"ok": l.ok, "failures": l.failures[:5]})
+    for n in READERS:
+        record(ph, "{} query_log over the whole of c (writer restart included)".format(n), None, query_log_summary(n, t0))
     inv1 = pool_inventory()
     record(ph, "old GC artefacts left alone by step 2 (leak, never loss)", None, {"before": inv0, "after": inv1})
     st = load_state()
@@ -715,7 +820,7 @@ def phase_lease():
 
 
 def main():
-    {"up": phase_up, "a": phase_a, "lease": phase_lease, "b": phase_b, "c": phase_c, "d": phase_d, "e": phase_e}[sys.argv[1]]()
+    {"up": phase_up, "a": phase_a, "lease": phase_lease, "c2": phase_c2, "b": phase_b, "c": phase_c, "d": phase_d, "e": phase_e}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
