@@ -10,7 +10,7 @@ O GC do pool deixa de listar o S3 e de reler os ref logs para saber o que está 
 | Base | passo 1 (PR #2, merge `b71585e`), sobre o RC3 |
 | Imagem | `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, de `023e6c4`, push 12/10 02:52Z |
 | Linear | TEC-850 |
-| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); **aceito nos três às 03:40Z** (+30 min). Rollback não usado |
+| Em produção | Nos três nós desde 12/10 03:09:48Z (writer → reader-mdb → reader, 9 min 18 s); **aceito nos três às 03:40Z** (+30 min). Rollback não usado. Substituído pelo [passo 2b](step2b-gc-dead-code.md) entre 05:48Z e 06:07Z |
 
 Commits:
 - `7c6c4c8` teste `test_cas_reader_pin`;
@@ -142,6 +142,20 @@ Builder `tec850`, RelWithDebInfo sem LTO, `ENABLE_TESTS=ON`. Árvore idêntica �
 
 **O que este portão não cobre:** o build ThinLTO de release, a paridade de features e a imagem no ECR. Isso entrou na imagem de release (abaixo).
 
+## Ensaio em laboratório (12/10, branch `kayro/upgrade-rehearsal` @ `0775312a`, `tests/kayro_upgrade_rehearsal/`)
+
+Três nós num único pool RustFS, Keeper 26.2.19.43, settings de disco e de MergeTree iguais às de produção (inclusive `cas_gc_enabled=1` nos readers). Só no laboratório: `cas_gc_interval_sec=5` e `old_parts_lifetime=30`.
+
+| Etapa | Resultado |
+|---|---|
+| (a) Carga no RC3 | 72 partes em 8 partições; 5 rodadas do GC antigo. Bucket com `gc/state`, 3 fold seals, 13 `.meta` Condemned, 633 ref logs, 190 manifests; 17 partes removidas antes de existir qualquer registro. Quando o writer para, um reader RC3 toma o lease do GC antigo em 5,6 s = 1,1 intervalo (≈ 10–20 min em produção), e o lease fica com o reader |
+| (b) Writer no passo 1 | Backfill 6/6; inserts novos 6/6 com registro; readers RC3 anexam por relink. 158 queries e 0 falhas durante os 32 s do restart do writer. Padrão S3 do reader inalterado (24 GET / 6 PUT / 0 LIST por 60 s). O GC antigo ainda recupera um DROP recente em 16 s |
+| (c) Writer no passo 2 | As primeiras rodadas marcam e condenam. 48 rodadas com 0 apagados enquanto o reader RC3 segurava o lease antigo e fazia toda a deleção (17 blobs em 16 rodadas, sem `old_parts_lifetime` e ignorando a guarda de parte sem registro). A guarda em si funciona (parte sem registro por failpoint → "removing nothing"). MOVE PARTITION TO TABLE cria registro. 0 queries de reader falharam (2.378 concluídas) |
+| (d) Readers no passo 2 | Anexam partes novas pelo registro, 7/7 e 8/8, com 0 PUT / 0 LIST / 0 GET no `DownloadPart`. Rodadas do GC com `not_writer=1` e 0 apagados. O outro reader teve 0 queries falhas durante cada restart |
+| (e) Rollback | Writer de volta ao passo 1: sobe em 5,7 s e serve. Reader de volta ao RC3: sobe em 5,7 s e rebusca por bytes as partes que segurava pelos registros (o manifest de relink não é decodificável no RC3); dados idênticos, 0 queries falhas |
+
+**Conclusão:** nenhuma perda e nenhuma query falha em nenhuma etapa. A única lacuna em produção é o reader RC3 rodando o GC antigo entre o restart do writer no passo 2 e o upgrade do último reader. Por isso os três restarts foram uma sequência só, em menos de 10 min.
+
 ## Deploy (12/10)
 
 Antes: readers no RC3 (`sha256:6469a0c1…`), writer no passo 1 (`sha256:250b6ed9…`). A sequência começou logo depois da rodada do GC antigo do reader-mdb às 03:00:19Z: em produção era o reader-mdb, não o writer, quem segurava o lease do GC antigo.
@@ -176,7 +190,7 @@ Sequência encerrada às 03:09:48Z, 9 min 18 s depois do restart do writer, dent
 
 `474668394551.dkr.ecr.us-east-2.amazonaws.com/kayro/clickhouse@sha256:9347ff1ccd9a2a3f7ff242055cf29254e4a950f82a339f3c1fefd31e142d8a3e`, construída de `023e6c4` em 12/10 e enviada ao ECR às 02:52Z.
 
-- Link ThinLTO: 79 min a 3.000 IOPS, limitado pelo swap (precisou de 96 GB num host de 61 GB).
+- Link ThinLTO: ~79 min a 3.000 IOPS, com outra carga (containers do ensaio) no mesmo host; precisou de 96 GB de memória num host de 61 GB.
 - `compare-features.py`: idêntico ao build do passo 1.
 - Harness fault/RLS: passou.
 
