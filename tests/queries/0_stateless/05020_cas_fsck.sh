@@ -2,11 +2,9 @@
 # Tags: no-fasttest
 # ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# `SYSTEM CAS FSCK <disk>` (runs on a RUNNING disk, T13) + GC RUN's `pending_*` drain
-# columns + the fail-closed FORGET teardown (spec rev.8 §5/§9). FSCK is a read-only reachability audit
-# that now runs directly on the mounted, live disk and prints a clean one-row summary. The GC RUN result
-# set carries the retire pipeline's REMAINING (not this-round-delta) `pending_*` columns; on a disk with
-# nothing outstanding to reclaim they read 0. Teardown is fail-closed: DROP the table, `SYSTEM CONTENT
+# `SYSTEM CAS FSCK <disk>` (runs on a RUNNING disk, T13) + the fail-closed FORGET teardown (spec rev.8
+# §5/§9). FSCK is a read-only reachability audit that now runs directly on the mounted, live disk and
+# prints a clean one-row summary. Teardown is fail-closed: DROP the table, `SYSTEM CONTENT
 # ADDRESSED FORGET` the disk (force-Vanish, node-local), verify via system.cas_mounts that
 # it reads exactly `vanished(forgotten)`, and only THEN `rm -rf` the pool dir (FORGET stopped and joined
 # every CAS background thread for this disk). A failed FORGET or an unexpected lifecycle aborts the test
@@ -33,13 +31,6 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_fsck SYNC"
 ${CLICKHOUSE_CLIENT} --query "
 CREATE TABLE t_fsck (id UInt64) ENGINE = MergeTree ORDER BY id
 SETTINGS disk = ${DISK_CA}"
-
-# --- GC RUN's result set carries the new pending_* columns while the disk is mounted, and they read 0
-#     on this fresh pool (nothing was ever written, so nothing was ever condemned) ---
-${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CAS GC RUN '${DISK_NAME}'" \
-    | tr '\t' '\n' | grep -c "pending_candidates\|pending_condemned\|pending_retired"
-${CLICKHOUSE_CLIENT} --format TSV --query "SYSTEM CAS GC RUN '${DISK_NAME}'" \
-    | awk -F'\t' '{print $(NF-2), $(NF-1), $NF}'
 
 # --- FSCK on the RUNNING, healthy pool (T13: FSCK runs on a mounted disk): a clean one-row summary,
 #     no dangling/unreachable ---

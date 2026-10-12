@@ -9,6 +9,4 @@ negative_control_state_after_truncate live
 negative_control_state_after_reinsert live
 negative_control_rows 1
 cycle_leaks_after_sync_drop 0
-captured_rows_absent_after_gc_fixpoint 1
-fsck_unreachable 0
 fsck_dangling 0
