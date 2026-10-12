@@ -342,9 +342,7 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("switch-disk", makeCommandSwitchDisk());
     command_descriptions.emplace("current_disk_with_path", makeCommandGetCurrentDiskAndPath());
     command_descriptions.emplace("touch", makeCommandTouch());
-    command_descriptions.emplace("cas-fsck", makeCommandFsck());
     command_descriptions.emplace("cas-inspect", makeCommandCaInspect());
-    command_descriptions.emplace("cas-drop-member", makeCommandCaDropMember());
     command_descriptions.emplace("read-checksums", makeCommandReadChecksums());
     command_descriptions.emplace("help", makeCommandHelp(*this));
 #if CLICKHOUSE_CLOUD

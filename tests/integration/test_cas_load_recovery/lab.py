@@ -8,8 +8,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 COMPOSE = ['docker', 'compose', '-f', str(ROOT / 'compose.yaml')]
-EVENTS = ('CASMountRenewalRetries', 'CASMountRenewalRecovered', 'CASMountRenewalDeadlineExceeded',
-          'CASMountLeaseLost', 'CASRemountSucceeded', 'CASRemountFailed')
+EVENTS = ('CASBlobPut', 'CASBlobHead', 'CASBlobHeadMiss', 'CASBlobBodyPutAvoided', 'S3ListObjects')
 
 
 def command(*args, timeout=40, input=None):
@@ -56,9 +55,8 @@ def counters(role):
 
 
 def snapshot(role):
-    mounts = sql(role, "SELECT state,lifecycle,server_uuid,writer_epoch FROM system.cas_mounts "
-                 f"WHERE server_root_id='{role}' FORMAT JSONEachRow")
-    return {'mount': [json.loads(x) for x in mounts.splitlines()], 'events': counters(role)}
+    disks = sql(role, "SELECT disk,is_leader,pending_reclaim FROM system.cas_mounts FORMAT JSONEachRow")
+    return {'disks': [json.loads(x) for x in disks.splitlines()], 'events': counters(role)}
 
 
 def record(name, data):
@@ -86,8 +84,9 @@ c.request('PUT','/test',body=b'',headers={'Host':host,'x-amz-content-sha256':dig
 r=c.getresponse();body=r.read().decode();assert r.status in (200,409),(r.status,body);print(r.status)
 '''
     wait(lambda: command('exec', '-T', 'writer-proxy', 'python3', '-', input=create_bucket) in ('200', '409'), 60)
-    command('up', '-d', 'writer', 'reader', timeout=120)
+    # The writer first: only it mints a new pool's `_pool_meta`, and a reader refuses to boot without it.
     for role in ('writer', 'reader'):
+        command('up', '-d', role, timeout=120)
         wait(lambda: sql(role, 'SELECT 1') == '1')
         sql(role, f"CREATE DATABASE IF NOT EXISTS lab ENGINE=Replicated('/cas-lab/database','1','{role}')")
     sql('writer', "CREATE TABLE IF NOT EXISTS lab.events (id UInt64, tenant UInt8, version UInt64) "
@@ -98,63 +97,29 @@ r=c.getresponse();body=r.read().decode();assert r.status in (200,409),(r.status,
                        'reader': sql('reader', 'SELECT * FROM lab.events ORDER BY id')})
 
 
-def short_fault(role):
-    before = snapshot(role)
-    control(role, '/config', {'reset': True})
-    control(role, '/config', {'rate': 1.0, 'modes': ['503'], 'methods': ['PUT'],
-            'path_substring': f'/test/shared_pool/gc/server-roots/{role}/mount',
-            'remaining_faults': 1, 'seed': 801})
-    try:
-        wait(lambda: control(role, '/stats').get('faults', 0) == 1, 40)
-        wait(lambda: snapshot(role)['events'].get('CASMountRenewalRecovered',0) > before['events'].get('CASMountRenewalRecovered',0), 40)
-        after = snapshot(role)
-        assert after['events'].get('CASMountLeaseLost',0) == before['events'].get('CASMountLeaseLost',0)
-        record('short_503', {'role': role, 'before': before, 'after': after,
-                            'rows': sql(role, 'SELECT count() FROM lab.events')})
-    finally:
-        control(role, '/config', {'reset': True})
-
-
-def long_fault(role):
-    before = snapshot(role)
-    control(role, '/config', {'reset': True})
-    control(role, '/config', {'rate': 1.0, 'modes': ['503'], 'methods': ['GET','PUT','HEAD'],
-            'path_substring': f'/test/shared_pool/gc/server-roots/{role}/mount', 'seed': 802})
-    try:
-        wait(lambda: counters(role).get('CASMountLeaseLost',0) > before['events'].get('CASMountLeaseLost',0), 70)
-        record('lease_lost', {'role':role, 'events':counters(role), 'faults':control(role,'/stats')['faults']})
-    finally:
-        control(role, '/config', {'reset': True})
-    wait(lambda: counters(role).get('CASRemountSucceeded',0) > before['events'].get('CASRemountSucceeded',0), 120)
-    # A fresh row proves replication still works, not just a cached count.
-    next_id = int(sql('writer', 'SELECT max(id) FROM lab.events')) + 1
-    sql('writer', f'INSERT INTO lab.events VALUES ({next_id},2,2)')
-    read = wait(lambda: sql('reader', f'SELECT count() FROM lab.events WHERE id={next_id}') == '1', 90)
-    record('long_503_recovered', {'role':role, 'snapshot':snapshot(role), 'fresh_row_visible':read})
-
-
 def loading_fault(role, expect_recovery=False):
     before_rows = sql(role, 'SELECT * FROM lab.events ORDER BY id')
     before_uuid = sql(role, "SELECT uuid FROM system.tables WHERE database='lab' AND name='events'")
-    # Hold table loading on ref-log reads, then interrupt the pool until its lease expires.
-    # After removing the fault, distinguish mount recovery from loader recovery.
+    # Since TEC-851 step 3c a table loads from its Keeper part records and the pool holds only blob bodies:
+    # interrupt the whole pool while the server starts and loads, and require the load to succeed anyway
+    # and the server to serve and replicate once the pool is back -- with no restart.
     command('stop', role, timeout=60)
     control(role, '/config', {'reset': True})
-    control(role, '/config', {'rate':1.0,'modes':['503'],'methods':['GET'],
-                            'path_substring':'/test/shared_pool/cas/ns/', 'seed':803})
     try:
         command('start', role, timeout=60)
         wait(lambda: sql(role, 'SELECT 1')=='1', 90)
         control(role, '/config', {'rate':1.0,'modes':['503'],'methods':['GET','PUT','HEAD'],
                                 'path_substring':'/test/shared_pool/', 'seed':803})
-        wait(lambda: counters(role).get('CASMountLeaseLost',0)>0, 70)
-        # Keep the same fault duration regardless of the loader outcome. Waiting
-        # for FAILED would make the corrected implementation impossible to test.
+        wait(lambda: sql(role, "SELECT count() FROM system.tables WHERE database='lab' AND name='events'") == '1', 90)
+        try:
+            sql(role, 'SELECT * FROM lab.events ORDER BY id SETTINGS use_query_cache=0')
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass   # a cold read of a blob fails or waits while the pool is down; the faults are what is recorded
+        # Zero faults is a valid outcome: a reader serving from its cache and its records needs no request.
         time.sleep(5)
         record('loading_fault_observed', {'role':role,'faults':control(role,'/stats')['faults']})
     finally:
         control(role, '/config', {'reset': True})
-    wait(lambda: counters(role).get('CASRemountSucceeded',0)>0, 120)
     if expect_recovery:
         wait(lambda: sql(role, 'SELECT * FROM lab.events ORDER BY id') == before_rows, 90)
         assert sql(role, "SELECT count() FROM system.asynchronous_loader WHERE status IN ('FAILED','CANCELED')") == '0'
@@ -168,21 +133,8 @@ def loading_fault(role, expect_recovery=False):
         record('loading_recovered_without_restart', {'role':role, 'snapshot':snapshot(role),
                'table_uuid':before_uuid, 'writer_rows':writer_rows, 'reader_rows':reader_rows})
         return
-    # Capture the persisted failure after storage is available, without trying to repair it.
-    states = []
-    for _ in range(6):
-        states.append(sql(role,"SELECT status,count() FROM system.asynchronous_loader GROUP BY status FORMAT JSONEachRow"))
-        time.sleep(5)
-    try:
-        rows = sql(role, 'SELECT * FROM lab.events ORDER BY id')
-        error = None
-    except RuntimeError as failure:
-        rows = None
-        error = str(failure)
     record('after_loading_fault', {'role':role,'snapshot':snapshot(role),
-                                  'loader_samples':states,'rows':rows,'error':error})
-    assert error and 'ASYNC_LOAD_WAIT_FAILED' in error and 'NETWORK_ERROR' in error, 'Expected cached CAS load failure was not reproduced'
-    assert all(m['lifecycle'] == 'live' for m in snapshot(role)['mount']), 'Storage itself has not recovered'
+                                  'rows':sql(role, 'SELECT * FROM lab.events ORDER BY id')})
 
 
 def rls_isolation(role):
@@ -210,28 +162,19 @@ def rls_isolation(role):
     record('rls_same_query_isolated', {'role': role, 'visible_ids': expected, 'policy_change_denied': True})
 
 
-def terminal_fault(role):
-    sql(role, 'SYSTEM CAS FORGET shared_s3')
-    try:
-        sql(role, 'SELECT * FROM lab.events')
-    except RuntimeError as error:
-        assert 'INVALID_STATE' in str(error), str(error)
-        record('terminal_refusal_preserved', {'role':role, 'snapshot':snapshot(role), 'error':str(error)})
-        return
-    raise AssertionError('Forgotten disk unexpectedly served the table')
-
-
 def shutdown_fault(role):
     command('stop', role, timeout=60)
     control(role, '/config', {'reset':True})
-    control(role, '/config', {'rate':1.0,'modes':['503'],'methods':['GET'],
-                            'path_substring':'/test/shared_pool/cas/ns/', 'seed':804})
     try:
         command('start', role, timeout=60)
         wait(lambda: sql(role, 'SELECT 1') == '1', 90)
         control(role, '/config', {'rate':1.0,'modes':['503'],'methods':['GET','PUT','HEAD'],
                                 'path_substring':'/test/shared_pool/', 'seed':804})
-        wait(lambda: counters(role).get('CASMountLeaseLost',0)>0,70)
+        try:
+            sql(role, 'SELECT * FROM lab.events SETTINGS use_query_cache=0')
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass
+        # Zero faults is a valid outcome: a reader serving from its cache and its records needs no request.
         time.sleep(5)
         started = time.monotonic()
         command('stop', '--timeout', '30', role, timeout=40)
@@ -245,17 +188,14 @@ def shutdown_fault(role):
 
 if __name__ == '__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('test', choices=['init','short','long','loading','terminal','shutdown','rls','snapshot'])
+    p.add_argument('test', choices=['init','loading','shutdown','rls','snapshot'])
     p.add_argument('--role', choices=['writer','reader'], default='reader')
     p.add_argument('--expect-recovery', action='store_true', help='Require automatic recovery in the loading test')
     a=p.parse_args()
     try:
         if a.test=='init': initialize()
-        elif a.test=='short': short_fault(a.role)
-        elif a.test=='long': long_fault(a.role)
         elif a.test=='loading': loading_fault(a.role, a.expect_recovery)
         elif a.test=='rls': rls_isolation(a.role)
-        elif a.test=='terminal': terminal_fault(a.role)
         elif a.test=='shutdown': shutdown_fault(a.role)
         else: record('snapshot', {'role':a.role, **snapshot(a.role)})
     except Exception as error:

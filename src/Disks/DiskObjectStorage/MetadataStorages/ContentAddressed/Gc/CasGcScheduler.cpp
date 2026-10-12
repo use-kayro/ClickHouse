@@ -148,7 +148,6 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(GcRoundLogRecord::Trigger trigge
     start.event_type = Rec::EventType::Start;
     start.trigger = trigger;
     start.disk_name = disk_name;
-    start.srid = store->poolConfig().server_root_id;
     start.round_id = round_id;
     emit(start);
 
@@ -193,12 +192,10 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(GcRoundLogRecord::Trigger trigge
     {
         fin.writer = r.writer;
         fin.round = r.round;
-        fin.objects_condemned = r.condemned;
         fin.objects_deleted = r.deleted;
         fin.objects_absent = r.absent;
         fin.objects_replaced = r.replaced;
         fin.objects_spared = r.spared;
-        fin.fence_outs = r.fence_outs;
     };
     try
     {
@@ -258,29 +255,6 @@ void CasGcScheduler::loop()
                 return;
             round_requested = false;
         }
-        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit the pacing loop the moment the pool reaches — or is
-        /// being driven toward — ANY terminal state. A NATURAL terminal transition (`VanishedReplaced` after
-        /// a foreign pool took the prefix, or `IdentityLost` once the sentinels are gone) never calls
-        /// `stop()` on this scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick
-        /// FOREVER against the vanished pool, and worse, after `VanishedReplaced` its rounds could
-        /// condemn/delete the FOREIGN pool's objects. We also exit on a published FORGET intent
-        /// (`vanishedIntentPublished`, still pre-terminal) — earliest-signal discipline — and on `IdentityLost`
-        /// (rev.8: a fail-loud terminal state; the last G2-zombie case — eternal `CORRUPTED_DATA` retries
-        /// against a half-erased pool — closes with it). Clearing `i_am_leader` before returning keeps
-        /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer runs GC). The thread exits
-        /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
-        /// finished thread cleanly.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
-        {
-            i_am_leader.store(false, std::memory_order_relaxed);
-            {
-                std::lock_guard exit_lock(terminal_exit_mutex);
-                loop_exited_on_terminal_for_test.store(true, std::memory_order_release);
-            }
-            terminal_exit_cv.notify_all();
-            return;
-        }
         try
         {
             /// LOW/benign: if stop() flips `stopping` while we're blocked here (a concurrent manual
@@ -301,8 +275,8 @@ void CasGcScheduler::loop()
             const Cas::RoundReport report = runRoundLogged(GcRoundLogRecord::Trigger::Scheduled);
             i_am_leader.store(report.writer, std::memory_order_relaxed);
             if (report.writer)
-                LOG_DEBUG(log, "CA GC round {}: condemned={} deleted={} absent={} replaced={} spared={}",
-                    report.round, report.condemned, report.deleted, report.absent, report.replaced, report.spared);
+                LOG_DEBUG(log, "CA GC round {}: deleted={} absent={} replaced={} spared={}",
+                    report.round, report.deleted, report.absent, report.replaced, report.spared);
         }
         catch (...)
         {
@@ -334,17 +308,7 @@ CasGcScheduler::GcHealth CasGcScheduler::gcHealth() const
             std::chrono::steady_clock::now().time_since_epoch()).count());
         h.last_success_age_seconds = now_ms > last_ms ? (now_ms - last_ms) / 1000 : 0;
     }
-    h.wedged_namespace_count = store->wedgedRefLaneCount();
     return h;
-}
-
-bool CasGcScheduler::waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout)
-{
-    std::unique_lock lock(terminal_exit_mutex);
-    return terminal_exit_cv.wait_for(lock, timeout, [this]
-    {
-        return loop_exited_on_terminal_for_test.load(std::memory_order_acquire);
-    });
 }
 
 }

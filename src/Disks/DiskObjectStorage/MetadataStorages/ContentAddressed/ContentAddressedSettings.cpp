@@ -3,7 +3,6 @@
 #include <Core/BaseSettings.h>
 #include <Core/BaseSettingsFwdMacrosImpl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -58,29 +57,16 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_interval_sec, 60, "Seconds between background GC rounds (>= 1)", 0) \
     DECLARE(String, blob_hash, "cityhash128", "Pool blob content-hash function (cityhash128 | xxh3-128 | sha256); fixed at pool creation", 0) \
     DECLARE(Bool,   blob_hash_allow_new, false, "Explicit opt-in to admit a NEW hash algo into an existing pool's algos_used", 0) \
-    DECLARE(UInt64, mount_lease_ttl_ms, 30000, "Mount lease validity after a successful claim or renewal, in milliseconds", 0) \
-    DECLARE(UInt64, mount_renew_period_ms, 10000, "Interval between background mount lease renewals, in milliseconds", 0) \
-    DECLARE(Bool, unsafe_remount_no_delay, false, "Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same server_uuid (a copied uuid file, a stalled predecessor): after such a reclaim the predecessor can still start conditional writes until its own cutoff (confirmed deadline − margin − 2 × envelope) or until its next renewal meets the token guard, and a request it already sent may materialize later. Ref-log keys carry (writer_epoch, sequence) and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles stragglers -- the exposure is availability, not data: recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions. Intended for test stands and deployments that guarantee one process per uuid", 0) \
     DECLARE(String, server_root_id, "", "REQUIRED explicit layout subtree identity; macros expand as in the s3 endpoint", 0) \
-    DECLARE(UInt64, part_folder_cache_bytes, 64ULL << 20, "Part-folder view cache byte budget (0 disables retention)", 0) \
-    DECLARE(UInt64, part_folder_cache_max_entries, 10000, "Part-folder view cache entry cap", 0) \
-    DECLARE(UInt64, part_folder_cache_max_entry_bytes, 16ULL << 20, "Oversized part-folder views bypass retention above this size", 0) \
-    DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
-    DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
-    DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
-    DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL: attempt envelope + this must be strictly less than the TTL, and renew period + 2 × envelope + this too", 0) \
-    DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
+    DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a pool request (blob PUT, HEAD, exact DELETE; `_pool_meta` read), at least 1", 0) \
 
 DECLARE_SETTINGS_TRAITS(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES)
 
 struct ContentAddressedSettingsImpl : public BaseSettings<ContentAddressedSettingsTraits>
 {
-    /// Parsed by `validate` from the corresponding string setting; cached here (rather than
-    /// re-parsed on every access) because the public header only forward-declares
-    /// `Cas::StagingBackend` and cannot store it by value.
+    /// Parsed by `validate` from the corresponding string setting; cached here rather than re-parsed on
+    /// every access.
     Cas::BlobHashAlgo blob_hash_algo_cached = Cas::BlobHashAlgo::CityHash128;
-    bool skip_access_check_cached = false;
-    Cas::StagingBackend staging_backend_cached = Cas::StagingBackend::Local;
 };
 
 IMPLEMENT_SETTINGS_TRAITS_CUSTOM_IMPL(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, ContentAddressedSettings, ContentAddressedSetting)
@@ -159,10 +145,6 @@ void ContentAddressedSettings::loadFromConfig(
         candidate.impl->set(key, config.getString(config_prefix + "." + key));
     }
 
-    /// Not a CAS setting: the generic disk layer reads this same unprefixed key for its own access
-    /// check, so one spelling must serve both.
-    candidate.impl->skip_access_check_cached = config.getBool(config_prefix + ".skip_access_check", false);
-
     auto & settings = candidate;
 
     /// Server-local scratch dir for the write-buffer spill. Mirrors how other metadata storages
@@ -224,44 +206,37 @@ void ContentAddressedSettings::validate()
             "content_addressed disk: cas_attempt_timeout_ms must be >= 1 (got {})",
             settings[ContentAddressedSetting::attempt_timeout_ms].value);
 
-    if (settings[ContentAddressedSetting::mount_lease_ttl_ms] == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "content_addressed disk: cas_mount_lease_ttl_ms must be >= 1 (got {})",
-            settings[ContentAddressedSetting::mount_lease_ttl_ms].value);
-
-    if (settings[ContentAddressedSetting::mount_renew_period_ms] == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "content_addressed disk: cas_mount_renew_period_ms must be >= 1 (got {})",
-            settings[ContentAddressedSetting::mount_renew_period_ms].value);
-
     /// The layout subtree identity is explicit and REQUIRED — no default, so an ABSENT key throws a
     /// typed `NO_ELEMENTS_IN_CONFIG` (mirroring the `metadata_type` check in `MetadataStorageFactory`),
-    /// distinct from a PRESENT-but-invalid value, which falls through to `validateServerRootId`'s
-    /// `BAD_ARGUMENTS` below. `.changed` is exactly "the config had this key" (or a caller set it
+    /// distinct from a PRESENT-but-invalid value, which throws `BAD_ARGUMENTS` below. `.changed` is exactly "the config had this key" (or a caller set it
     /// explicitly via the subscript operator); an unset field never reaches here as anything but empty.
     if (!settings[ContentAddressedSetting::server_root_id].changed)
         throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
             "Expected `cas_server_root_id` in config for a content-addressed disk");
 
-    Cas::validateServerRootId(settings[ContentAddressedSetting::server_root_id].value);
+    /// A clean relative path: it prefixes every in-memory namespace. Non-empty, at most 255 bytes, no empty, '.' or '..' segment.
+    const String & id = settings[ContentAddressedSetting::server_root_id].value;
+    if (id.empty() || id.size() > 255)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_server_root_id '{}' must be non-empty and at most 255 bytes", id);
+    for (size_t start = 0;;)
+    {
+        const size_t end = id.find('/', start);
+        const std::string_view segment = std::string_view(id).substr(start, end == String::npos ? String::npos : end - start);
+        if (segment.empty() || segment == "." || segment == "..")
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "content_addressed disk: cas_server_root_id '{}' has an empty, '.' or '..' segment", id);
+        if (end == String::npos)
+            break;
+        start = end + 1;
+    }
 
     impl->blob_hash_algo_cached = Cas::parseBlobHashAlgo(settings[ContentAddressedSetting::blob_hash].value);
-    impl->staging_backend_cached = ContentAddressedMetadataStorage::parseStagingBackend(settings[ContentAddressedSetting::staging_backend].value);
 }
 
 Cas::BlobHashAlgo ContentAddressedSettings::blobHashAlgo() const
 {
     return impl->blob_hash_algo_cached;
-}
-
-bool ContentAddressedSettings::skipAccessCheck() const
-{
-    return impl->skip_access_check_cached;
-}
-
-Cas::StagingBackend ContentAddressedSettings::stagingBackend() const
-{
-    return impl->staging_backend_cached;
 }
 
 }

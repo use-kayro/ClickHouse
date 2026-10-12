@@ -762,7 +762,7 @@ bool DiskObjectStorage::supportsHardLinks() const
     /// points at the same blob hash — no re-upload) and changed columns are written as fresh blobs,
     /// committed atomically. No code branches on this flag to choose a per-file-autocommit path, so
     /// advertising true does NOT open the per-file clone hazard: partition clones use one whole-part
-    /// transaction, replication uses whole-part transactions or the relink path, and the BACKUP
+    /// transaction, replication attaches parts from their Keeper records, and the BACKUP
     /// hard-link path remains independently rejected on CA.
     if (metadata_storage->isContentAddressed())
         return true;
@@ -773,6 +773,12 @@ bool DiskObjectStorage::supportsHardLinks() const
 bool DiskObjectStorage::isContentAddressed() const
 {
     return metadata_storage->isContentAddressed();
+}
+
+void DiskObjectStorage::checkAccessImpl(const String & path)
+{
+    if (!isContentAddressed())
+        IDisk::checkAccessImpl(path);
 }
 
 bool DiskObjectStorage::supportsAtomicFileWrites() const

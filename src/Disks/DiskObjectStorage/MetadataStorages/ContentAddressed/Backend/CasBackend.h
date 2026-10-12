@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
@@ -23,31 +22,6 @@
 namespace DB::Cas
 {
 
-/// Typed erasure evidence for one key or one prefix. Ordinary `head`/`read` answer only two things
-/// for a plain caller: the object, or nullopt for the store's own authoritative "key not found" (see
-/// `isObjectNotFound`) -- every other fault (a missing bucket/container, a permission failure, a
-/// transport fault) propagates as an exception instead of being flattened into absence. That
-/// present/absent/throw shape is exactly right for a plain read, but wrong for lifecycle recovery,
-/// which must never treat a fault it cannot classify as proof that data is gone. `ProbeOutcome` keeps
-/// the four cases distinct: only a backend's OWN authoritative "not found" evidence earns `KeyAbsent`
-/// -- a timeout, a 5xx, or an unclassifiable error is ALWAYS `Indeterminate`, never promoted to absence.
-enum class ProbeOutcome : uint8_t
-{
-    Present,           /// the key (or, for a prefix probe, at least one object under it) exists
-    KeyAbsent,         /// authoritative miss: the container is alive, the key itself is not there
-    ContainerAbsent,   /// the bucket/prefix-parent itself is gone, not merely the key
-    AccessDenied,      /// the probe was rejected on permissions — absence was never established
-    Indeterminate,     /// a transport/timeout/unclassifiable error — absence was NEVER proven
-};
-
-/// Result of `Backend::probeSentinelRaw`. `body` carries the materialized bytes only when the outcome is
-/// `Present`.
-struct SentinelProbeResult
-{
-    ProbeOutcome outcome;
-    std::optional<String> body;
-};
-
 /// Re-readable payload transport for one unconditional blob publication. `fresh_envelope` is the
 /// complete CAS envelope to prepend, while `payload_size` is the exact number of bytes the source
 /// must yield before the backend can make the destination visible.
@@ -58,23 +32,12 @@ struct StreamingBlobPublication
     std::function<std::unique_ptr<ReadBuffer>()> open_payload;
 };
 
-/// A complete, already-size-verified CAS object that can be copied byte-for-byte to the destination.
-/// This transport requires a provider-native same-store copy; the backend must never replace it with
-/// a client-side read/write fallback.
-struct VerbatimStagedBlobPublication
-{
-    String object_key;
-    uint64_t object_size;
-};
-
-using BlobPublication = std::variant<StreamingBlobPublication, VerbatimStagedBlobPublication>;
-
 /// Transport-only request for an unconditional blob rewrite. Publication does not inspect destination
 /// state or freshness metadata and does not produce an incarnation token.
 struct BlobPublishRequest
 {
     String destination_key;
-    BlobPublication publication;
+    StreamingBlobPublication publication;
 };
 
 namespace blob_publication_detail
@@ -124,22 +87,17 @@ inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuff
 ///     absence);
 ///   - `remove` removes ONLY the incarnation whose value matches — a mismatch MUST report
 ///     `RawRemoval::Mismatch` with the object untouched (backends that silently ignore the condition
-///     are rejected by `Cas::Probe`).
+///     must not serve a pool: the exact delete GC issues relies on it).
 ///
 /// VALUE ⟹ CONTENT PRECONDITION (read-path caches depend on this): a value must uniquely identify the
 /// byte-content of the incarnation it labels — i.e. `head(k)`'s value equalling a prior `read(k)`'s
 /// value MUST imply the bytes are unchanged. The protocol's SAFETY only needs the contrapositive
-/// (changed bytes ⟹ a new value, so a stale conditional write/delete is rejected), but `Cas::Pool`'s
-/// read-path decode cache (`readShardDecoded`) skips a re-`read`+decode on a value match, so a backend
-/// whose value could REPEAT across different content would make it serve stale manifests (wrong
-/// results). Holds for every backend in use: S3 ETag is content-derived; the emulated/in-memory
-/// backends mint a strictly-monotonic sequence that is never reused. A backend with a weak/recycled
-/// value must NOT be used as a Cas pool. The capability probe currently verifies conditional-operation
-/// behavior but does not test value non-reuse across different contents, so this invariant remains a
-/// requirement of every backend implementation.
+/// (changed bytes ⟹ a new value, so a stale conditional write/delete is rejected). Holds for every
+/// backend in use: S3 ETag is content-derived; the emulated/in-memory backends mint a strictly-monotonic
+/// sequence that is never reused. A backend with a weak/recycled value must NOT be used as a Cas pool;
+/// nothing verifies it at open, so it is a requirement of every backend implementation.
 ///
-/// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
-/// objects. Large content blobs use the transport-only `publish` seam; reads stay String-based because
+/// Most ops take/return whole `String` bodies — sufficient for `_pool_meta`. Large content blobs use the transport-only `publish` seam; reads stay String-based because
 /// blob payload reads go through the wiring's read stack, not this seam.
 class Backend
 {
@@ -187,44 +145,12 @@ public:
     virtual std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                      const std::optional<String> & expected_value, TransportAccess &) = 0;
     /// A forward-only read of a WRITE-ONCE object: nothing is materialized by the seam.
-    /// MUTABLE objects (checkpoints, the catalog, mounts) MUST use `read` -- their bytes may change
+    /// MUTABLE objects (`_pool_meta`) MUST use `read` -- their bytes may change
     /// under an open stream. Null when the key is absent.
     virtual std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess &) = 0;
     /// Executes one unconditional blob publication and returns once the complete destination is
     /// visible. Transport only: it observes no destination state and produces no incarnation.
     virtual void publish(const BlobPublishRequest & request, TransportAccess &) = 0;
-
-    /// Removes up to 1000 WRITE-ONCE keys in one request with no per-key precondition; an absent key
-    /// is success. The caller proves the keys are write-once by minting them as `WriteOnceKey`, so a
-    /// backend never sees a mutable control key through this verb. Throws on any failure; the whole
-    /// chunk is reissued by the engine, which is sound because a key already deleted is absent, and
-    /// absence is success.
-    virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
-
-    /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
-    /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`
-    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
-    /// call is `Indeterminate` -- never promoted to `KeyAbsent`. A backend able to surface real
-    /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
-    /// overrides this to sharpen the classification.
-    virtual SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access)
-    {
-        try
-        {
-            const auto meta = head(key, access);
-            if (!meta)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            auto raw = read(key, access);
-            /// Vanished between the two: still a clean, authoritative miss, not an error.
-            if (!raw)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            return {ProbeOutcome::Present, std::move(raw->bytes)};
-        }
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
 
     /// The dialect this backend mints its incarnation values in.
     virtual Dialect dialect() const = 0;
@@ -261,26 +187,19 @@ public:
     /// equals the persisted folded one, saving a GET per unchanged shard.
     virtual bool supportsListTokens() const = 0;
 
-    /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
-    /// probe BEFORE the op battery. Default: nothing to check. The S3 backend refuses here when a
+    /// Pool-level preconditions beyond per-op conditional semantics, checked by `Pool::open` on the
+    /// writer before any request. Default: nothing to check. The S3 backend refuses here when a
     /// generation-dialect (GCS) bucket is verified to have object versioning enabled: a token-exact
     /// DELETE against a versioned bucket archives a noncurrent generation instead of reclaiming
     /// storage, so GC "reclaim" would silently stop reclaiming. A probe that cannot answer is not
     /// evidence of that, so it warns and the mount proceeds.
     virtual void checkPoolPreconditions() {}
 
-    /// Fail-closed precondition: may this backend serve a WRITABLE mount that skips the access-check
-    /// battery? `PoolConfig::skip_access_check` is a preflight convenience, so it is available only to
-    /// backends whose correctness does not depend on the battery having run. Default: available.
-    /// See ObjectStorageBackend's override for the one combination that refuses it.
-    virtual void checkSkipAccessCheckSupport() {}
-
     /// Fail-closed precondition: a Native-mode backend MUST have a
     /// working single-attempt conditional-write path before it coordinates a WRITABLE pool — silently
     /// running CAS conditional writes under the disk's default (~500-attempt) transparent retry policy
-    /// is exactly the hazard this seam forbids. Asked by `Pool::open` through
-    /// `backendForCapabilityPredicates()`, alongside `checkPoolPreconditions`, before the probe
-    /// operation is admitted. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
+    /// is exactly the hazard this seam forbids. Asked by `Pool::open` on the writer, alongside
+    /// `checkPoolPreconditions`, before any request. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
     /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
     virtual void checkConditionalWriteSingleAttemptSupport() {}
 

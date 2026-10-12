@@ -479,7 +479,7 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
-The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `writer`, `round`, `objects_condemned`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, and `fence_outs`, describing the outcome of that round (see [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) for their meaning). Only a round that runs as the writer (`writer = 1`: this server writes every table on the disk) condemns or deletes.
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `writer`, `round`, `objects_deleted`, `objects_absent`, `objects_replaced` and `objects_spared`, describing the outcome of that round (see [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) for their meaning). Only the server that writes the pool's blobs runs a round.
 
 A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
@@ -507,74 +507,6 @@ already-running scheduler), and refuses with a typed error on a decommissioned o
 since restarting GC there would only spin failing rounds.
 
 Neither command returns a result set.
-
-### SYSTEM CAS FSCK {#system-cas-fsck}
-
-Independently verifies content-addressed pool reachability against a **running, mounted** disk — the
-scan re-validates every finding against a fresh authoritative read, so unlike the offline
-`clickhouse-disks cas-fsck` tool it needs no quiesce and no read-only mount.
-
-```sql
-SYSTEM CAS FSCK [ON CLUSTER cluster_name] disk_name
-```
-
-`disk_name` is **required**. The command returns one row with columns `disk`, `reachable`,
-`dangling`, `unreachable`, `pending_gc`, `unaccounted`, `chain_broken`, `unchecked`,
-`lifeless_keys`, `namespace_janitor_pending`,
-`namespace_janitor_pending_bytes`, `namespace_janitor_pending_lives`, `ref_records_walked`,
-`physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, and `total_blob_refs`. `dangling` is
-the one column that means data loss; `unreachable` counts every present object no live ref
-references (`unaccounted` the blobs among them) — not a problem on their own. `pending_gc` is `0`: the
-retired set it counted belonged to the S3-listing GC. This is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
-
-### SYSTEM CAS FORGET {#system-cas-forget}
-
-Node-local operator assertion that a content-addressed disk is permanently gone — the "fire marshal"
-verb for a stuck disk (a transient or identity-lost pool, or an operator-asserted decommission).
-Unlike the other `SYSTEM CAS` commands, it deliberately works on a disk that is **not** live, since
-that is its whole purpose.
-
-```sql
-SYSTEM CAS FORGET [ON CLUSTER cluster_name] disk_name
-```
-
-`disk_name` is **required**. It is an assertion, not a proof of erasure: the disk stays registered
-and answers further store-class access with a typed error, and a server restart re-registers the
-name. Returns no result set. This is different from
-[`SYSTEM CAS DROP POOL MEMBER`](#system-cas-drop-pool-member), which permanently retires one pool
-*member's* identity across the whole shared pool — `FORGET` only affects this node's own local view
-of one disk.
-
-### SYSTEM CAS DROP POOL MEMBER {#system-cas-drop-pool-member}
-
-Permanently decommissions a dead member (`server_root_id`) of a content-addressed disk
-pool. It claims the member's mount slot as an administrative writer — fencing that `server_root_id` from ever
-writing again — then drops every table namespace the member owned, drains eligible manifest debris,
-staging objects, and mountpoint objects belonging to it, and retires the mount slot once all drains
-are confirmed. This is a **destructive, irreversible** operation: only run it once the `server_root_id` is
-confirmed permanently dead, since it fences the member out even if it later comes back online, and
-it deletes namespace and drain state that cannot be recovered.
-
-It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
-transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only
-makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.
-
-```sql
-SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
-```
-
-Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque server-root path
-that may contain `/`, not a plain identifier, so it cannot be written unquoted).
-
-The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
-separately from namespaces newly removed by this invocation. Per-object drain failures are recorded
-as warnings and leave the slot in a terminated-but-not-fully-drained state that a later invocation
-can resume from, rather than raising an exception.
-
-The command returns one row with columns `server_root_id`, `namespaces_removed`, `namespaces_already_removed`,
-`committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`, `staging_objects_removed`,
-`mountpoint_objects_removed`, `slot_removed`, and `warnings`. A non-empty `warnings` means some
-drain was not confirmed and the mount slot was left in place as a resume anchor.
 
 ## Managing ReplicatedMergeTree Tables {#managing-replicatedmergetree-tables}
 

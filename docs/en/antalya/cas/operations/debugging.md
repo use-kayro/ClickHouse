@@ -44,7 +44,7 @@ ORDER BY event_time_microseconds;
 `skipped`) and `reason` are the two columns to read first; `detail` is a
 `Map(LowCardinality(String), String)` of decision-specific facts (`condemn_round`,
 `superseded_token`, `code`, `site`) worth `arrayJoin(detail)` when the summary columns alone do not
-explain the decision. See [`system.cas_log`](/operations/system-tables/cas_log) for the full column
+explain the decision. See `system.cas_log` for the full column
 reference.
 
 ### Why GC is not reclaiming {#why-not-reclaiming}

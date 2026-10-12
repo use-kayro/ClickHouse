@@ -14,8 +14,7 @@ namespace DB::Cas
 {
 
 /// Shared container mechanics for versioned content-addressed text objects: a header line
-/// {"type":"cas_<x>","v":N}, a body, an optional trailer line, and, for formats whose registry
-/// policy requires it, one zstd frame around the whole object. This is the only code that knows
+/// {"type":"cas_<x>","v":N}, a body, and an optional trailer line. This is the only code that knows
 /// that container shape; per-object codecs add only key mappings and object-specific invariants.
 ///
 /// Writers produce canonical text without whitespace outside JSON strings, and readers reject such
@@ -311,18 +310,5 @@ String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what);
 /// 0xE2 lead byte of the U+2028/U+2029 lookahead), or `end`. Scalar bulk-run scan: the win is on
 /// the short hot strings, so SIMD is deferred to a benchmark-gated contingency.
 const char * findNextSpecialJsonByte(const char * pos, const char * end);
-
-/// Zstd detection and per-format compression policy.
-
-/// True iff `bytes` starts with the zstd frame prefix 28 B5 2F FD.
-bool looksZstd(std::string_view bytes);
-/// Compression per the per-type policy: `Always` -> one zstd frame (any size, checksum on);
-/// everything else -> identity (returns `text` unchanged).
-String sealObject(FormatId id, String text);
-/// Inverse of sealObject. A compressed body is only legal when `id`'s policy is `Always`
-/// (declared content size checked against the cap before allocation); a raw body is accepted
-/// (repair path — e.g. an operator-restored uncompressed copy) subject to the SAME `object_cap` --
-/// skipping compression must never also skip the size cap.
-String openObject(FormatId id, std::string_view stored);
 
 }

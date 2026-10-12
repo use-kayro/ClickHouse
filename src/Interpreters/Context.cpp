@@ -6429,18 +6429,6 @@ std::shared_ptr<ContentAddressedGarbageCollectionLog> Context::getContentAddress
     return shared->system_logs->cas_gc_log;
 }
 
-std::shared_ptr<ContentAddressedLog> Context::getContentAddressedLog() const
-{
-    std::lock_guard lock(mutex_shared_context);
-    if (!shared)
-        return {};
-
-    SharedLockGuard lock2(shared->mutex);
-    if (!shared->system_logs)
-        return {};
-    return shared->system_logs->cas_log;
-}
-
 std::shared_ptr<BackgroundSchedulePoolLog> Context::getBackgroundSchedulePoolLog() const
 {
     SharedLockGuard lock(shared->mutex);

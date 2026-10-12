@@ -216,6 +216,14 @@ StorageMergeTree::StorageMergeTree(
     , cleanup_thread(*this)
     , support_transaction(supportTransaction(getDisks(), log.load()))
 {
+    /// A part on a content-addressed disk persists only as its Keeper record, which only a
+    /// ReplicatedMergeTree table commits (TEC-851 step 3c).
+    for (const auto & disk : getDisks())
+        if (disk->isContentAddressed())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "A non-replicated MergeTree table cannot use the content-addressed disk '{}': its parts would have no "
+                "Keeper record and would not survive a restart. Use a ReplicatedMergeTree table", disk->getName());
+
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
 
     loadDataParts(LoadingStrictnessLevel::FORCE_RESTORE <= mode, std::nullopt);

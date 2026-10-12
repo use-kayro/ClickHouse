@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <city.h>
 #include <algorithm>
 #include <optional>
 
@@ -26,8 +25,6 @@ namespace
 
 namespace PartManifestWire
 {
-    constexpr WireKey ns{"namespace"};
-    constexpr WireKey payload_digest{"payload_digest"};
     constexpr WireKey path{"path"};
     constexpr WireKey place{"place"};
     constexpr WireKey size{"size"};
@@ -147,9 +144,9 @@ std::vector<ManifestEntry> readEntriesAndPayload(ReadBuffer & in, uint64_t line_
         ManifestEntry e;
         e.path = r.readString();
 
-        /// Manifest bytes arrive over the interserver relink channel: enforce the same path hygiene
-        /// as CasLayout::checkNamespace so no future consumer can inherit a traversal. Relative,
-        /// no empty/'.'/'..' segments. (Syntactic only — legal projection subdirs pass.)
+        /// A record's bytes come from Keeper, written by another server: enforce path hygiene so no
+        /// consumer can inherit a traversal. Relative, no empty/'.'/'..' segments. (Syntactic only —
+        /// legal projection subdirs pass.)
         if (e.path.empty() || e.path.front() == '/')
             throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: invalid entry path '{}'", what, e.path);
         for (std::string_view rest = e.path; !rest.empty();)
@@ -258,83 +255,6 @@ EntryPlacement entryPlacementFromWireWord(std::string_view w)
     return kEntryPlacementWords.fromWord(w, "PartManifest: EntryPlacement");
 }
 
-String encodePartManifest(const PartManifest & m)
-{
-    /// Canonical path order plus duplicate-path rejection makes the encoded record sequence
-    /// deterministic and establishes the ordering required by the lookup helpers.
-    const std::vector<const ManifestEntry *> sorted = sortedUniqueEntries(m.entries, "PartManifest");
-
-    CasJsonWriter out(256);
-    writeHeaderLine(out, FormatId::PartManifest);
-
-    /// descriptor meta line: ManifestRef (epoch/build/ord, shared rendering with refsnaplog) + root
-    /// namespace + payload digest.
-    {
-        bool first = true;
-        writeManifestRefFields(out, first, kBareManifestRefKeys, m.ref);
-        writeStringField(out, PartManifestWire::ns, m.root_namespace_id.string(), first);
-        writeHex128Field(out, PartManifestWire::payload_digest, m.payload_digest, first);
-        closeObject(out, first);
-        writeChar('\n', out);
-    }
-
-    writeEntriesAndPayload(out, sorted);
-    return std::move(out).take();
-}
-
-PartManifest decodePartManifest(std::string_view data)
-{
-    ReadBufferFromMemory in(data.data(), data.size());
-    expectHeaderLine(in, FormatId::PartManifest);
-    const uint64_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
-
-    PartManifest m;
-
-    /// descriptor meta line
-    {
-        const String meta = readLine(in, line_cap, "cas_part_manifest");
-        ReadBufferFromMemory mm(meta.data(), meta.size());
-        JsonObjectReader r(mm, KeyStrictness::Tolerant, "cas_part_manifest");
-        ManifestRefFields fields;
-        std::optional<String> ns;
-        std::optional<UInt128> pd;
-        String key;
-        while (r.nextKey(key))
-        {
-            if (matchManifestRefFields(key, r, kBareManifestRefKeys, fields)) {}
-            else if (key == PartManifestWire::ns) ns = r.readString();
-            else if (key == PartManifestWire::payload_digest) pd = r.readHex128();
-            else r.skipUnknown(key);
-        }
-        if (!ns)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing namespace");
-        if (!pd)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing payload_digest");
-        m.ref = fields.buildRef("PartManifest", "descriptor");
-        m.root_namespace_id = RootNamespace(*ns);
-        m.payload_digest = *pd;
-        if (!mm.eof())
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after descriptor line");
-    }
-
-    m.entries = readEntriesAndPayload(in, line_cap, "PartManifest", "cas_part_manifest");
-
-    if (!in.eof())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: trailing bytes after the payload zone");
-
-    /// Recompute and verify `payload_digest` last, over the fully-decoded body. `computePayloadDigest`
-    /// builds its own probe copy with payload_digest zeroed before hashing (see below), so calling it
-    /// directly here on `m` (whose payload_digest is whatever was read off the wire) is safe and
-    /// matches encode's own computation exactly.
-    const UInt128 expected_digest = computePayloadDigest(m);
-    if (expected_digest != m.payload_digest)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "PartManifest: payload_digest mismatch, expected {}, got {}",
-            u128ToHex(expected_digest), u128ToHex(m.payload_digest));
-
-    return m;
-}
-
 String encodePartFiles(const PartFiles & part_files)
 {
     for (const auto & e : part_files.entries)
@@ -385,29 +305,6 @@ PartFiles decodePartFiles(std::string_view data)
         if (e.placement != EntryPlacement::Inline)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartFiles: entry '{}' is not Inline", e.path);
     return part_files;
-}
-
-UInt128 computePayloadDigest(const PartManifest & m)
-{
-    /// Digest the canonical encoding with payload_digest zeroed, so the digest does not depend on
-    /// itself (it would be circular otherwise) and is stable for identical bodies, changing whenever
-    /// ref / namespace / entries change. Uses the CAS content-hash primitive (CityHash128) over the
-    /// deterministic encodePartManifest bytes - the same primitive blob/tree hashing uses.
-    PartManifest probe = m;
-    probe.payload_digest = UInt128{};
-    const String bytes = encodePartManifest(probe);
-    const auto h = CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size());
-    return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
-}
-
-bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body)
-{
-    return journal_ref == body.ref;
-}
-
-bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body)
-{
-    return owning == body.root_namespace_id;
 }
 
 const ManifestEntry * findEntry(const std::vector<ManifestEntry> & entries, std::string_view path)

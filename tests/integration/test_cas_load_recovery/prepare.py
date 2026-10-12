@@ -25,6 +25,9 @@ for role in ('writer', 'reader'):
 <path>/var/lib/clickhouse/cache/</path><max_size>134217728</max_size></shared_s3_cache>'''
              if role == 'reader' else '')
     disk = 'shared_s3_cache' if role == 'reader' else 'shared_s3'
+    # As production readers (kayro-infra merge-tree.xml.tftpl): only the writer writes blobs (TEC-851).
+    merge_tree = ('<merge_tree><replicated_can_become_leader>0</replicated_can_become_leader>'
+                  '<always_fetch_merged_part>1</always_fetch_merged_part></merge_tree>' if role == 'reader' else '')
     (LAB / f'{role}.xml').write_text(f'''<clickhouse>
 <logger><level>information</level><console>true</console></logger>
 <listen_host>0.0.0.0</listen_host>
@@ -32,16 +35,15 @@ for role in ('writer', 'reader'):
 <async_load_databases>true</async_load_databases>
 <interserver_http_host>{role}</interserver_http_host>
 <macros><replica>{role}</replica><shard>1</shard></macros>
+{merge_tree}
 <zookeeper><node><host>keeper</host><port>9181</port></node></zookeeper>
-<cas_log><database>system</database><table>cas_log</table><flush_interval_milliseconds>1000</flush_interval_milliseconds></cas_log>
 <storage_configuration><disks><shared_s3>
 <type>object_storage</type><object_storage_type>s3</object_storage_type><metadata_type>cas</metadata_type>
 <endpoint>http://{role}-proxy:11121/test/shared_pool/</endpoint>
 <access_key_id>clickhouse</access_key_id><secret_access_key>clickhouse</secret_access_key>
 <cas_server_root_id>{role}</cas_server_root_id>
 <connect_timeout_ms>1000</connect_timeout_ms>
-<cas_mount_lease_ttl_ms>30000</cas_mount_lease_ttl_ms><cas_mount_renew_period_ms>10000</cas_mount_renew_period_ms>
-<cas_attempt_timeout_ms>5000</cas_attempt_timeout_ms><cas_lease_safety_margin_ms>2000</cas_lease_safety_margin_ms>
+<cas_attempt_timeout_ms>5000</cas_attempt_timeout_ms>
 </shared_s3>{cache}</disks>
 <policies><shared_s3><volumes><main><disk>{disk}</disk></main></volumes></shared_s3></policies>
 </storage_configuration></clickhouse>''')

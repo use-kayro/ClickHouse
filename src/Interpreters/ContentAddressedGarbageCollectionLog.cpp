@@ -39,12 +39,10 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"round", std::make_shared<DataTypeUInt64>(), "This process's round number on this disk (0 on Start, and on a round that did not run as the writer)."},
         {"outcome", outcome_enum, "Unknown (Start) / Success (the round completed) / Aborted (the round threw a transient error -- backend or Keeper unavailability -- and the next scheduled round retries) / Stopped (a transient error observed after the disk\'s teardown began: the round was cut short by a server shutdown or the storage\'s destructor; a correlation, not a cause) / Error (the round threw a non-transient error -- during a teardown too)."},
         {"writer", std::make_shared<DataTypeUInt8>(), "1 when the round ran as the writer (this server writes every table on the disk; only the writer deletes); 0 when it only read the tables\' records."},
-        {"objects_condemned", std::make_shared<DataTypeUInt64>(), "Blobs condemned this round (`.meta = Condemned`): referenced only by records of parts no replica lists."},
         {"objects_deleted", std::make_shared<DataTypeUInt64>(), "Blobs deleted this round (exact ETag), after their last record was removed."},
-        {"objects_absent", std::make_shared<DataTypeUInt64>(), "Condemned blobs already gone when deleted."},
-        {"objects_replaced", std::make_shared<DataTypeUInt64>(), "Condemned blobs re-uploaded since their condemnation (ETag changed), so spared."},
-        {"objects_spared", std::make_shared<DataTypeUInt64>(), "Condemned blobs a listed part references again."},
-        {"fence_outs", std::make_shared<DataTypeUInt64>(), "Expired mounts fenced out by this round's heartbeat floor."},
+        {"objects_absent", std::make_shared<DataTypeUInt64>(), "Candidate blobs already gone when deleted."},
+        {"objects_replaced", std::make_shared<DataTypeUInt64>(), "Candidate blobs re-uploaded since their ETag was read, so kept."},
+        {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidate blobs a record references again."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
         {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Aborted, Stopped or Error. On a Stopped row it names the engine\'s refusal, not the teardown."},
         {"error_code", std::make_shared<DataTypeInt32>(), "Exception code when outcome = Aborted, Stopped or Error; 0 otherwise. The structured twin of `error`: key monitoring on this column, not on message text."},
@@ -53,11 +51,11 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"round_id", std::make_shared<DataTypeString>(),
             "Correlator for every row of one round attempt (its Start, each Phase, and its Finish). Minted per attempt; unlike `round` it exists even for a round that did not run as the writer. Group by this column to reconstruct one round."},
         {"phase", lc_string,
-            "The GC phase this row describes (empty on Start/Finish), in execution order: keeper_records, heartbeat_floor, mark, remove. A round that does not run as the writer, or has nothing to remove, emits only the phases it reached."},
+            "The GC phase this row describes (empty on Start/Finish), in execution order: keeper_records, mark, remove. A round that does not run as the writer, or has nothing to remove, emits only the phases it reached."},
         {"phase_duration_microseconds", std::make_shared<DataTypeUInt64>(),
             "Wall-clock duration of this phase in microseconds (Phase rows only). Microseconds because several phases are routinely sub-millisecond and the point is to see when they are not. Phase durations do not sum to the round's `duration_ms`: the round also does untimed bookkeeping between phases."},
         {"phase_metrics", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `records`/`unrecorded_listed` on keeper_records, `marked`/`condemned`/`due` on mark, `records_removed` on remove. The verb counts ride the `ProfileEvents` column of the same row."},
+            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `records`/`held_blobs`/`held_references` on keeper_records, `marked`/`due` on mark, `records_removed`/`blobs_deleted`/`blobs_pending` on remove. The verb counts ride the `ProfileEvents` column of the same row."},
     };
 }
 
@@ -75,12 +73,10 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
     columns[i++]->insert(round);
     columns[i++]->insert(static_cast<Int8>(outcome));
     columns[i++]->insert(static_cast<UInt8>(writer));
-    columns[i++]->insert(objects_condemned);
     columns[i++]->insert(objects_deleted);
     columns[i++]->insert(objects_absent);
     columns[i++]->insert(objects_replaced);
     columns[i++]->insert(objects_spared);
-    columns[i++]->insert(fence_outs);
     columns[i++]->insert(duration_ms);
     columns[i++]->insert(error);
     columns[i++]->insert(error_code);

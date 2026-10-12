@@ -193,56 +193,39 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
 
 void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
-    if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+    const StreamingBlobPublication & streaming = request.publication;
+    std::unique_ptr<ReadBuffer> payload = streaming.open_payload();
+    if (!payload)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "InMemoryBackend::publish: payload source for {} returned no reader",
+            request.destination_key);
+
+    /// Drain before taking the store lock: the source may itself read another object from this
+    /// backend. The complete body remains private until its size has been validated.
+    String body = streaming.fresh_envelope;
+    blob_publication_detail::BlobPayloadCopyResult copy_result;
     {
-        std::unique_ptr<ReadBuffer> payload = streaming->open_payload();
-        if (!payload)
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "InMemoryBackend::publish: payload source for {} returned no reader",
-                request.destination_key);
-
-        /// Drain before taking the store lock: the source may itself read another object from this
-        /// backend. The complete body remains private until its size has been validated.
-        String body = streaming->fresh_envelope;
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
-        {
-            WriteBufferFromString out(body, AppendModeTag{});
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, out, streaming->payload_size);
-            if (copy_result.exact(streaming->payload_size))
-                out.finalize();
-            else
-                out.cancel();
-        }
-
-        if (!copy_result.exact(streaming->payload_size))
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
-
-        std::lock_guard lock(mutex_);
-        Object object;
-        object.bytes = std::move(body);
-        object.value = mintValue();
-        store_[request.destination_key] = std::move(object);
-        return;
+        WriteBufferFromString out(body, AppendModeTag{});
+        copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, out, streaming.payload_size);
+        if (copy_result.exact(streaming.payload_size))
+            out.finalize();
+        else
+            out.cancel();
     }
 
-    const auto & staged = std::get<VerbatimStagedBlobPublication>(request.publication);
-    std::lock_guard lock(mutex_);
-    const auto source = store_.find(staged.object_key);
-    if (source == store_.end())
+    if (!copy_result.exact(streaming.payload_size))
         throw Exception(
-            ErrorCodes::FILE_DOESNT_EXIST,
-            "InMemoryBackend::publish: staging object {} is absent",
-            staged.object_key);
+            ErrorCodes::CORRUPTED_DATA,
+            "InMemoryBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
+            copy_result.has_excess ? "more than " : "",
+            copy_result.copied,
+            request.destination_key,
+            streaming.payload_size);
 
+    std::lock_guard lock(mutex_);
     Object object;
-    object.bytes = source->second.bytes;
+    object.bytes = std::move(body);
     object.value = mintValue();
     store_[request.destination_key] = std::move(object);
 }
@@ -287,61 +270,6 @@ Backend::RawRemoval InMemoryBackend::remove(const String & key, const String & e
     }
 
     return applyDelete(key, expected_value);
-}
-
-void InMemoryBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &)
-{
-    std::exception_ptr armed;
-    std::function<void()> hook;
-    {
-        std::lock_guard lock(mutex_);
-        ++bulk_remove_calls_;
-        if (!armed_bulk_remove_failures_.empty())
-        {
-            armed = armed_bulk_remove_failures_.front();
-            armed_bulk_remove_failures_.erase(armed_bulk_remove_failures_.begin());
-        }
-        hook = before_bulk_remove_hook_;
-    }
-    if (armed)
-        std::rethrow_exception(armed);
-    if (hook)
-        hook();
-
-    std::lock_guard lock(mutex_);
-    for (const WriteOnceKey & key : keys)
-    {
-        auto it = store_.find(key.str());
-        if (it == store_.end())
-            continue;   /// absent is success
-        if (hold_deletes_)
-        {
-            PendingDelete pd;
-            pd.key = key.str();
-            pd.value = it->second.value;
-            pending_deletes_.push_back(std::move(pd));
-            continue;
-        }
-        store_.erase(it);
-    }
-}
-
-void InMemoryBackend::failNextBulkRemoveWith(std::exception_ptr error)
-{
-    std::lock_guard lock(mutex_);
-    armed_bulk_remove_failures_.push_back(std::move(error));
-}
-
-void InMemoryBackend::onBeforeBulkRemove(std::function<void()> hook)
-{
-    std::lock_guard lock(mutex_);
-    before_bulk_remove_hook_ = std::move(hook);
-}
-
-size_t InMemoryBackend::bulkRemoveCalls() const
-{
-    std::lock_guard lock(mutex_);
-    return bulk_remove_calls_;
 }
 
 Backend::RawListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess &)

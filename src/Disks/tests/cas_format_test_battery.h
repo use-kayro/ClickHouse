@@ -87,14 +87,11 @@ inline void runFormatBattery(const FormatBatteryCase & c)
     const String stored = c.encode();
     c.decode(stored); /// round-trip: must not throw
 
-    /// Work on the canonical text (identical to `stored` for raw formats).
-    const String text = openObject(c.id, stored);
+    const String & text = stored;
     ASSERT_TRUE(text.starts_with("{\"type\":\"")) << t.type;
 
     if (!c.golden.empty())
         EXPECT_EQ(text, c.golden) << "golden text drifted for " << t.type;
-    if (looksZstd(stored) && !c.golden.empty())
-        EXPECT_EQ(stored, sealObject(c.id, c.golden)) << "pinned compressed arm drifted for " << t.type;
 
     /// Truncation at every line boundary (drop the terminator too) fails closed.
     for (size_t i = 0; i < text.size(); ++i)

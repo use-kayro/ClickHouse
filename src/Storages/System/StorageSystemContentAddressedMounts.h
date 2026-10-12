@@ -8,10 +8,8 @@ namespace DB
 
 class Context;
 
-/// system.cas_mounts: one row per CAS mount slot (`gc/server-roots/<server_root_id>/mount`)
-/// visible from every content-addressed disk — live lease state for operators (who holds which
-/// slot, renewal health, fenced/terminated). Read-only, one LIST + one GET per slot per disk.
-/// The `is_leader` column is per-disk and supersedes the retired process-global `CasGcIsLeader` metric.
+/// system.cas_mounts: one row per content-addressed disk of this server and its GC's health, read from
+/// process state only.
 class StorageSystemContentAddressedMounts final : public StorageWithCommonVirtualColumns
 {
 public:

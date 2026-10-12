@@ -144,7 +144,7 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// to have versioning enabled refuses the mount. A probe that cannot answer does not: it is not
 /// evidence of a versioned bucket, its usual cause is a credential without permission to read the
 /// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
-/// mount proceeds with a warning that names what was not verified and how the operator can verify it.
+/// open proceeds with a warning that names what was not verified and how the operator can verify it.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != Dialect::Generation)
@@ -172,30 +172,12 @@ void ObjectStorageBackend::checkPoolPreconditions()
             "soft-delete duration 0 for CAS pools) and retry the mount.");
 }
 
-/// See Backend::checkSkipAccessCheckSupport. A writable generation-dialect (GCS) mount is the one
-/// combination whose correctness depends on the MUTATING capability battery having run: the battery
-/// is what proves a numeric generation actually reaches GCS as x-goog-if-generation-match on a
-/// DELETE, and nothing else in the mount path proves it.
-void ObjectStorageBackend::checkSkipAccessCheckSupport()
-{
-    if (mode != Mode::Native || native_token_type != Dialect::Generation)
-        return;
-
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-        "CAS on GCS: skip_access_check=true is not supported on a WRITABLE generation-token mount. "
-        "The capability battery this setting skips is what verifies that a token-exact DELETE "
-        "actually honours the generation precondition; without it GC could delete an incarnation it "
-        "did not condemn, and the bucket-versioning precondition would go unchecked too. Remove "
-        "skip_access_check from this disk, or mount it read-only.");
-}
-
 /// See Backend::checkConditionalWriteSingleAttemptSupport. This is a MOUNT-TIME gate, deliberately
 /// separate from the ctor: narrow, targeted unit tests can keep constructing a raw Native-mode backend
 /// over a non-S3 IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the
 /// established convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A
-/// REAL writable mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls
-/// it for every non-read-only Pool::open, so production never silently runs Native-mode conditional
-/// writes under the disk's default (~500-attempt) transparent retry policy.
+/// REAL writer, by contrast, always reaches this check (`Pool::open`), so production never silently
+/// runs Native-mode conditional writes under the disk's default (~500-attempt) transparent retry policy.
 void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 {
     if (mode != Mode::Native)
@@ -334,7 +316,7 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
 ///
 /// `NO_SUCH_BUCKET` is deliberately NOT here even though it is the third member of the store's own
 /// 404 family: a vanished CONTAINER is not an absent key, and answering "absent" for it would let a
-/// caller read an empty pool out of an outage. It propagates, and `probeSentinelRaw` classifies it.
+/// caller read an empty pool out of an outage. It propagates.
 /// Any other error (network, auth, throttle, corruption) propagates unchanged — fail-closed.
 static bool isObjectNotFound(const std::exception & e)
 {
@@ -731,71 +713,6 @@ std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(const String & k
     return RawMeta{metadata->size_bytes, emuObserveToken(key)};
 }
 
-/// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
-SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess & access)
-{
-    return probeSentinelUnder(key, controlRequest(access.attemptNo()));
-}
-
-SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key, const ObjectStorageControlRequest & request)
-{
-    if (mode == Mode::Native)
-    {
-        try
-        {
-            /// One `read`: unlike a bodyless HEAD 404, a GET 404 carries a response body, so the
-            /// SDK can parse its `<Code>` and a missing key and a missing bucket arrive as different
-            /// errors -- which is the whole distinction this probe exists to make.
-            auto raw = readUnder(key, request);
-            if (!raw)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            return {ProbeOutcome::Present, std::move(raw->bytes)};
-        }
-#if USE_AWS_S3
-        catch (const S3Exception & e)
-        {
-            /// `read` already answers the key-absent half of the store's 404 family (see
-            /// `isObjectNotFound`), so what reaches here is what it deliberately does not flatten.
-            /// The limit of the one-read shape: every case below classifies an error a GET raised, so
-            /// a store whose HEAD and GET answer differently for the same key is classified by its GET.
-            switch (e.getS3ErrorCode())
-            {
-                case Aws::S3::S3Errors::NO_SUCH_BUCKET:
-                    return {ProbeOutcome::ContainerAbsent, std::nullopt};
-                case Aws::S3::S3Errors::ACCESS_DENIED:
-                    return {ProbeOutcome::AccessDenied, std::nullopt};
-                default:
-                    /// Everything else (timeouts, 5xx, throttling, an unmodeled code) is inconclusive —
-                    /// NEVER promoted to KeyAbsent, per the IAM permutation table in spec §2.
-                    return {ProbeOutcome::Indeterminate, std::nullopt};
-            }
-        }
-#endif
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
-    }
-
-    /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`read`
-    /// alone cannot distinguish "this key is absent" from "the whole pool directory is gone" (Local
-    /// listing is best-effort and silently reports zero either way, see LocalObjectStorage::listObjects).
-    try
-    {
-        if (!object_storage->existsOrHasAnyChild(emu_root))
-            return {ProbeOutcome::ContainerAbsent, std::nullopt};
-
-        auto raw = readUnder(key, request);
-        if (!raw)
-            return {ProbeOutcome::KeyAbsent, std::nullopt};
-        return {ProbeOutcome::Present, std::move(raw->bytes)};
-    }
-    catch (...)
-    {
-        return {ProbeOutcome::Indeterminate, std::nullopt};
-    }
-}
-
 /// Settings for a genuine Native conditional write. Mark the request for the typed conditional
 /// dialect and, on a generation-token store, force a single PUT: GCS does not enforce the condition
 /// on multipart completion. Blob publication never uses these settings; it remains an ordinary
@@ -868,76 +785,53 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
 
 void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
-    if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+    const StreamingBlobPublication & streaming = request.publication;
+    std::unique_ptr<ReadBuffer> payload = streaming.open_payload();
+    if (!payload)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ObjectStorageBackend::publish: payload source for {} returned no reader",
+            request.destination_key);
+
+    if (mode != Mode::Native)
     {
-        std::unique_ptr<ReadBuffer> payload = streaming->open_payload();
-        if (!payload)
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: payload source for {} returned no reader",
-                request.destination_key);
-
-        if (mode != Mode::Native)
-        {
-            /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
-            emuPublishBlobAtomically(
-                request.destination_key, streaming->fresh_envelope, *payload, streaming->payload_size);
-            return;
-        }
-
-        /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
-        /// In particular, generation stores are not restricted by the conditional single-PUT cap.
-        auto out = object_storage->writeObject(
-            StoredObject(request.destination_key),
-            WriteMode::Rewrite,
-            /*attributes=*/std::nullopt,
-            DBMS_DEFAULT_BUFFER_SIZE,
-            WriteSettings{});
-        out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        blob_publication_detail::BlobPayloadCopyResult copy_result;
-        try
-        {
-            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming->payload_size);
-        }
-        catch (...)
-        {
-            out->cancel();
-            throw;
-        }
-        if (!copy_result.exact(streaming->payload_size))
-        {
-            out->cancel();
-            throw Exception(
-                ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
-                copy_result.has_excess ? "more than " : "",
-                copy_result.copied,
-                request.destination_key,
-                streaming->payload_size);
-        }
-        out->finalize();
+        /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
+        emuPublishBlobAtomically(
+            request.destination_key, streaming.fresh_envelope, *payload, streaming.payload_size);
         return;
     }
 
-    const auto & staged = std::get<VerbatimStagedBlobPublication>(request.publication);
-    if (mode != Mode::Native)
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publish: verbatim staged publication requires Native mode");
-
-    WriteSettings write_settings;
-    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
-    if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publish: object storage {} does not support native-only same-store copy",
-            object_storage->getName());
-
-    object_storage->copyObject(
-        StoredObject(staged.object_key),
+    /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
+    /// In particular, generation stores are not restricted by the conditional single-PUT cap.
+    auto out = object_storage->writeObject(
         StoredObject(request.destination_key),
-        getReadSettings(),
-        write_settings);
+        WriteMode::Rewrite,
+        /*attributes=*/std::nullopt,
+        DBMS_DEFAULT_BUFFER_SIZE,
+        WriteSettings{});
+    out->write(streaming.fresh_envelope.data(), streaming.fresh_envelope.size());
+    blob_publication_detail::BlobPayloadCopyResult copy_result;
+    try
+    {
+        copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming.payload_size);
+    }
+    catch (...)
+    {
+        out->cancel();
+        throw;
+    }
+    if (!copy_result.exact(streaming.payload_size))
+    {
+        out->cancel();
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
+            copy_result.has_excess ? "more than " : "",
+            copy_result.copied,
+            request.destination_key,
+            streaming.payload_size);
+    }
+    out->finalize();
 }
 
 Backend::RawRemoval ObjectStorageBackend::remove(const String & key, const String & expected_value, TransportAccess & access)
@@ -999,33 +893,6 @@ void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
             emu_token_state.erase(it);
         else
             emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
-    }
-}
-
-void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
-{
-    if (keys.empty())
-        return;
-    if (mode == Mode::Native)
-    {
-        StoredObjects objects;
-        objects.reserve(keys.size());
-        for (const WriteOnceKey & key : keys)
-            objects.emplace_back(key.str());
-        /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- this layer never
-        /// substitutes a per-key loop of its own (that would run under a single admission for up to
-        /// 1000 keys).
-        object_storage->removeObjectsIfExistUnderProfile(objects, controlRequest(access.attemptNo()));
-        return;
-    }
-
-    std::lock_guard lock(emu_mutex);
-    for (const WriteOnceKey & key : keys)
-    {
-        if (!emuExists(key.str()))
-            continue;
-        object_storage->removeObjectIfExists(StoredObject(emuPath(key.str())));
-        emuForgetDeletedToken(key.str());
     }
 }
 

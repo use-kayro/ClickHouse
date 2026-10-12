@@ -35,12 +35,10 @@ struct ContentAddressedGarbageCollectionLogElement
     Outcome outcome = UNKNOWN;      /// UNKNOWN on START
     /// The `Cas::RoundReport` of a FINISH row.
     bool writer = false;
-    UInt64 objects_condemned = 0;
     UInt64 objects_deleted = 0;
     UInt64 objects_absent = 0;
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
-    UInt64 fence_outs = 0;
     UInt64 duration_ms = 0;
     String error;
     Int32 error_code = 0;           /// exception code on an Aborted/Error FINISH; 0 otherwise

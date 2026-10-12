@@ -43,6 +43,7 @@
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/hasNullable.h>
 #include <Disks/IDiskTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
 #include <Disks/createVolume.h>
@@ -550,7 +551,9 @@ void MergeTreeData::initializeDirectoriesAndFormatVersion(const std::string & re
             /// since it does not support move, that is required for any
             /// operation over MergeTree, so avoid writing format_version.txt
             /// into it as well, to avoid leaving it after DROP.
-            if (!disk->isReadOnly() && !disk->isWriteOnce())
+            /// A content-addressed disk persists no table-level file: the format version comes from the table
+            /// definition on every attach.
+            if (!disk->isReadOnly() && !disk->isWriteOnce() && !disk->isContentAddressed())
             {
                 auto buf = disk->writeFile(format_version_path, 16, WriteMode::Rewrite, getContext()->getWriteSettings());
                 writeIntText(format_version.toUnderType(), *buf);
@@ -5927,7 +5930,11 @@ MergeTreeData::PartsToRemoveFromZooKeeper MergeTreeData::removePartsInRangeFromW
     /// Under a running MVCC transaction the removed parts keep their version metadata (creation/removal CSN
     /// persisted on disk), which already prevents them from being resurrected on restart, so no covering part
     /// is needed (mirrors plain MergeTree DROP PARTITION, which only covers parts in its non-transaction path).
-    if (create_empty_part && !txn && !parts_to_remove.empty() && is_new_syntax && !range_in_the_middle)
+    /// A content-addressed disk holds exactly the parts the replica re-attaches from their Keeper records, so
+    /// a removed part can never come back as unexpected after a restart: no covering part there (TEC-851 step
+    /// 3c; it would have no record and could not be written by a replica that does not write blobs).
+    const bool content_addressed = !parts_to_remove.empty() && parts_to_remove.front()->getDataPartStorage().isContentAddressed();
+    if (create_empty_part && !txn && !parts_to_remove.empty() && is_new_syntax && !range_in_the_middle && !content_addressed)
     {
         /// We are going to remove a lot of parts from zookeeper just after returning from this function.
         /// And we will remove parts from disk later (because some queries may use them).
@@ -5957,27 +5964,6 @@ MergeTreeData::PartsToRemoveFromZooKeeper MergeTreeData::removePartsInRangeFromW
 
         MergeTreeData::Transaction transaction(*this, NO_TRANSACTION_RAW);
         renameTempPartAndAdd(new_data_part, transaction, lock, /*rename_in_transaction=*/ false);     /// All covered parts must be already removed
-
-        /// On a content-addressed disk a part directory becomes durable only when its disk-storage
-        /// transaction is committed (the ref to its manifest is published at commit, not at rename).
-        /// The flow below rolls back the in-memory MergeTreeData transaction (to keep the empty part
-        /// Outdated, not Active), which never calls commitTransaction on the disk storage — so on a CA
-        /// disk the empty covering part would leave NO on-disk ref and vanish on restart/reattach,
-        /// defeating its sole purpose (it exists only to cover the dropped parts on disk so a restart
-        /// does not treat them as uncovered unexpected parts and trip TOO_MANY_UNEXPECTED_DATA_PARTS).
-        /// On a plain disk the rename in renameTempPartAndAdd is already durable, so this is a no-op
-        /// there. Commit the disk storage transaction here (CA only) so the ref is published before the
-        /// in-memory rollback; the part still ends up Outdated, exactly as on a plain disk.
-        ///
-        /// [TXN-ONE-PIPELINE] (`2026-07-16-cas-txn-one-pipeline-design.md`, Audit 7 / Tension 2): this
-        /// hand-placed `commitTransaction()` is NOT made redundant by moving publication into `commit`
-        /// — it is the direct consequence of that design. There is no `precommit` phase under the
-        /// one-pipeline model, and this rollback path (by construction, to keep the part Outdated) never
-        /// reaches `MergeTreeData::Transaction::commit`, the only other place a disk transaction is
-        /// committed. So this call remains the ONLY thing that publishes the empty cover's ref. Keep it.
-        if (new_data_part->getDataPartStorage().isContentAddressed()
-            && new_data_part->getDataPartStorage().hasActiveTransaction())
-            new_data_part->getDataPartStorage().commitTransaction();
 
         /// It will add the empty part to the set of Outdated parts without making it Active (exactly what we need)
         transaction.rollback(&lock);
@@ -6826,40 +6812,11 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 }
                 case MetadataStorageType::CAS:
                 {
-                    /// On a CAS disk whole-part publication is transactional. Same-disk clones use
-                    /// `DataPartStorageOnDiskBase::freeze`; cross-disk clones use
-                    /// `DataPartStorageOnDiskBase::freezeRemote`, which streams source bytes into ONE CA
-                    /// transaction. When both disks share a pool, the publish dedup-resolves existing blobs
-                    /// and becomes a ref repoint, although the sequential source read still happens.
-                    /// `moveDirectory` re-keys the detached-staging → active rename into a complete active
-                    /// ref — so these are SUPPORTED and verified (read back identical data, survive restart):
-                    /// `ATTACH PARTITION`/`ATTACH PART` (re-clone of the table's own
-                    /// detached parts), `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` (parses to
-                    /// `REPLACE_PARTITION`), and `MOVE PARTITION ... TO TABLE`. The pointer-unlink commands
-                    /// `DROP PARTITION` / `DETACH PARTITION` / `DROP DETACHED PARTITION` are also fine.
-                    /// `FETCH PARTITION`/`FETCH PART` is also SUPPORTED — it is a `ReplicatedMergeTree` op
-                    /// (now supported on CA), and a `to_detached` fetch takes the byte-fetch path: the
-                    /// downloaded files content-address into the `detached/` namespace (relink-into-detached
-                    /// is deferred, see backlog). `ALTER ... FETCH PART` parses to the same `FETCH_PARTITION`
-                    /// command type (with `part=true`), so this entry covers both.
-                    /// `FREEZE PARTITION`/`FREEZE ALL` and `UNFREEZE PARTITION`/`UNFREEZE ALL` are now SUPPORTED:
-                    /// a freeze publishes each part as its own ref in the `shadow/` namespace (a GC root sharing
-                    /// the live blobs zero-copy — no byte copy); UNFREEZE removes the backup's refs.
-                    /// `FORGET PARTITION` is SUPPORTED on CA — it only manipulates ZooKeeper partition metadata
-                    /// (removes block-number nodes from ZooKeeper) and does not write, clone, or touch any part
-                    /// files on disk, so it is safe on a content-addressed disk.
-                    /// `EXPORT PARTITION` is SUPPORTED because the reason this list exists does not apply
-                    /// to it. The rejection below is about commands that clone parts file-by-file;
-                    /// exporting does not clone at all. `ExportPartTask` reads the source part through
-                    /// `MergeTreeSequentialSource` (`MergeTreeSequentialSourceType::Export`) and writes
-                    /// rows into the destination through a `SinkToStorage` on an ordinary query
-                    /// pipeline, so the source's part files are only READ, under `readLockParts`, and
-                    /// nothing is hard-linked or copied on the content-addressed disk. The command's
-                    /// own bookkeeping is ZooKeeper-side.
-                    /// NOTE: `MOVE_PARTITION` also admits cross-disk
-                    /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
-                    /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
-                    /// same-disk `MOVE ... TO TABLE` is verified here — cross-disk is a follow-up to verify.
+                    /// On a CAS disk whole-part publication is transactional, so the commands below do not clone
+                    /// file-by-file. What the disk cannot persist (anything but a part a ReplicatedMergeTree table
+                    /// commits: DETACH, FREEZE, a fetch into `detached/`, a MOVE to another disk) is refused by the
+                    /// disk itself or, for DETACH, by `alterPartition` before it removes anything. `FORGET PARTITION`
+                    /// touches only Keeper; `EXPORT PARTITION` only reads parts.
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
                         PartitionCommand::DROP_DETACHED_PARTITION,
@@ -7458,6 +7415,14 @@ Pipe MergeTreeData::alterPartition(
     /// because partition commands (DROP, MOVE, etc.)
     /// must be applied to all parts on disk.
     waitForOutdatedPartsToBeLoaded();
+
+    /// DETACH on a content-addressed disk is refused before it removes anything (a detached copy would have no
+    /// Keeper record); FREEZE is refused by the disk itself when it writes the shadow copy.
+    for (const PartitionCommand & command : commands)
+        if (command.type == PartitionCommand::DROP_PARTITION && command.detach)
+            for (const auto & disk : getDisks())
+                if (disk->isContentAddressed())
+                    throwNotPersistedOnContentAddressedDisk(fmt::format("DETACH (disk '{}')", disk->getName()));
 
     PartitionCommandsResultInfo result;
     for (const PartitionCommand & command : commands)

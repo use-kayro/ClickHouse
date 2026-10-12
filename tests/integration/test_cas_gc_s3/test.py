@@ -8,8 +8,8 @@ cluster = ClickHouseCluster(__file__)
 
 STORAGE_POLICY = "cas_gc_s3"
 
-# Endpoint is http://rustfs1:11121/test/cas_gc_data/, so the pool's content blobs live under this prefix of
-# the `test` RustFS bucket (each with a `.meta` sidecar next to it).
+# Endpoint is http://rustfs1:11121/test/cas_gc_data/, so the pool's blobs live under this prefix of the `test`
+# RustFS bucket. Since TEC-851 step 3c a blob body is the only object the pool holds (no `.meta` sidecar).
 BLOBS_PREFIX = "cas_gc_data/blobs/"
 
 # Enough rows / inserts to materialise several distinct blobs in the pool.
@@ -43,7 +43,7 @@ def start_cluster():
 
 def blob_keys():
     objects = cluster.rustfs_client.list_objects(cluster.rustfs_bucket, BLOBS_PREFIX, recursive=True)
-    return {o.object_name for o in objects if not o.object_name.endswith(".meta")}
+    return {o.object_name for o in objects}
 
 
 def gc_log_scalar(node, query):
@@ -53,8 +53,8 @@ def gc_log_scalar(node, query):
 
 def test_gc_reclaims_dropped_blobs():
     """
-    The background GC reclaims the blobs of a dropped partition, from the parts' Keeper records alone: the
-    only listing a round does is the heartbeat floor's `gc/server-roots/`.
+    The background GC reclaims the blobs of a dropped partition, from the parts' Keeper records alone, and a
+    round lists nothing (TEC-851 step 3c: no heartbeat floor, no server roots).
     """
     node = cluster.instances["node"]
 
@@ -89,8 +89,7 @@ def test_gc_reclaims_dropped_blobs():
 
     node.query("ALTER TABLE cas_gc_test DROP PARTITION 1")
 
-    # Every blob the inserts (and the merges of their parts) wrote goes. DROP's empty covering part is a local
-    # part with no record: its blob (the one every empty file hashes to) is not the GC's to reclaim.
+    # Every blob the inserts (and the merges of their parts) wrote goes.
     left = inserted & blob_keys()
     for _ in range(RECLAIM_RETRIES):
         if not left:
@@ -106,20 +105,12 @@ def test_gc_reclaims_dropped_blobs():
         node,
         "SELECT sum(objects_deleted) FROM system.cas_gc_log WHERE event_type = 'Finish' AND event_time >= '{}'".format(since),
     ) > 0
-    # The heartbeat floor's one LIST is the only listing on the GC path.
+    # No round lists the pool.
     node.query("SYSTEM FLUSH LOGS")
-    over_budget = node.query(
-        """
-        SELECT round_id,
-               sumIf(ProfileEvents['S3ListObjects'], event_type = 'Finish') AS total,
-               sumIf(ProfileEvents['S3ListObjects'], event_type = 'Phase' AND phase = 'heartbeat_floor') AS floor
-        FROM system.cas_gc_log
-        WHERE round_id IN (SELECT round_id FROM system.cas_gc_log WHERE event_type = 'Finish' AND event_time >= '{}')
-        GROUP BY round_id
-        HAVING total != floor
-        FORMAT TSV
-        """.format(since)
-    )
-    assert not over_budget.strip(), over_budget
+    listed = node.query(
+        "SELECT sum(ProfileEvents['S3ListObjects']) FROM system.cas_gc_log "
+        "WHERE event_type = 'Finish' AND event_time >= '{}'".format(since)
+    ).strip()
+    assert listed in ("0", ""), listed
 
     node.query("DROP TABLE cas_gc_test SYNC")

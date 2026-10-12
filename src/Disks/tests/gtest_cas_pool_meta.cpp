@@ -11,6 +11,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int NETWORK_ERROR;
 }
 }
@@ -41,8 +42,18 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     auto create_op = requests.admit();
     const PoolMeta created = PoolMeta::createOrValidate(
         create_op, layout, /*blob_header_len=*/256,
-        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
+        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*writer=*/true);
     EXPECT_EQ(created.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
+
+    /// Only the writer admits a new algo: elsewhere `allow_new` is refused before any write.
+    {
+        auto reader_op = requests.admit();
+        expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+        {
+            (void)PoolMeta::createOrValidate(
+                reader_op, layout, 256, BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*writer=*/false);
+        });
+    }
 
     /// Rig the key permanently hot: every write attempt races a concurrent rewrite of the SAME
     /// content, so the object's incarnation moves under every attempt and admission of a new algo
@@ -71,7 +82,7 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     {
         (void)PoolMeta::createOrValidate(
             admit_op, layout, 256,
-            BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
+            BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*writer=*/true);
     });
     /// Bounded by the deadline, not a live-lock: it paced its retries rather than spinning.
     EXPECT_FALSE(clock.sleeps.empty());

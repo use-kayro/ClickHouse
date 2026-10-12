@@ -257,8 +257,7 @@ void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, b
     attachNoDescription<StorageSystemProjectionPartsColumns>(context, system_database, "projection_parts_columns", "Contains a list of columns of all currently existing projection parts of all MergeTree tables. Each column is represented by a single row.");
     attachNoDescription<StorageSystemDisks>(context, system_database, "disks", "Contains information about disks defined in the server configuration.");
     attachNoDescription<StorageSystemContentAddressedMounts>(context, system_database, "cas_mounts",
-        "One row per content-addressed (CAS) mount slot: live lease state per server root id — who holds "
-        "which slot, renewal health, fenced/terminated state.");
+        "One row per content-addressed (CAS) disk of this server: the health of its GC.");
     attachNoDescription<StorageSystemStoragePolicies>(context, system_database, "storage_policies", "Contains information about storage policies and volumes defined in the server configuration.");
     attach<StorageSystemProcesses>(context, system_database, "processes", "Contains a list of currently executing processes (queries) with their progress.");
     attach<StorageSystemMetrics>(context, system_database, "metrics", "Contains metrics which can be calculated instantly, or have a current value. For example, the number of simultaneously processed queries or the current replica delay. This table is always up to date.");

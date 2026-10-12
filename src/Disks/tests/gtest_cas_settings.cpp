@@ -23,10 +23,9 @@ namespace DB::ErrorCodes
 namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsBool gc_enabled;
-    extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
+    extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsString scratch_path;
-    extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
 }
 
 namespace
@@ -101,10 +100,10 @@ void expectLoadFailureWithExactMessage(const String & config, int code, const St
 
 TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
 {
-    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_meta_pool_size>4</cas_gc_meta_pool_size>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_attempt_timeout_ms>4</cas_attempt_timeout_ms>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
-    EXPECT_EQ(s[ContentAddressedSetting::gc_meta_pool_size].value, 4u);
+    EXPECT_EQ(s[ContentAddressedSetting::attempt_timeout_ms].value, 4u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
     /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
@@ -165,7 +164,7 @@ TEST(CASContentAddressedSettings, UnknownKeyRejected)
 TEST(CASContentAddressedSettings, MissingRequiredSettingNamesExternalConfigKey)
 {
     expectLoadFailureWithExactMessage(
-        "<cas_gc_meta_pool_size>1</cas_gc_meta_pool_size>",
+        "<cas_attempt_timeout_ms>1</cas_attempt_timeout_ms>",
         ErrorCodes::NO_ELEMENTS_IN_CONFIG,
         "Expected `cas_server_root_id` in config for a content-addressed disk");
 }
@@ -184,10 +183,6 @@ TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)
         "<cas_server_root_id>srv1</cas_server_root_id><cas_blob_hash>md5</cas_blob_hash>",
         ErrorCodes::BAD_ARGUMENTS,
         "parseBlobHashAlgo: unknown cas_blob_hash config value 'md5' (expected one of cityhash128|xxh3-128|sha256)");
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_staging_backend>remote</cas_staging_backend>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_staging_backend value 'remote' (expected 'local' or 's3')");
 }
 
 /// The point of this test is that none of these names appears anywhere in CAS code. It is not an
@@ -216,17 +211,17 @@ TEST(CASContentAddressedSettings, ForeignKeysAreNeverInspected)
 
 TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
 {
-    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_meta_pool_size>4</gc_meta_pool_size>");
+    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><attempt_timeout_ms>4</attempt_timeout_ms>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
-    EXPECT_EQ(s[ContentAddressedSetting::gc_meta_pool_size].value, 4u);
+    EXPECT_EQ(s[ContentAddressedSetting::attempt_timeout_ms].value, 4u);
 }
 
 TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<gc_meta_pool_size>4</gc_meta_pool_size><gc_interval_sec>7</gc_interval_sec>");
+        "<attempt_timeout_ms>4</attempt_timeout_ms><gc_interval_sec>7</gc_interval_sec>");
     ContentAddressedSettings s;
     String captured;
     {
@@ -234,16 +229,16 @@ TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)
         s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
         captured = capture.captured();
     }
-    EXPECT_EQ(s[ContentAddressedSetting::gc_meta_pool_size].value, 4u);
+    EXPECT_EQ(s[ContentAddressedSetting::attempt_timeout_ms].value, 4u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 7u);
     EXPECT_EQ(countOccurrences(captured, "superseded unprefixed spelling"), 1u);
-    EXPECT_NE(captured.find("gc_meta_pool_size"), String::npos);
+    EXPECT_NE(captured.find("attempt_timeout_ms"), String::npos);
     EXPECT_NE(captured.find("gc_interval_sec"), String::npos);
 }
 
 TEST(CASContentAddressedSettings, FullyMigratedBlockWarnsAboutNothing)
 {
-    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_meta_pool_size>4</cas_gc_meta_pool_size>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_attempt_timeout_ms>4</cas_attempt_timeout_ms>");
     ContentAddressedSettings s;
     ScopedCasSettingsLogCapture capture;
     s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
@@ -254,7 +249,7 @@ TEST(CASContentAddressedSettings, BothSpellingsOfOneSettingRejected)
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_meta_pool_size>4</cas_gc_meta_pool_size><gc_meta_pool_size>8</gc_meta_pool_size>");
+        "<cas_attempt_timeout_ms>4</cas_attempt_timeout_ms><attempt_timeout_ms>8</attempt_timeout_ms>");
     ContentAddressedSettings s;
     try
     {
@@ -271,7 +266,7 @@ TEST(CASContentAddressedSettings, MalformedRepeatedPrefixedKeyIsRejectedBeforePa
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_meta_pool_size>not-a-number</cas_gc_meta_pool_size><cas_gc_meta_pool_size>8</cas_gc_meta_pool_size>");
+        "<cas_attempt_timeout_ms>not-a-number</cas_attempt_timeout_ms><cas_attempt_timeout_ms>8</cas_attempt_timeout_ms>");
     ContentAddressedSettings s;
     try
     {
@@ -289,7 +284,7 @@ TEST(CASContentAddressedSettings, MalformedPrefixedValueCannotMaskBothSpellingsC
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_meta_pool_size>not-a-number</cas_gc_meta_pool_size><gc_meta_pool_size>8</gc_meta_pool_size>");
+        "<cas_attempt_timeout_ms>not-a-number</cas_attempt_timeout_ms><attempt_timeout_ms>8</attempt_timeout_ms>");
     ContentAddressedSettings s;
     try
     {
@@ -307,7 +302,7 @@ TEST(CASContentAddressedSettings, AmbiguousConfigDoesNotWarnOrPartiallyApplySett
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_meta_pool_size>4</cas_gc_meta_pool_size><gc_meta_pool_size>8</gc_meta_pool_size>");
+        "<cas_attempt_timeout_ms>4</cas_attempt_timeout_ms><attempt_timeout_ms>8</attempt_timeout_ms>");
     ContentAddressedSettings s;
     String captured;
     {
@@ -316,13 +311,13 @@ TEST(CASContentAddressedSettings, AmbiguousConfigDoesNotWarnOrPartiallyApplySett
         captured = capture.captured();
     }
     EXPECT_EQ(captured.find("are applied"), String::npos);
-    EXPECT_FALSE(s[ContentAddressedSetting::gc_meta_pool_size].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::attempt_timeout_ms].changed);
 }
 
 TEST(CASContentAddressedSettings, UnknownPrefixedKeyDoesNotWarnOrPartiallyApplySettings)
 {
     auto cfg = makeConfig(
-        "<cas_gc_meta_pool_size>3</cas_gc_meta_pool_size><gc_enabled>0</gc_enabled>"
+        "<cas_attempt_timeout_ms>3</cas_attempt_timeout_ms><gc_enabled>0</gc_enabled>"
         "<cas_gc_meta_pool_sizz>8</cas_gc_meta_pool_sizz>");
     ContentAddressedSettings s;
     String captured;
@@ -340,14 +335,14 @@ TEST(CASContentAddressedSettings, UnknownPrefixedKeyDoesNotWarnOrPartiallyApplyS
         captured = capture.captured();
     }
     EXPECT_EQ(captured.find("are applied"), String::npos);
-    EXPECT_FALSE(s[ContentAddressedSetting::gc_meta_pool_size].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::attempt_timeout_ms].changed);
     EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
 }
 
 TEST(CASContentAddressedSettings, MalformedPrefixedKeyDoesNotWarnOrPartiallyApplySettings)
 {
     auto cfg = makeConfig(
-        "<cas_gc_meta_pool_size>3</cas_gc_meta_pool_size><gc_enabled>0</gc_enabled>"
+        "<cas_attempt_timeout_ms>3</cas_attempt_timeout_ms><gc_enabled>0</gc_enabled>"
         "<cas_gc_interval_sec>not-a-number</cas_gc_interval_sec>");
     ContentAddressedSettings s;
     String captured;
@@ -364,18 +359,18 @@ TEST(CASContentAddressedSettings, MalformedPrefixedKeyDoesNotWarnOrPartiallyAppl
         captured = capture.captured();
     }
     EXPECT_EQ(captured.find("are applied"), String::npos);
-    EXPECT_FALSE(s[ContentAddressedSetting::gc_meta_pool_size].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::attempt_timeout_ms].changed);
     EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
 }
 
 TEST(CASContentAddressedSettings, ValidMixedConfigCommitsAfterAllValuesValidate)
 {
     auto cfg = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_meta_pool_size>3</cas_gc_meta_pool_size>"
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_attempt_timeout_ms>3</cas_attempt_timeout_ms>"
         "<gc_enabled>0</gc_enabled>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
-    EXPECT_EQ(s[ContentAddressedSetting::gc_meta_pool_size].value, 3u);
+    EXPECT_EQ(s[ContentAddressedSetting::attempt_timeout_ms].value, 3u);
     EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].value);
 }
 
@@ -431,7 +426,7 @@ TEST(CASContentAddressedSettings, InvalidEnumDoesNotWarnOrPartiallyApplySettings
 /// recognized by its base name rather than passed over as foreign, or the first value would silently win.
 TEST(CASContentAddressedSettings, RepeatedKeyRejectedInEitherSpelling)
 {
-    for (const std::string & spelling : {std::string("gc_meta_pool_size"), std::string("cas_gc_meta_pool_size")})
+    for (const std::string & spelling : {std::string("attempt_timeout_ms"), std::string("cas_attempt_timeout_ms")})
     {
         SCOPED_TRACE(spelling);
         auto cfg = makeConfig(
@@ -448,30 +443,6 @@ TEST(CASContentAddressedSettings, RepeatedKeyRejectedInEitherSpelling)
         {
             EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
         }
-    }
-}
-
-TEST(CASContentAddressedSettings, SkipAccessCheckKeepsItsBareSpelling)
-{
-    auto with = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<skip_access_check>1</skip_access_check>");
-    ContentAddressedSettings s;
-    s.loadFromConfig(*with, "disk", "/scratch", "/scratch", identity_macros);
-    EXPECT_TRUE(s.skipAccessCheck());
-
-    auto prefixed = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_skip_access_check>1</cas_skip_access_check>");
-    ContentAddressedSettings rejected;
-    try
-    {
-        rejected.loadFromConfig(*prefixed, "disk", "/scratch", "/scratch", identity_macros);
-        FAIL() << "expected `cas_skip_access_check` to be unknown";
-    }
-    catch (const Exception & e)
-    {
-        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
     }
 }
 
@@ -495,7 +466,7 @@ TEST(CASContentAddressedSettings, PrefixedGcsCapIsNotACasSetting)
 TEST(CASContentAddressedSettings, ValidateFailsClosed)
 {
     {
-        auto cfg = makeConfig("<cas_gc_meta_pool_size>1</cas_gc_meta_pool_size>");
+        auto cfg = makeConfig("<cas_attempt_timeout_ms>1</cas_attempt_timeout_ms>");
         ContentAddressedSettings s;
         try
         {
@@ -546,20 +517,4 @@ TEST(CASContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/disks/x/cas_scratch");
-}
-
-TEST(CASContentAddressedSettings, UnsafeRemountNoDelayIsOffByDefault)
-{
-    {
-        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
-        ContentAddressedSettings s;
-        s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
-        EXPECT_FALSE(s[ContentAddressedSetting::unsafe_remount_no_delay].value);
-    }
-    {
-        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_unsafe_remount_no_delay>1</cas_unsafe_remount_no_delay>");
-        ContentAddressedSettings s;
-        s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
-        EXPECT_TRUE(s[ContentAddressedSetting::unsafe_remount_no_delay].value);
-    }
 }

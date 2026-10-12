@@ -12,7 +12,6 @@ CAS_PUBLICATION_EVENTS = (
     "CASBlobHeadMiss",
     "CASBlobPut",
     "CASBlobUploadFanoutTasks",
-    "CASMetaCreateClean",
 )
 
 
@@ -22,6 +21,8 @@ def start_cluster():
         "node",
         main_configs=["configs/storage_conf.xml"],
         with_rustfs=True,
+        with_zookeeper=True,
+        keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
         stay_alive=True,
     )
 
@@ -65,7 +66,8 @@ def test_disk_accepts_backend_settings_that_used_to_be_rejected():
     ).strip() == "1"
     node.query("DROP TABLE IF EXISTS t_foreign_settings SYNC")
     node.query(
-        "CREATE TABLE t_foreign_settings (a UInt64) ENGINE = MergeTree ORDER BY a "
+        "CREATE TABLE t_foreign_settings (a UInt64) "
+        "ENGINE = ReplicatedMergeTree('/clickhouse/tables/t_foreign_settings', 'node') ORDER BY a "
         "SETTINGS storage_policy = '{}'".format(STORAGE_POLICY)
     )
     node.query("INSERT INTO t_foreign_settings SELECT number FROM numbers(100)")
@@ -82,7 +84,7 @@ def test_cas_s3():
         CREATE TABLE cas_test (
             id Int64,
             data String
-        ) ENGINE = MergeTree()
+        ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/cas_test', 'node')
         ORDER BY id
         SETTINGS storage_policy = '{}'
         """.format(
@@ -94,25 +96,17 @@ def test_cas_s3():
     # so process-wide ProfileEvents form an exact request budget for this operation.
     before_fresh = cas_publication_events(node)
     node.query(
-        "INSERT INTO cas_test SELECT number, toString(number) FROM numbers({})".format(
+        "INSERT INTO cas_test SELECT number, toString(number) FROM numbers({}) SETTINGS insert_deduplicate = 0".format(
             NUM_ROWS
         )
     )
     fresh = event_delta(before_fresh, cas_publication_events(node))
+    # TEC-851 step 3c: a blob nothing on this server references is uploaded unconditionally under a fresh
+    # envelope -- one PUT per distinct blob, no HEAD before it, no `.meta` sibling.
     assert fresh["CASBlobUploadFanoutTasks"] > 0, fresh
-    assert (
-        fresh["CASBlobHead"] + fresh["CASBlobHeadMiss"]
-        == fresh["CASBlobUploadFanoutTasks"]
-    ), fresh
-    assert fresh["CASBlobHeadMiss"] == fresh["CASBlobUploadFanoutTasks"], fresh
+    assert fresh["CASBlobPut"] == fresh["CASBlobUploadFanoutTasks"], fresh
+    assert fresh["CASBlobHead"] + fresh["CASBlobHeadMiss"] == 0, fresh
     assert fresh["CASBlobBodyPutAvoided"] == 0, fresh
-    assert fresh["CASMetaCreateClean"] == fresh["CASBlobUploadFanoutTasks"], fresh
-    # `CASBlobPut` is namespace/path instrumentation: both the body and its `.meta` sibling live
-    # below `/blobs/`, so a fresh publication contributes exactly those two physical PUTs.
-    assert (
-        fresh["CASBlobPut"]
-        == fresh["CASBlobUploadFanoutTasks"] + fresh["CASMetaCreateClean"]
-    ), fresh
 
     expected_sum = (NUM_ROWS - 1) * NUM_ROWS // 2
     assert int(node.query("SELECT count() FROM cas_test")) == NUM_ROWS
@@ -122,21 +116,16 @@ def test_cas_s3():
     # content-addressed disk deduplicates the blobs, but the logical row count must still double.
     before_duplicate = cas_publication_events(node)
     node.query(
-        "INSERT INTO cas_test SELECT number, toString(number) FROM numbers({})".format(
+        "INSERT INTO cas_test SELECT number, toString(number) FROM numbers({}) SETTINGS insert_deduplicate = 0".format(
             NUM_ROWS
         )
     )
     duplicate = event_delta(before_duplicate, cas_publication_events(node))
+    # Every blob is referenced by the first part this server holds: adopted with no request at all.
     assert duplicate["CASBlobUploadFanoutTasks"] > 0, duplicate
-    assert (
-        duplicate["CASBlobHead"] + duplicate["CASBlobHeadMiss"]
-        == duplicate["CASBlobUploadFanoutTasks"]
-    ), duplicate
-    assert duplicate["CASBlobHead"] == duplicate["CASBlobUploadFanoutTasks"], duplicate
-    assert duplicate["CASBlobHeadMiss"] == 0, duplicate
     assert duplicate["CASBlobPut"] == 0, duplicate
-    assert duplicate["CASBlobBodyPutAvoided"] == duplicate["CASBlobHead"], duplicate
-    assert duplicate["CASMetaCreateClean"] == 0, duplicate
+    assert duplicate["CASBlobHead"] + duplicate["CASBlobHeadMiss"] == 0, duplicate
+    assert duplicate["CASBlobBodyPutAvoided"] == duplicate["CASBlobUploadFanoutTasks"], duplicate
     assert int(node.query("SELECT count() FROM cas_test")) == 2 * NUM_ROWS
     assert int(node.query("SELECT sum(id) FROM cas_test")) == 2 * expected_sum
 
@@ -145,13 +134,13 @@ def test_cas_s3():
     assert int(node.query("SELECT count() FROM cas_test")) == 2 * NUM_ROWS
     assert int(node.query("SELECT sum(id) FROM cas_test")) == 2 * expected_sum
 
-    # Persistence: after a restart the refs/footers/blobs in S3 must still resolve the data.
+    # Persistence: after a restart the parts are re-attached from their Keeper records over the blobs in S3.
     node.restart_clickhouse()
 
     assert int(node.query("SELECT count() FROM cas_test")) == 2 * NUM_ROWS
     assert int(node.query("SELECT sum(id) FROM cas_test")) == 2 * expected_sum
 
-    # Drop must complete without error (ref unlink + deferred GC).
+    # Drop must complete without error (the parts are forgotten; their blobs go through the record GC).
     node.query("DROP TABLE cas_test SYNC")
     assert (
         node.query(
@@ -162,8 +151,8 @@ def test_cas_s3():
 
 
 def test_mutations_and_patch_parts_survive_restart():
-    # A mutated part and a patch part are ordinary content-addressed parts published as refs. After a
-    # restart the active set must be rediscovered from the refs in S3, so the post-mutation /
+    # A mutated part and a patch part are ordinary content-addressed parts with Keeper records. After a
+    # restart the active set is re-attached from the records, so the post-mutation /
     # post-lightweight-delete state must survive (CAS M7).
     node = cluster.instances["node"]
 
@@ -174,7 +163,7 @@ def test_mutations_and_patch_parts_survive_restart():
             id Int64,
             v UInt64,
             s String
-        ) ENGINE = MergeTree()
+        ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/cas_mut', 'node')
         ORDER BY id
         SETTINGS storage_policy = '{}', enable_block_number_column = 1, enable_block_offset_column = 1
         """.format(
@@ -207,7 +196,7 @@ def test_mutations_and_patch_parts_survive_restart():
     sum_before = int(node.query("SELECT sum(v) FROM cas_mut"))
     digest_before = node.query("SELECT sum(cityHash64(id, v, s)) FROM cas_mut").strip()
 
-    # Persistence: rediscover the active set (incl. the mutated and patch parts) from S3 refs.
+    # Persistence: re-attach the active set (incl. the mutated and patch parts) from the Keeper records.
     node.restart_clickhouse()
 
     assert int(node.query("SELECT count() FROM cas_mut")) == count_before

@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
+#include <Common/tests/gtest_global_context.h>
 #include <base/scope_guard.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -39,13 +38,18 @@ using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::expectThrowsCode;
 
+namespace DB::ContentAddressedSetting
+{
+extern const ContentAddressedSettingsBool gc_enabled;
+}
+
 namespace
 {
 
 PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConfig config = {})
 {
     config.pool_prefix = "p";
-    config.server_root_id = "test";
+    config.writer = true;
     return Pool::open(backend, config);
 }
 
@@ -89,44 +93,58 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage()
     const auto scratch = std::filesystem::temp_directory_path()
         / ("cas_gc_teardown_stop_scratch_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1)));
     auto settings = DB::Cas::tests::makeSettingsForTest("test", scratch);
+    /// No background scheduler: the test drives every round itself.
+    settings[DB::ContentAddressedSetting::gc_enabled] = false;
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", getContext().context, settings);
     storage->startup();
     return storage;
 }
 
-/// The record source of one table this server writes, with no part on the disk: a round reads it and
-/// runs as the writer, so it goes on to issue requests after its `keeper_records` phase.
-class WriterWithNoRecords : public DB::ICasKeeperRecordSource
+/// The record source of one table this server writes, holding one record whose part no replica lists,
+/// with no retention: the first round marks it, the second removes it and leaves its blob pending, so
+/// that round goes on to issue a request (the pending blob's HEAD) after its `keeper_records` phase.
+class WriterWithOneUnlistedRecord : public DB::ICasKeeperRecordSource
 {
 public:
-    DB::CasKeeperRecordSnapshot snapshotCasRecords(const DB::IContentAddressedExchange &) override
+    DB::CasKeeperRecordSnapshot snapshotCasRecords(const DB::IContentAddressedExchange &) override { return snapshot(); }
+    DB::Strings markCasRecords(const std::vector<const DB::CasKeeperRecordState *> & records) override { return parts(records); }
+    DB::Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> & records) override
+    {
+        return parts(records);
+    }
+
+    static DB::CasKeeperRecordSnapshot snapshot()
     {
         DB::CasKeeperRecordSnapshot snapshot;
         snapshot.writer = true;
+        snapshot.records.push_back({.part = "all_1_1_0", .data = "record", .blobs = {{"data.bin", 1, UInt128(42)}},
+                                    .listed = false, .version = 0, .mtime_ms = 0});
         return snapshot;
     }
-    DB::Strings markCasRecords(const std::vector<const DB::CasKeeperRecordState *> &) override { return {}; }
-    DB::Strings removeCasRecords(const DB::CasKeeperRecordSnapshot &, const std::vector<const DB::CasKeeperRecordState *> &) override
+
+private:
+    static DB::Strings parts(const std::vector<const DB::CasKeeperRecordState *> & records)
     {
-        return {};
+        DB::Strings out;
+        for (const auto * record : records)
+            out.push_back(record->part);
+        return out;
     }
 };
 
 KeeperRecordTablesFn writerSources()
 {
-    return [source = std::make_shared<WriterWithNoRecords>()]
+    return [source = std::make_shared<WriterWithOneUnlistedRecord>()]
     {
-        DB::CasKeeperRecordSnapshot snapshot;
-        snapshot.writer = true;
-        return std::optional<KeeperRecordTables>(KeeperRecordTables{{source, snapshot}});
+        return std::optional<KeeperRecordTables>(KeeperRecordTables{{source, WriterWithOneUnlistedRecord::snapshot()}});
     };
 }
 
-/// The disk's tables, as a provider: one table this server writes, with no part on the disk.
+/// The disk's tables, as a provider: the one table above.
 std::optional<std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>> oneWriterTable(const DB::IContentAddressedExchange &)
 {
-    static const auto source = std::make_shared<WriterWithNoRecords>();
+    static const auto source = std::make_shared<WriterWithOneUnlistedRecord>();
     return std::vector<std::shared_ptr<DB::ICasKeeperRecordSource>>{source};
 }
 
@@ -191,29 +209,10 @@ size_t countStarts(const std::vector<GcRoundLogRecord> & rows)
 
 }
 
-/// The arm is idempotent, observable, and closes the door to new detached work; a drain after an
-/// early arm has nothing to wait for.
-TEST(CASGCTeardownStop, BeginTeardownIsIdempotentAndRefusesNewDetachedWork)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPlainPool(backend);
-
-    EXPECT_FALSE(store->teardownBegun());
-    store->beginTeardown();
-    EXPECT_TRUE(store->teardownBegun());
-    store->beginTeardown();
-    EXPECT_TRUE(store->teardownBegun()) << "a second arm changes nothing";
-    EXPECT_TRUE(store->detachedWorkStoppingForTest());
-
-    EXPECT_FALSE(store->tryDispatchDetached([](DetachedStopToken) {}))
-        << "no detached task is accepted once teardown began";
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/1000))
-        << "the drain after an early arm finds nothing in flight and returns at once";
-}
-
-/// The open plane -- GC, FSCK, the probe -- refuses after the arm, before anything reaches the
-/// backend; the mount plane, which the ref-lane drain and the farewell need alive, does not.
-TEST(CASGCTeardownStop, OpenPlaneRefusesAfterTeardownBeganAndTheMountPlaneDoesNot)
+/// The exact delete GC issues runs on the same open plane as `read` above, so a delete issued after the
+/// disk's shutdown (which arms teardown on this plane before the object storage's own `shutdown()` even
+/// runs, see `DiskObjectStorage::shutdown()`) is refused at admission and never reaches the backend.
+TEST(CASGCTeardownStop, RemoveIsRefusedAfterTeardownBeganAndNeverReachesTheBackend)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPlainPool(backend);
@@ -224,50 +223,16 @@ TEST(CASGCTeardownStop, OpenPlaneRefusesAfterTeardownBeganAndTheMountPlaneDoesNo
     backend->resetCounts();
 
     store->beginTeardown();
-
-    CasOperation refused = store->openRequests().admit();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)refused.read("p/probe", Retry::standard()); });
-    CasOperation resumed = store->openRequests().resume(/*admitted_generation=*/0);
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)resumed.read("p/probe", Retry::standard()); });
-    EXPECT_EQ(backend->getTotal(), 0u) << "a refused admission never reaches the backend";
-
-    CasOperation mount = store->mountRequests().admit();
-    ASSERT_TRUE(mount.read("p/probe", Retry::once()).has_value())
-        << "the mount plane is not the open plane: teardown's own drain and farewell run on it";
-    EXPECT_EQ(backend->getTotal(), 1u);
-}
-
-/// `removeManyWriteOnce` -- the verb the CAS GC bulk-delete phases call, and the one an
-/// `S3ObjectStorage`-backed pool ultimately dispatches to `removeObjectsIfExistUnderProfile` -- runs on
-/// the same open plane as `read` above, so a control-plane bulk delete issued after the disk's shutdown
-/// (which arms teardown on this plane before the object storage's own `shutdown()` even runs, see
-/// `DiskObjectStorage::shutdown()`) is refused at admission and never reaches the backend at all.
-TEST(CASGCTeardownStop, RemoveManyWriteOnceIsRefusedAfterTeardownBeganAndNeverReachesTheBackend)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPlainPool(backend);
-    {
-        CasOperation op = store->openRequests().admit();
-        orThrow(op.create("p/probe", "v", Retry::once()), "create");
-    }
-    backend->resetCounts();
-
-    store->beginTeardown();
-
-    const Layout layout{"p"};
-    const ManifestId manifest_id{RootNamespace{"probe/ns@cas@"},
-        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1}};
 
     CasOperation refused = store->openRequests().admit();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        refused.removeManyWriteOnce({layout.writeOnceManifestKey(manifest_id)}, Retry::standard());
+        refused.removeCurrent("p/probe", Retry::standard());
     });
-    EXPECT_EQ(backend->deleteTotal(), 0u) << "a refused admission never reaches the backend, not even for one key";
+    EXPECT_EQ(backend->deleteTotal(), 0u) << "a refused admission never reaches the backend";
 }
 
-/// The open plane's sleep is the interruptible one, in production wiring and after the test seam is
-/// cleared. Arming FIRST makes this a wiring test: a predicate `wait_for` whose predicate already
+/// The open plane's sleep is the interruptible one. Arming FIRST makes this a wiring test: a predicate `wait_for` whose predicate already
 /// holds returns without waiting, so a plane still wired to the plain sleep cannot pass. The deadline
 /// is the assertion; no sleep orders any thread.
 TEST(CASGCTeardownStop, OpenPlaneSleepReturnsAtOnceOnceTeardownBegan)
@@ -279,13 +244,6 @@ TEST(CASGCTeardownStop, OpenPlaneSleepReturnsAtOnceOnceTeardownBegan)
     auto paused = std::async(std::launch::async, [&store] { store->openRequests().pause(60'000); });
     EXPECT_EQ(paused.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "the open plane's sleep must observe the arm; a plain sleep holds for the full minute";
-
-    /// Clearing the seam must put the interruptible sleep back, not the engine's plain one.
-    store->setCasRetrySleepForTest([](uint64_t) {});
-    store->setCasRetrySleepForTest({});
-    auto paused_again = std::async(std::launch::async, [&store] { store->openRequests().pause(60'000); });
-    EXPECT_EQ(paused_again.wait_for(std::chrono::seconds(10)), std::future_status::ready)
-        << "resetting the retry-sleep seam left the open plane on the plain sleep";
 }
 
 /// The defect itself: `shutdown` waits behind `gc_scheduler_mutex`, which a synchronous round holds
@@ -303,8 +261,10 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
     auto parked = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
+    std::atomic<bool> park{false};
     std::mutex rows_mutex;
     std::vector<GcRoundLogRecord> rows;
+    /// Installed before the first round: the scheduler takes its row sink when it is created.
     storage->setGcRoundRowHookForTest([&](const GcRoundLogRecord & r)
     {
         {
@@ -312,13 +272,19 @@ TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
             rows.push_back(r);
         }
         /// Park on the `keeper_records` phase row: the round holds `gc_scheduler_mutex` and, as the
-        /// writer, has requests ahead of it.
-        if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records")
+        /// writer with a blob to delete, has a request ahead of it.
+        if (park && r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records")
         {
             parked->open();
             release->wait("release");
         }
     });
+    storage->runOneGcRoundForTest();   /// marks the record: the next round has a pending blob to HEAD
+    {
+        std::lock_guard lock(rows_mutex);
+        rows.clear();
+    }
+    park = true;
 
     auto round = std::async(std::launch::async, [&storage] { storage->runOneGcRoundForTest(); });
     parked->wait("parked");
@@ -357,12 +323,13 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
     auto entered = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
-    std::atomic<bool> park{true};
+    /// Park on the SECOND round's `keeper_records`: the first marks the record, the second has its blob to HEAD.
+    std::atomic<int> rounds_to_park{2};
     CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", writerSources(),
-        [log = sink.logger(), &park, entered, release](const GcRoundLogRecord & r)
+        [log = sink.logger(), &rounds_to_park, entered, release](const GcRoundLogRecord & r)
         {
             log(r);
-            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && park.exchange(false))
+            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && --rounds_to_park == 0)
             {
                 entered->open();
                 release->wait("release");
@@ -371,19 +338,20 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
 
     sched.start();
     entered->wait("entered");
+    const size_t parked_round_rows_from = sink.all().size();   /// past the first round's Finish
 
     store->beginTeardown();
     const uint64_t requests_at_arm = requestsTotal(*backend);
     release->open();
 
-    const auto finish = sink.waitForFinish(/*from=*/0, std::chrono::seconds(30));
+    const auto finish = sink.waitForFinish(parked_round_rows_from, std::chrono::seconds(30));
     ASSERT_TRUE(finish.has_value()) << "the parked round never finished";
     EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped);
     sched.stop();
     EXPECT_TRUE(sched.isQuiescent());
     EXPECT_EQ(requestsTotal(*backend), requests_at_arm)
         << "after the arm no request may reach the backend: the round unwinds at the next gate";
-    EXPECT_EQ(countStarts(sink.all()), 1u) << "no further round started after the arm";
+    EXPECT_EQ(countStarts(sink.all()), 2u) << "no further round started after the arm";
 }
 
 /// The tick queued behind a manual round must not mint a Start row after the arm: it checks the
@@ -396,19 +364,21 @@ TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
     auto entered = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
-    std::atomic<bool> park{true};
+    /// Park on the SECOND round's `keeper_records`: the first marks the record, the second has its blob to HEAD.
+    std::atomic<int> rounds_to_park{2};
     /// An hour-long interval: the loop ticks only when asked.
     CasGcScheduler sched(store, std::chrono::seconds(3600), "test::gc", "ca", writerSources(),
-        [log = sink.logger(), &park, entered, release](const GcRoundLogRecord & r)
+        [log = sink.logger(), &rounds_to_park, entered, release](const GcRoundLogRecord & r)
         {
             log(r);
-            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && park.exchange(false))
+            if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "keeper_records" && --rounds_to_park == 0)
             {
                 entered->open();
                 release->wait("release");
             }
         });
     sched.start();
+    (void)sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual);   /// marks the record
 
     auto manual = std::async(std::launch::async,
                              [&sched] { return sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual); });
@@ -422,5 +392,5 @@ TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
     EXPECT_THROW((void)manual.get(), DB::Exception);
     sched.stop();
     const auto rows = sink.all();
-    EXPECT_EQ(countStarts(rows), 1u) << "the queued tick minted a Start row after teardown began";
+    EXPECT_EQ(countStarts(rows), 2u) << "the queued tick minted a Start row after teardown began";
 }

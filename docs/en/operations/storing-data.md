@@ -456,13 +456,13 @@ Starting from `24.5` it is possible to configure any object storage disk
 
 Setting `metadata_type` to `cas` turns a disk into a content-addressed (CAS) disk: every
 object is addressed by the hash of its content rather than by a randomly generated blob name, so
-identical content written by different parts (or different tables) is stored once and shared. A
-background garbage collector reclaims objects once no part references them anymore; see
-[`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run),
-[`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member),
-and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
-[`system.cas_mounts`](/operations/system-tables/cas_mounts), and
-[`system.cas_log`](/operations/system-tables/cas_log) system tables. See the
+identical content written by different parts (or different tables) is stored once and shared. Only
+`ReplicatedMergeTree` tables can use it: a part's metadata is its Keeper record, and the object store
+holds only the blobs. A garbage collector on the server that writes the blobs reclaims them once no
+record references them; see
+[`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run) and the
+[`system.cas_gc_log`](/operations/system-tables/cas_gc_log) and
+[`system.cas_mounts`](/operations/system-tables/cas_mounts) system tables. See the
 [content-addressed storage documentation](/antalya/cas) for the architecture, operations
 runbooks, and a live-validated quick start.
 
@@ -482,11 +482,9 @@ reason explained under
 
     <cas_server_root_id>server-{replica}</cas_server_root_id>
     <cas_scratch_path>disks/s3_cas/cas_scratch/</cas_scratch_path>
-    <cas_staging_backend>local</cas_staging_backend>
     <cas_blob_hash>cityhash128</cas_blob_hash>
     <cas_gc_enabled>true</cas_gc_enabled>
     <cas_gc_interval_sec>60</cas_gc_interval_sec>
-    <cas_part_folder_cache_bytes>67108864</cas_part_folder_cache_bytes>
 </s3_cas>
 ```
 
@@ -511,42 +509,21 @@ disk-level and server-level settings surface.
   is committed to the pool (never the object-storage key prefix). Defaults to
   `<clickhouse-path>/disks/<disk_name>/cas_scratch/`. A relative override is anchored to the server
   data path, not the process's current working directory.
-- `cas_staging_backend` — `local` (default) or `s3`. Selects where in-flight part data is staged before
-  being committed into the pool; `local` is byte-for-byte the original write path, `s3` enables
-  S3-native staging. A writable disk configured with `s3` must support native same-store copy and
-  fails closed instead of falling back to client-side copy.
 - `cas_blob_hash` — `cityhash128` (default), `xxh3-128`, or `sha256`. Selects the pool's blob
   content-hash function. The choice is fixed at pool creation; a reopen whose `cas_blob_hash` disagrees
   with the pool's recorded algorithm fails closed. See
   [choosing `cas_blob_hash`](/antalya/cas/configuration#choosing-blob-hash) for the trade-offs between
   the three.
-- `cas_blob_hash_allow_new` — `false` by default. Admits a new hash algorithm into an existing pool's set
+- `cas_blob_hash_allow_new` — `false` by default. On the pool's writer, admits a new hash algorithm into an existing pool's set
   of recorded algorithms; without it, a `cas_blob_hash` that disagrees with what the pool already recorded
   fails closed instead of silently turning the pool mixed-algorithm.
 - `cas_gc_enabled` — `true` by default. Enables the background garbage collector for this disk.
 - `cas_gc_interval_sec` — `60` by default; must be `>= 1`. Interval between background GC rounds.
-- Every physical blob materialization starts with `HEAD`. A present non-condemned blob is adopted;
-  an absent or condemned blob is published unconditionally and its freshness metadata is reconciled
-  to `Clean`. A genuine fresh miss issues no metadata GET before publication.
 - `gcs_max_conditional_put_bytes` — `1` GiB by default. Bounds every conditional non-blob `PUT` on
   generation-token backends, where the precondition must survive one request. This includes
   create-if-absent metadata/control artifacts and conditional replacements. Blob bodies do not
   consume a write-response token: their unconditional publication can use ordinary multipart and
   is not subject to this cap. Irrelevant on `ETag`-based backends such as AWS S3.
-- `cas_part_folder_cache_bytes` — `64` MiB by default. Size of the part-folder view cache. `0` disables
-  retention; this is a supported permanent operational configuration, not only a debug aid.
-- `cas_part_folder_cache_max_entries` — `10000` by default. Maximum number of entries in the part-folder
-  view cache.
-- `cas_part_folder_cache_max_entry_bytes` — `16` MiB by default. Maximum size of a single cached
-  part-folder view entry.
-- `cas_manifest_decode_cache_bytes` — `128` MiB by default. Byte bound for the decoded-manifest cache.
-  `0` disables decode caching entirely (a diagnostic mode).
-- `cas_gc_meta_pool_size` — `16` by default. Bounded thread-pool size for the GC's per-hash freshness-meta
-  writes (condemn/spare/delete), so a mass `DROP` condemning millions of blobs does not run fully
-  sequentially.
-- `skip_access_check` — `false` by default. Skips the disk's `CAS` capability probe ("start now,
-  fix later"). The server-level `skip_access_check` flag skips the generic disk access check;
-  this disk key governs the `CAS` capability probe.
 
 ### Using Azure Blob Storage {#azure-blob-storage}
 

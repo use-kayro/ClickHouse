@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <ICommand.h>
 
@@ -16,8 +15,8 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-/// Read-only "decode any object" command: takes the RAW object-storage key (e.g. as printed by
-/// `fsck`) rather than a ClickHouse-relative path, GETs its bytes straight from
+/// Read-only "decode an object" command: takes the RAW object-storage key (`_pool_meta` or a blob key)
+/// rather than a ClickHouse-relative path, GETs its bytes straight from
 /// the pool's backend, and dispatches to `Cas::caInspectToJson` (the same free function the unit
 /// tests exercise directly against encoder output). Never writes; safe to run against a live pool.
 class CommandCaInspect final : public ICommand
@@ -26,7 +25,7 @@ public:
     CommandCaInspect() : ICommand("CommandCaInspect")
     {
         command_name = "cas-inspect";
-        description = "Decode a content-addressed pool object (by its raw object-storage key) to JSON (read-only).";
+        description = "Decode a content-addressed pool object (`_pool_meta` or a blob, by its raw object-storage key) to JSON (read-only).";
         options_description.add_options()("key", po::value<String>(), "the raw object-storage key to decode (mandatory, positional)");
         positional_options_description.add("key", 1);
     }
@@ -48,30 +47,14 @@ public:
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: open the CA disk read-only");
 
-        /// `store()` hands back a snapshot of the pool pointer; `openRequests()`/`layout()` return
-        /// references into that Pool object. Keeping the shared_ptr alive for the whole operation,
-        /// rather than letting each `store()` call's temporary expire, is what keeps those references
-        /// valid and pins both calls to the SAME pool if a concurrent remount swaps it out from under `ca`.
+        /// Kept alive for the whole operation: `openRequests()`/`layout()` return references into it.
         const Cas::PoolPtr pool = ca->store();
         Cas::CasOperation op = pool->openRequests().admit();
         const auto got = op.read(key, Cas::Retry::standard());
         if (!got)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: key '{}' does not exist", key);
 
-        const Cas::Layout & layout = pool->layout();
-        std::optional<Cas::NamespaceLifeId> resolved_life;
-        std::optional<Cas::NamespaceLifePhysicalId> life_id;
-        if (const auto parsed = layout.parseRefObjectKey(key))
-            life_id = parsed->life_id;
-        else if (const auto parsed_ckpt = layout.parseRefCkptKey(key))
-            life_id = *parsed_ckpt;
-        if (life_id)
-        {
-            const Cas::CasRefCatalog::Snapshot cut = Cas::CasRefCatalog::read(op, layout);
-            resolved_life = cut.life_index.resolve(*life_id);
-        }
-
-        std::cout << Cas::caInspectToJson(layout, key, got->bytes, resolved_life) << "\n";
+        std::cout << Cas::caInspectToJson(pool->layout(), key, got->bytes) << "\n";
     }
 };
 

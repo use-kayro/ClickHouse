@@ -15,25 +15,16 @@ namespace DB::Cas
 /// backends. This backend-level chokepoint is needed because background PUTs are not attributable
 /// through the foreground request that scheduled them.
 
-/// Namespace of a CA key, classified by substring of the key path (6 classes; `Server` is currently
-/// unreachable through this classifier — the per-server control subtree lives under
-/// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
-///   <prefix>/blobs/..        → Blob
-///   <prefix>/cas/ns/..        → Root  (immutable streams and point/path-addressed namespace state)
-///   <prefix>/cas/manifests/.. → Manifest
-///   <prefix>/roots/..        → Root  (loose mountpoint objects)
-///   <prefix>/gc/..           → Gc
-///   else (e.g. _pool_meta, _probe) → Other
+/// Class of a CA key, by substring of the key path. The object store holds blobs and `_pool_meta`
+/// only (TEC-851 step 3c), so there are two classes:
+///   <prefix>/blobs/.. → Blob
+///   else (`_pool_meta`, or anything unexpected) → Other
 enum class CasNs : uint8_t
 {
     Blob = 0,
-    Manifest,
-    Root,
-    Gc,
-    Server,
     Other,
 };
-static constexpr size_t CAS_NS_COUNT = 6;
+static constexpr size_t CAS_NS_COUNT = 2;
 
 /// Operation + outcome class, mapped from the `Backend` primitive and its result.
 ///   write, no expected value   → a value ⇒ Put       ; RawConflict ⇒ PutDeduplicated
@@ -64,9 +55,7 @@ enum class CasOp : uint8_t
 };
 static constexpr size_t CAS_OP_COUNT = 11;
 
-/// Classify a key into its namespace by substring. The order is significant where a more specific
-/// layout such as `cas/ns/` must be recognized before a generic fallback; unknown key families
-/// are intentionally counted as `Other`.
+/// Classify a key by substring; anything that is not a blob counts as `Other`.
 CasNs classifyCasNs(const String & key);
 
 /// Increment the `ProfileEvent` corresponding to `(ns, op)`. The row-major table is defined in the
@@ -82,15 +71,7 @@ public:
 
     /// Capability checks are deliberately uninstrumented: they do not represent storage operations.
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
-    void checkSkipAccessCheckSupport() override { inner->checkSkipAccessCheckSupport(); }
     void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
-
-    /// The typed sentinel probe is a diagnostic/authoritative read, not a routine storage operation —
-    /// deliberately uninstrumented (no ProfileEvent), like the capability checks above.
-    SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access) override
-    {
-        return inner->probeSentinelRaw(key, access);
-    }
 
     /// Delegate the read and count it after the inner call succeeds or returns absent. Exceptions
     /// propagate unchanged and therefore do not produce a separate outcome event.
@@ -124,12 +105,6 @@ public:
         incrementCasEvent(classifyCasNs(key), CasOp::Delete);
         return outcome;
     }
-
-    /// Delegate the batch removal, count the request once, and count each key it named as a `Delete`
-    /// in its own namespace class -- the per-key counters say how many keys of each class one request
-    /// carried, the request counter says how many requests it took. Out of line, like `publish`, so
-    /// the header need not declare the `CASBulkDeleteRequests` extern.
-    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
 
     /// Count a create and a replacement separately, and each of them separately from its refusal:
     /// they cost the same one request, but a pool whose creates are mostly refused and one whose

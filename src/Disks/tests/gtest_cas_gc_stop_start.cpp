@@ -1,9 +1,9 @@
+#include <Common/tests/gtest_global_context.h>
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -22,15 +22,13 @@
 #include <unistd.h>
 #include <vector>
 
-/// Task 11 (rev.7 spec §6): `SYSTEM CAS GC STOP` / `GC START` -- granular operator control
-/// of ONLY the background GC scheduler. STOP is STOP-IN-PLACE: it joins the worker + heartbeat threads and
-/// clears the in-process leadership hint, but RETAINS the scheduler object so a later START restarts the
-/// SAME instance (its condemnations preserved). The disk stays fully usable (reads/
-/// writes unaffected) while GC is stopped. START refuses on a decommissioned/uncertain pool (typed 668).
+/// `SYSTEM CAS GC STOP` / `GC START` -- granular operator control of ONLY the background GC scheduler. STOP
+/// is STOP-IN-PLACE: it joins the worker thread and clears the in-process leadership hint, but RETAINS the
+/// scheduler object so a later START restarts the SAME instance (its in-memory state preserved). The disk
+/// stays fully usable (reads/writes unaffected) while GC is stopped.
 ///
 /// These tests exercise the scheduler-level behavior directly (`CasGcScheduler::stop`/`start`) and the
-/// end-to-end verbs through a real `ContentAddressedMetadataStorage`. Harness patterns follow
-/// gtest_cas_forget.cpp and gtest_cas_gc_log.cpp.
+/// end-to-end verbs through a real `ContentAddressedMetadataStorage`.
 
 namespace DB::ErrorCodes
 {
@@ -41,42 +39,20 @@ using namespace DB;
 using DB::Cas::CasGcScheduler;
 using DB::Cas::GcRoundLogRecord;
 using DB::Cas::InMemoryBackend;
-using DB::Cas::PoolLifecycle;
 using DB::Cas::RoundReport;
 using DB::Cas::tests::openPoolForTest;
 
 namespace
 {
 
-/// A live table dir + committed part reused by the "reads/writes unaffected while stopped" test (the shape
-/// gtest_cas_forget.cpp / gtest_cas_operation_gate.cpp use).
+/// A live table dir + committed part reused by the "reads/writes unaffected while stopped" test.
 const std::string kTableDir = "gg0/gg0gg0g0-0808-4808-8808-080808080808";
 const std::string kPartDir = kTableDir + "/all_1_1_0";
 const std::string kPartFile = kPartDir + "/data.bin";
 
-/// The Pool-level `server_root_id` `openPoolForTest` mints (mirrors gtest_cas_lifecycle_condition.cpp).
-const std::string kSrid = "test";
-
-/// GC's fence-out applied directly to the mount lease (preserve the body, set `gc_fenced`, bump `seq`) so a
-/// subsequent `tryRemountOnce` verdicts `Recover` and reclaims a FRESH incarnation immediately (no
-/// lease-expiry wait), driving a transient-not-live pool back to `Live`. Mirrors
-/// gtest_cas_lifecycle_condition.cpp's helper — used by the operator-STOP-persistence test below.
-void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
-{
-    DB::Cas::tests::OperationForTest op(backend);
-    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
-    ASSERT_TRUE(got.has_value());
-    DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
-    m.gc_fenced = true;
-    m.seq += 1;
-    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->etag, DB::Cas::Retry::once());
-    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
-}
-
-/// A real `ContentAddressedMetadataStorage` over a fresh, unique local object storage. `context == nullptr`
-/// (a unit-test mount), so `startup()` creates NO GC scheduler -- the GC entry points, and `gcStart`, create
-/// one lazily. GC is enabled by default (`gc_enabled == true`, `gc_interval_sec == 60`), so no background
-/// round fires during the sub-second test window. Mirrors gtest_cas_forget.cpp's `openForgetStorage`.
+/// A real `ContentAddressedMetadataStorage` over a fresh, unique local object storage, writing blobs (the
+/// gtest context's `replicated_can_become_leader` is the default, 1). GC is enabled by default
+/// (`gc_interval_sec == 60`), so no background round fires during the sub-second test window.
 std::shared_ptr<ContentAddressedMetadataStorage> openGcStorage()
 {
     static std::atomic<uint64_t> counter{0};
@@ -84,7 +60,7 @@ std::shared_ptr<ContentAddressedMetadataStorage> openGcStorage()
         / ("ca_gc_stopstart_scratch_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1)));
     auto settings = Cas::tests::makeSettingsForTest("test", scratch);
     auto storage = std::make_shared<ContentAddressedMetadataStorage>(
-        Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+        Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", getContext().context, settings);
     storage->startup();
     return storage;
 }
@@ -184,102 +160,6 @@ Cas::KeeperRecordTablesFn writerSources()
 /// A generous wait bound for a background round to land -- trips only on a real deadlock/regression.
 constexpr std::chrono::milliseconds kRoundWait{60000};
 
-/// Bound for the [C1] self-exit observation: comfortably above the 1s pacing interval (so a slow CI box
-/// still sees the loop tick + observe the terminal state) yet short enough that the RED demo (self-exit
-/// removed) fails fast rather than hanging for `kRoundWait`.
-constexpr std::chrono::milliseconds kSelfExitWait{15000};
-
-/// A bounded OBSERVATION window (not a sleep-to-fix-a-race) for the "stays stopped across recovery" test:
-/// comfortably above the 1s pacing interval so a running scheduler would have filled it with several
-/// rounds, yet short enough to keep the negative assertion cheap. Its meaning is anchored by a positive
-/// control (an explicit START right after DOES produce a round through the same sink).
-constexpr std::chrono::milliseconds kStayStoppedWindow{3000};
-
-}
-
-/// (C1) A NATURAL terminal transition (`VanishedReplaced`, or here `VanishedForgotten` forced via the test
-/// seam) is never accompanied by a `stop()` on this scheduler — only `~Pool`/FORGET join it. The scheduler's
-/// OWN loops must observe the terminal lifecycle at their next tick and self-exit,
-/// so the pacing loop stops spamming Failed rounds (the G2 zombie) and the steal-capable loop can never
-/// fold/condemn a foreign pool's prefix. Drive it while RUNNING, then vanish it, then prove BOTH loops
-/// self-exit (bounded cv wait, no sleep) and that no further round-log rows appear.
-TEST(CASGCStopStart, SchedulerSelfExitsOnNaturalVanished)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-
-    RoundLogSink sink;
-    /// 1s interval: the loop ticks ~1s; the cv wait below (never a sleep) synchronizes on real records.
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitTest", "ca-disk", writerSources(), sink.logger());
-    sched.start();
-
-    /// Prove the loop is genuinely RUNNING first: a background round must land and acquire the lease.
-    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
-        << "the scheduler must be pacing rounds before we drive it terminal";
-
-    /// A natural terminal transition (forced here via the seam; in production `VanishedReplaced` and
-    /// `IdentityLost` arrive identically, WITHOUT anyone calling stop() on this scheduler).
-    store->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
-
-    ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
-        << "both the pacing and heartbeat loops must self-exit once the pool is Vanished";
-
-    /// No further round-log rows appear after the self-exit: both loops have returned, so capture the
-    /// count, reap them with stop() (a hang/double-terminate here would fail the test), and assert stable.
-    const size_t count_at_exit = sink.mark();
-    sched.stop();
-    EXPECT_EQ(sink.mark(), count_at_exit) << "a self-exited pacing loop must emit no further round records";
-    EXPECT_FALSE(sched.gcHealth().is_leader);
-}
-
-/// (C1, rev.8 §9 item 8) `IdentityLost` is now a fail-loud TERMINAL state, so the scheduler must self-exit
-/// there exactly as it does on `Vanished` — a scheduler ticking against a half-erased pool is a pure zombie
-/// (eternal retries against a vanished pool). Prove the loop self-exits and that no
-/// further round-log rows appear, and that leadership is cleared.
-TEST(CASGCStopStart, SchedulerSelfExitsOnIdentityLost)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-
-    RoundLogSink sink;
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcIdentityLostTest", "ca-disk", writerSources(), sink.logger());
-    sched.start();
-
-    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
-
-    store->setLifecycleForTest(PoolLifecycle::IdentityLost);
-
-    ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait))
-        << "IdentityLost is terminal (rev.8): both the pacing and heartbeat loops must self-exit";
-
-    const size_t count_at_exit = sink.mark();
-    sched.stop();
-    EXPECT_EQ(sink.mark(), count_at_exit) << "a self-exited pacing loop must emit no further round records";
-    EXPECT_FALSE(sched.gcHealth().is_leader) << "a self-exited scheduler must report it no longer leads";
-}
-
-/// (C1 cleanup hygiene) After BOTH loops self-exit on a terminal transition, `stop()` must cleanly reap
-/// the already-finished (joinable) threads, a second `stop()` is a safe no-op, and destruction (scope exit
-/// → ~CasGcScheduler → stop()) runs clean — the ThreadFromGlobalPool join/reset contract holds for a
-/// self-exited thread exactly as for a stop()-signalled one.
-TEST(CASGCStopStart, StopAndDestroyCleanAfterSelfExit)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    {
-        RoundLogSink sink;
-        CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcSelfExitCleanupTest", "ca-disk", writerSources(), sink.logger());
-        sched.start();
-        ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value());
-
-        store->setLifecycleForTest(PoolLifecycle::VanishedReplaced);
-        ASSERT_TRUE(sched.waitForTerminalSelfExitForTest(kSelfExitWait));
-
-        EXPECT_NO_THROW(sched.stop()) << "stop() must cleanly join the self-exited threads";
-        EXPECT_NO_THROW(sched.stop()) << "a second stop() after self-exit is a safe no-op";
-        /// Destruction at scope exit runs stop() a third time — also clean (test completing proves it).
-    }
-    SUCCEED();
 }
 
 /// (a + e) STOP joins the worker + heartbeat threads and clears the in-process leadership hint. The T10
@@ -365,33 +245,6 @@ TEST(CASGCStopStart, StopAndStartAreIdempotent)
     sched.stop();
 }
 
-/// (d) START refuses on a Vanished disk with the typed 668 (`INVALID_STATE`) error -- restarting GC on a
-/// decommissioned pool is meaningless and would only spin failing rounds -- while STOP on the SAME
-/// Vanished disk (with a live scheduler present) SUCCEEDS: stopping the reclaimer on a sick disk is a
-/// legitimate operator action, so STOP never consults the operation gate.
-TEST(CASGCStopStart, StartRefusesOnVanishedButStopSucceeds)
-{
-    /// START on a Vanished disk -> typed 668. No scheduler needed: the gate refuses before touching it.
-    {
-        auto storage = openGcStorage();
-        auto pool = storage->store();                       /// captured while Live (store() throws once Vanished)
-        pool->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
-        Cas::tests::expectThrowsCode(ErrorCodes::INVALID_STATE, [&] { storage->gcStart(); });
-    }
-
-    /// STOP on a Vanished disk WITH a live scheduler -> succeeds.
-    {
-        auto storage = openGcStorage();
-        storage->gcStart();                                 /// Live: lazily creates + starts a scheduler
-        ASSERT_TRUE(storage->gcHealth().has_value()) << "gcStart must have created a scheduler on a Live disk";
-
-        auto pool = storage->store();
-        pool->setLifecycleForTest(PoolLifecycle::VanishedForgotten);
-
-        EXPECT_NO_THROW(storage->gcStop()) << "stopping GC on a Vanished disk is legitimate operator action";
-    }
-}
-
 /// (f) The disk stays fully usable while its GC scheduler is stopped: a store()-path write + read succeed
 /// after `gcStop`. STOP controls ONLY the GC pacer, not the disk's data plane.
 TEST(CASGCStopStart, DiskReadsWritesUnaffectedWhileGcStopped)
@@ -462,55 +315,3 @@ TEST(CASGCStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
     storage->gcStop();
 }
 
-/// (T11 cannot-verify, acceptance matrix) Operator intent PERSISTS across a transient recovery: after the
-/// operator STOPs GC, the disk loses its mount lease (transient-not-live) and self-remounts back to Live —
-/// and NOTHING restarts the GC scheduler. Recovery is a Pool-internal operation with no reference to the
-/// scheduler; only an explicit START (`SYSTEM CAS GC START`) resumes it. We prove the scheduler
-/// was genuinely running+leading first, STOP it, drive a real transient→Live recovery on the pool, then show
-/// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
-/// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the
-/// SAME instance. The positive control makes the negative meaningful: the sink IS live.
-TEST(CASGCStopStart, OperatorStopPersistsAcrossTransientRecovery)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-
-    RoundLogSink sink;
-    /// 1s interval so a RUNNING scheduler would pace rounds within the observation window below.
-    CasGcScheduler sched(store, std::chrono::seconds(1), "CasGcStopPersistTest", "ca-disk", writerSources(), sink.logger());
-
-    /// The operator has GC running and leading.
-    sched.start();
-    ASSERT_TRUE(sink.waitForSuccessFinish(/*from=*/0, kRoundWait).has_value())
-        << "the scheduler must be pacing rounds and leading before the operator stops it";
-    ASSERT_TRUE(sched.gcHealth().is_leader);
-
-    /// The operator STOPs GC (stop-in-place: threads joined, leadership hint cleared).
-    sched.stop();
-    ASSERT_FALSE(sched.gcHealth().is_leader);
-    const size_t after_stop = sink.mark();
-
-    /// The disk now suffers a transient mount-lease loss and self-remounts back to Live (a fresh
-    /// incarnation), WITHOUT any operator action — exactly the recovery §4 describes.
-    store->tripMountLost();
-    ASSERT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive);
-    fenceOutMount(*backend, store->layout().mountKey(kSrid));
-    ASSERT_TRUE(store->tryRemountOnce()) << "the self-remount must reclaim a fresh incarnation";
-    ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live) << "the pool must auto-recover to Live";
-
-    /// The operator's STOP persists: recovery restarted NOTHING. The scheduler is still not leading and
-    /// still quiescent, and NO background round appears across a window a running scheduler would have
-    /// filled many times over.
-    EXPECT_FALSE(sched.gcHealth().is_leader);
-    EXPECT_TRUE(sched.isQuiescent());
-    EXPECT_FALSE(sink.waitForSuccessFinish(after_stop, kStayStoppedWindow).has_value())
-        << "a self-remount recovery must NOT restart an operator-STOPped GC scheduler";
-
-    /// Positive control: only an explicit START resumes rounds, on the SAME instance.
-    /// This also proves the sink WOULD have caught a round, so the negative above is meaningful.
-    sched.start();
-    const auto resumed = sink.waitForSuccessFinish(after_stop, kRoundWait);
-    ASSERT_TRUE(resumed.has_value()) << "an explicit START must resume background rounds after the recovery";
-    EXPECT_TRUE(sched.gcHealth().is_leader);
-    sched.stop();
-}

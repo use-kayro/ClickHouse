@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 
+from helpers.cas import join_pool_after_writer
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
@@ -33,7 +34,9 @@ def start_cluster():
     for name in ("writer", "reader"):
         cluster.add_instance(
             name,
-            main_configs=["configs/storage_conf.xml", "configs/server_root_id_{}.xml".format(name)],
+            main_configs=([] if name == "reader" else ["configs/storage_conf.xml", "configs/server_root_id_writer.xml"])
+            # As production readers: never merge leader, always fetch merged parts (`merge_tree` settings).
+            + (["configs/reader_role.xml"] if name == "reader" else []),
             macros={"replica": name},
             with_rustfs=True,
             with_zookeeper=True,
@@ -42,6 +45,9 @@ def start_cluster():
         )
     try:
         cluster.start()
+        join_pool_after_writer(
+            cluster.instances["reader"], cluster.base_dir, ["configs/storage_conf.xml", "configs/server_root_id_reader.xml"]
+        )
         yield cluster
     finally:
         cluster.shutdown()
@@ -75,9 +81,6 @@ def create_table(node, table, reader):
         "cleanup_delay_period = 1",
         "max_cleanup_delay_period = 1",
     ]
-    if reader:
-        # As production readers: they never assign merges and never run them, they fetch the writer's result.
-        settings += ["always_fetch_merged_part = 1", "replicated_can_become_leader = 0"]
     node.query(
         """
         CREATE TABLE {table} (p UInt8, x UInt64)

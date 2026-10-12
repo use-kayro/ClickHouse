@@ -1,7 +1,7 @@
+#include <Common/tests/gtest_global_context.h>
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromString.h>
@@ -20,14 +20,6 @@ namespace ProfileEvents
 {
     extern const Event CASBlobPut;
     extern const Event CASBlobList;
-    extern const Event CASManifestPut;
-    extern const Event CASManifestOverwrite;
-    extern const Event CASManifestCompareSwap;
-    extern const Event CASManifestList;
-    extern const Event CASRootPut;
-    extern const Event CASRootOverwrite;
-    extern const Event CASRootCompareSwap;
-    extern const Event CASRootList;
     extern const Event CASOtherPut;
     extern const Event CASOtherOverwrite;
     extern const Event CASOtherCompareSwap;
@@ -50,7 +42,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openStorage()
     auto settings = DB::Cas::tests::makeSettingsForTest(
         "srv1", std::filesystem::temp_directory_path() / "cas_keeper_part_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", getContext().context, settings);
     storage->startup();
     return storage;
 }
@@ -63,17 +55,11 @@ void writeThroughTransaction(DB::IMetadataTransaction & tx, const String & path,
     buf->finalize();
 }
 
-/// Object-store writes and LISTs against blobs, manifests, ref state and namespace files. The mount lease
-/// (Server) and GC classes are excluded: their background renewals are not caused by the operations under
-/// test.
+/// Object-store writes and LISTs: blob bodies and every non-blob key (`Other`).
 uint64_t objectStoreWritesAndLists()
 {
     uint64_t total = 0;
     for (auto event : {ProfileEvents::CASBlobPut, ProfileEvents::CASBlobList,
-                       ProfileEvents::CASManifestPut, ProfileEvents::CASManifestOverwrite, ProfileEvents::CASManifestCompareSwap,
-                       ProfileEvents::CASManifestList,
-                       ProfileEvents::CASRootPut, ProfileEvents::CASRootOverwrite, ProfileEvents::CASRootCompareSwap,
-                       ProfileEvents::CASRootList,
                        ProfileEvents::CASOtherPut, ProfileEvents::CASOtherOverwrite, ProfileEvents::CASOtherCompareSwap,
                        ProfileEvents::CASOtherList})
         total += ProfileEvents::global_counters[event].load(std::memory_order_relaxed);
@@ -121,13 +107,6 @@ TEST(CASKeeperPart, HeldPartIsServedRenamedAndRemovedWithoutObjectStoreWritesOrL
     const auto source_plan = storage->getBlobViewPlan(source_part + "/data.bin");
     ASSERT_TRUE(source_plan.has_value());
 
-    /// The reader table's namespace exists before any part arrives (CREATE TABLE writes its files).
-    {
-        auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, String(READER_TABLE) + "/format_version.txt", "1\n");
-        tx->commit(DB::NoCommitOptions{});
-    }
-    (void)storage->listDirectory(READER_TABLE);   /// warm the reader namespace
 
     const uint64_t before = objectStoreWritesAndLists();
 
@@ -139,8 +118,6 @@ TEST(CASKeeperPart, HeldPartIsServedRenamedAndRemovedWithoutObjectStoreWritesOrL
         {{"data.bin", 9, contentHash("content-A")}, {"p.proj/data.bin", 9, contentHash("content-A")}}));
 
     EXPECT_TRUE(storage->existsDirectory(tmp_part));
-    EXPECT_TRUE(storage->isHeldFromKeeper(tmp_part));
-    EXPECT_FALSE(storage->isHeldFromKeeper(source_part));
     EXPECT_TRUE(storage->existsFile(tmp_part + "/data.bin"));
     EXPECT_EQ(storage->getFileSize(tmp_part + "/data.bin"), 9u);
     EXPECT_EQ(storage->tryGetInManifestBytes(tmp_part + "/count.txt"), std::optional<String>("3"));
@@ -167,7 +144,6 @@ TEST(CASKeeperPart, HeldPartIsServedRenamedAndRemovedWithoutObjectStoreWritesOrL
     }
     EXPECT_FALSE(storage->existsDirectory(tmp_part));
     EXPECT_TRUE(storage->existsDirectory(part));
-    EXPECT_TRUE(storage->isHeldFromKeeper(part + "/"));
     EXPECT_EQ(storage->getFileSize(part + "/p.proj/data.bin"), 9u);
 
     {
@@ -180,45 +156,12 @@ TEST(CASKeeperPart, HeldPartIsServedRenamedAndRemovedWithoutObjectStoreWritesOrL
     EXPECT_EQ(objectStoreWritesAndLists(), before);
 }
 
-TEST(CASKeeperPart, WriteIntoHeldPartIsRefused)
-{
-    auto storage = openStorage();
-    {
-        auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, String(READER_TABLE) + "/format_version.txt", "1\n");
-        tx->commit(DB::NoCommitOptions{});
-    }
-    const String part = String(READER_TABLE) + "/all_3_3_0";
-    EXPECT_TRUE(storage->holdKeeperPart(part, {{"count.txt", "3"}}, {}));
-
-    /// A held part has no ref in the pool to repoint and nothing would persist the change: refused,
-    /// never silently lost, and the held content is unchanged.
-    auto tx = storage->createTransaction();
-    try
-    {
-        writeThroughTransaction(*tx, part + "/count.txt", "4");
-        tx->commit(DB::NoCommitOptions{});
-        FAIL() << "a write into a Keeper-held part must be refused";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED) << e.message();
-    }
-    EXPECT_EQ(storage->tryGetInManifestBytes(part + "/count.txt"), std::optional<String>("3"));
-}
-
 /// The MergeTree fast removal of an outdated part (`DataPartStorageOnDiskBase::clearDirectory`): one
 /// transaction unlinks the part's files, the next removes its directory. On a held part it edits and then
 /// forgets what is held, in memory, with no object-store request and no refusal.
 TEST(CASKeeperPart, FastRemovalOfHeldPart)
 {
     auto storage = openStorage();
-    {
-        auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, String(READER_TABLE) + "/format_version.txt", "1\n");
-        tx->commit(DB::NoCommitOptions{});
-    }
-    (void)storage->listDirectory(READER_TABLE);   /// warm the reader namespace
     const String part = String(READER_TABLE) + "/delete_tmp_all_5_5_0";
     EXPECT_TRUE(storage->holdKeeperPart(
         part, {{"count.txt", "3"}, {"checksums.txt", "c"}}, {{"data.bin", 9, contentHash("content-A")}}));
@@ -231,7 +174,6 @@ TEST(CASKeeperPart, FastRemovalOfHeldPart)
         tx->unlinkFile(part + "/txn_version.txt", /*if_exists=*/true, /*should_remove_objects=*/true);
         tx->commit(DB::NoCommitOptions{});
     }
-    EXPECT_TRUE(storage->isHeldFromKeeper(part));
     EXPECT_EQ(storage->listDirectory(part), (std::vector<std::string>{"checksums.txt"}));
     {
         auto tx = storage->createTransaction();
@@ -244,12 +186,11 @@ TEST(CASKeeperPart, FastRemovalOfHeldPart)
         tx->removeDirectory(part);
         tx->commit(DB::NoCommitOptions{});
     }
-    EXPECT_FALSE(storage->isHeldFromKeeper(part));
     EXPECT_FALSE(storage->existsDirectory(part));
     EXPECT_EQ(objectStoreWritesAndLists(), before);
 }
 
-TEST(CASKeeperPart, RefTablePartIsNeverShadowed)
+TEST(CASKeeperPart, HeldPartIsNeverReplacedByARecord)
 {
     auto storage = openStorage();
     const String part = String(SOURCE_TABLE) + "/all_2_2_0";
@@ -260,11 +201,11 @@ TEST(CASKeeperPart, RefTablePartIsNeverShadowed)
         tx->commit(DB::NoCommitOptions{});
     }
 
-    /// A record for a part this server already has in its ref table leaves the ref table in charge.
+    /// A record for a part this disk already holds changes nothing.
     EXPECT_FALSE(storage->holdKeeperPart(part, {{"count.txt", "999"}}, {{"data.bin", 9, contentHash("content-B")}}));
     EXPECT_EQ(storage->tryGetInManifestBytes(part + "/count.txt"), std::optional<String>("5"));
 
-    /// And removing it drops the ref-table ref, not a phantom held copy.
+    /// And removing it forgets it.
     {
         auto tx = storage->createTransaction();
         tx->removeRecursive(part, {});
@@ -287,7 +228,7 @@ TEST(CASKeeperPart, RecordIsTheManifestInlineEntries)
         tx->commit(DB::NoCommitOptions{});
     }
     const auto ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
-    auto entries = storage->partAccess()->getView({ns, "all_4_4_0"}, DB::Cas::Freshness::ForceFresh)->manifest()->entries;
+    auto entries = storage->partAccess()->getView({ns, "all_4_4_0"})->manifest()->entries;
 
     /// A manifest as an older build wrote it: `statistics.packed` Inline.
     DB::Cas::ManifestEntry stats;
@@ -296,7 +237,7 @@ TEST(CASKeeperPart, RecordIsTheManifestInlineEntries)
     stats.inline_bytes = "stats-bytes";
     entries.push_back(stats);
     std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) { return a.path < b.path; });
-    storage->partAccess()->publishEntries({ns, "all_5_5_0"}, entries, DB::Cas::ProvenanceOp::Other);
+    storage->partAccess()->install({ns, "all_5_5_0"}, entries);
     const String legacy_part = String(SOURCE_TABLE) + "/all_5_5_0";
 
     const std::vector<DB::CasKeeperBlobFile> checksummed{
@@ -314,7 +255,7 @@ TEST(CASKeeperPart, RecordIsTheManifestInlineEntries)
     EXPECT_EQ(decoded.files[1].bytes, "stats-bytes");
 
     /// A blob the checksums name differently, a checksummed file the manifest lacks, and a manifest blob
-    /// the checksums do not name: no record (the part replicates by the ordinary fetch).
+    /// the checksums do not name: no record (the commit is refused).
     auto wrong_hash = checksummed;
     wrong_hash[1].hash = contentHash("other");
     EXPECT_FALSE(storage->encodeKeeperPartRecord(legacy_part, wrong_hash).has_value());
@@ -326,3 +267,149 @@ TEST(CASKeeperPart, RecordIsTheManifestInlineEntries)
     /// No published manifest: no record.
     EXPECT_FALSE(storage->encodeKeeperPartRecord(String(SOURCE_TABLE) + "/all_9_9_0", checksummed).has_value());
 }
+
+/// TEC-851 step 3c: a written part costs blob bodies only -- no manifest, ref, marker or namespace object --
+/// and identical content in a second part is adopted without a request. Nothing persists in the pool: a
+/// second disk over the same pool holds nothing until a record is attached.
+TEST(CASKeeperPart, WritesAreBlobBodiesOnlyAndIdenticalContentIsAdopted)
+{
+    auto storage = openStorage();
+    const auto metadata_writes = []
+    {
+        uint64_t total = 0;
+        for (auto event : {ProfileEvents::CASOtherPut, ProfileEvents::CASOtherOverwrite, ProfileEvents::CASOtherCompareSwap,
+                           ProfileEvents::CASOtherList,
+                           ProfileEvents::CASBlobList})
+            total += ProfileEvents::global_counters[event].load(std::memory_order_relaxed);
+        return total;
+    };
+    const auto blob_puts = [] { return ProfileEvents::global_counters[ProfileEvents::CASBlobPut].load(std::memory_order_relaxed); };
+
+    const uint64_t meta_before = metadata_writes();
+    const uint64_t puts_before = blob_puts();
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, String(SOURCE_TABLE) + "/all_6_6_0/data.bin", "content-D");
+        writeThroughTransaction(*tx, String(SOURCE_TABLE) + "/all_6_6_0/count.txt", "1");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    const uint64_t first_puts = blob_puts() - puts_before;
+    EXPECT_GE(first_puts, 1u);
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, String(SOURCE_TABLE) + "/all_7_7_0/data.bin", "content-D");
+        writeThroughTransaction(*tx, String(SOURCE_TABLE) + "/all_7_7_0/count.txt", "1");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(blob_puts() - puts_before, first_puts);   /// adopted: held by all_6_6_0
+    EXPECT_EQ(metadata_writes(), meta_before);
+
+    auto other = openStorage();
+    EXPECT_FALSE(other->existsDirectory(String(SOURCE_TABLE) + "/all_6_6_0"));
+}
+
+namespace
+{
+
+void writePart(DB::ContentAddressedMetadataStorage & storage, const String & part, const String & payload)
+{
+    auto tx = storage.createTransaction();
+    writeThroughTransaction(*tx, part + "/data.bin", payload);
+    writeThroughTransaction(*tx, part + "/count.txt", "1");
+    writeThroughTransaction(*tx, part + "/p.proj/data.bin", payload + "-proj");
+    writeThroughTransaction(*tx, part + "/p.proj/count.txt", "1");
+    tx->commit(DB::NoCommitOptions{});
+}
+
+std::vector<std::string> sorted(std::vector<std::string> v)
+{
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+int errorCode(const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (const DB::Exception & e)
+    {
+        return e.code();
+    }
+    return 0;
+}
+
+}
+
+/// TEC-851 step 3c: the read surface over the in-memory part store.
+TEST(CASKeeperPart, WrittenPartIsListedAndReadFromMemory)
+{
+    auto storage = openStorage();
+    const String table = SOURCE_TABLE;
+    writePart(*storage, table + "/all_8_8_0", "payload-E");
+
+    EXPECT_TRUE(storage->existsDirectory(table));
+    EXPECT_EQ(sorted(storage->listDirectory(table)), (std::vector<std::string>{"all_8_8_0"}));
+    EXPECT_EQ(sorted(storage->listDirectory(table + "/all_8_8_0")), (std::vector<std::string>{"count.txt", "data.bin", "p.proj"}));
+    EXPECT_EQ(sorted(storage->listDirectory(table + "/all_8_8_0/p.proj")), (std::vector<std::string>{"count.txt", "data.bin"}));
+    EXPECT_TRUE(storage->existsDirectory(table + "/all_8_8_0/p.proj"));
+    EXPECT_FALSE(storage->existsDirectory(table + "/all_8_8_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile(table + "/all_8_8_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize(table + "/all_8_8_0/data.bin"), 9u);
+    EXPECT_TRUE(storage->getBlobViewPlan(table + "/all_8_8_0/p.proj/data.bin").has_value());
+}
+
+/// RENAME TABLE moves parts in memory; a part rename and the table removal forget in memory.
+TEST(CASKeeperPart, RenameAndRemovalAreInMemory)
+{
+    auto storage = openStorage();
+    const String table = SOURCE_TABLE;
+    const String other = READER_TABLE;
+    writePart(*storage, table + "/all_9_9_0", "payload-F");
+    {
+        auto tx = storage->createTransaction();
+        tx->moveDirectory(table + "/all_9_9_0", table + "/delete_tmp_all_9_9_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(storage->existsDirectory(table + "/all_9_9_0"));
+    EXPECT_TRUE(storage->existsDirectory(table + "/delete_tmp_all_9_9_0"));
+    {
+        auto tx = storage->createTransaction();
+        tx->moveDirectory(table, other);
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(storage->existsDirectory(table));
+    EXPECT_EQ(sorted(storage->listDirectory(other)), (std::vector<std::string>{"delete_tmp_all_9_9_0"}));
+    {
+        auto tx = storage->createTransaction();
+        tx->removeRecursive(other, {});
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(storage->existsDirectory(other));
+}
+
+/// What could never get a Keeper record is refused at the operation: a table-level or loose file, DETACH
+/// (detached/), a MOVE between disks (moving/) and FREEZE (shadow/).
+TEST(CASKeeperPart, TargetsWithoutARecordAreRefused)
+{
+    auto storage = openStorage();
+    const String table = SOURCE_TABLE;
+    writePart(*storage, table + "/all_10_10_0", "payload-G");
+    const auto refused = [&](const std::function<void(DB::IMetadataTransaction &)> & op)
+    {
+        return errorCode([&] { auto tx = storage->createTransaction(); op(*tx); tx->commit(DB::NoCommitOptions{}); });
+    };
+    EXPECT_EQ(refused([&](auto & tx) { tx.moveDirectory(table + "/all_10_10_0", table + "/detached/all_10_10_0"); }),
+              DB::ErrorCodes::NOT_IMPLEMENTED);
+    EXPECT_EQ(refused([&](auto & tx) { writeThroughTransaction(tx, table + "/moving/all_10_10_0/count.txt", "1"); }),
+              DB::ErrorCodes::NOT_IMPLEMENTED);
+    EXPECT_EQ(refused([&](auto & tx) { writeThroughTransaction(tx, table + "/format_version.txt", "1\n"); }),
+              DB::ErrorCodes::NOT_IMPLEMENTED);
+    EXPECT_EQ(refused([&](auto & tx) { writeThroughTransaction(tx, "clickhouse_access_check_x", "test"); }),
+              DB::ErrorCodes::NOT_IMPLEMENTED);
+    EXPECT_EQ(refused([&](auto & tx) { tx.createHardLink(table + "/all_10_10_0/count.txt", "shadow/1/" + table + "/all_10_10_0/count.txt"); }),
+              DB::ErrorCodes::NOT_IMPLEMENTED);
+    EXPECT_TRUE(storage->existsDirectory(table + "/all_10_10_0"));
+}
+

@@ -231,10 +231,6 @@
     M(DiskPlainRewritableS3DirectoryMapSize, "Number of local-to-remote path entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     M(DiskPlainRewritableS3FileCount, "Number of file entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     \
-    M(CASPartFolderCacheBytes, "Estimated bytes retained by the CA part-folder view cache") \
-    M(CASPartFolderCacheEntries, "Entries retained by the CA part-folder view cache") \
-    M(CASManifestDecodeCacheBytes, "Bytes retained by the CA manifest decode cache") \
-    M(CASManifestDecodeCacheEntries, "Entries retained by the CA manifest decode cache") \
     M(CASHotKeyCacheBytes, "Bytes retained by the CA hot-key lane's cache of last known objects") \
     M(CASHotKeyCacheEntries, "Entries retained by the CA hot-key lane's cache of last known objects") \
     M(CASBlobUploadPoolThreads, "Number of threads in the CA blob upload thread pool.") \

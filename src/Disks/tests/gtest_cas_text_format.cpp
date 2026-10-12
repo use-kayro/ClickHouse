@@ -45,27 +45,19 @@ TEST(CASFormatBattery, EveryRegisteredFormatIsBatteryCovered)
         << "a registered codec is missing from the common battery (or vice versa)";
 }
 
-/// ---- Task 2: FormatId entries for refsnaplog / blob meta ----
-
-TEST(CASFormatIds, NewIdsExistWithFrozenValues)
+TEST(CASFormatIds, LiveIdsKeepTheirFrozenValues)
 {
-    EXPECT_EQ(static_cast<uint16_t>(FormatId::RefLog), 19);
-    EXPECT_EQ(static_cast<uint16_t>(FormatId::RefSnapshot), 20);
-    EXPECT_EQ(static_cast<uint16_t>(FormatId::BlobMeta), 21);
-    /// Every id, old and new, has a change-point ladder (BASELINE until a real bump).
-    for (auto id : {FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta})
-        EXPECT_FALSE(changePoints(id).empty());
+    EXPECT_EQ(static_cast<uint16_t>(FormatId::Blob), 1);
+    EXPECT_EQ(static_cast<uint16_t>(FormatId::PoolMeta), 8);
+    EXPECT_EQ(static_cast<uint16_t>(FormatId::PartFiles), 26);
 }
 
 /// ---- Task 3: per-format traits registry ----
 
 TEST(CASFormatTraits, CompleteUniqueAndGated)
 {
-    /// Completeness: every FormatId except the reserved Roster has traits.
-    const FormatId all[] = {FormatId::Blob, FormatId::PoolMeta,
-                            FormatId::PartManifest, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
-                            FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta,
-                            FormatId::RefCkpt, FormatId::RefCatalog, FormatId::PartFiles};
+    /// Completeness: every FormatId has traits.
+    const FormatId all[] = {FormatId::Blob, FormatId::PoolMeta, FormatId::PartFiles};
     std::set<std::string_view> types;
     for (FormatId id : all)
     {
@@ -76,28 +68,8 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
         EXPECT_EQ(traitsForType(t.type), &t);
     }
     EXPECT_EQ(traitsForType("cas_nope"), nullptr);
-#ifndef DEBUG_OR_SANITIZER_BUILD
-    /// traitsFor(Roster) throws LOGICAL_ERROR (a reserved/unreachable FormatId), which aborts the
-    /// whole process in debug/sanitizer builds instead of behaving like a catchable exception --
-    /// CASFormatTraitsDeathTest below proves the abort positively in those builds instead.
-    EXPECT_THROW(traitsFor(FormatId::Roster), DB::Exception);
-#endif
-    /// .zst key suffix is exactly the Always set (can-grow-large types).
-    EXPECT_EQ(storedSuffix(FormatId::RefSnapshot), ".zst");
-    EXPECT_EQ(storedSuffix(FormatId::RefLog), ".zst");
-    EXPECT_EQ(storedSuffix(FormatId::PartManifest), ".zst");
-    EXPECT_EQ(storedSuffix(FormatId::PoolMeta), "");
 }
 
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-/// Debug/sanitizer-build counterpart to CompleteUniqueAndGated's Roster check: LOGICAL_ERROR aborts
-/// the process here instead of throwing a catchable exception, so the check must be a death test
-/// (same pattern as CASBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
-TEST(CASFormatTraitsDeathTest, TraitsForRosterAborts)
-{
-    EXPECT_DEATH({ (void)traitsFor(FormatId::Roster); }, "");
-}
-#endif
 
 /// ---- Task 4: JSON micro-vocabulary + JsonObjectReader ----
 
@@ -256,47 +228,6 @@ TEST(CASTextLines, ReadLineAndTrailer)
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { readLine(in2, 16, "test"); });
     DB::ReadBufferFromMemory in3(two.data(), two.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { readLine(in3, 2, "test"); });
-}
-
-/// ---- Task 6: the zstd arm ----
-
-TEST(CASZstdArm, SealOpenPolicyAndCaps)
-{
-    /// Always types compress regardless of size (no threshold — the .zst key must be
-    /// constructible without knowing the body); a raw body is still readable (repair path).
-    /// `sealObject`/`openObject` are the storage-wrapper layer and never invoke the version gate
-    /// (that happens at decode, e.g. `decodeRefSnapshot`'s `expectHeaderLine`), so `v:1` here is just
-    /// the baseline header -- the test's subject is the compression arm, not the version.
-    const String small = "{\"type\":\"cas_ref_snap\",\"v\":1}\n{}\n";
-    const String sealed_small = sealObject(FormatId::RefSnapshot, small);
-    ASSERT_TRUE(looksZstd(sealed_small));
-    EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed_small), small);
-    EXPECT_EQ(openObject(FormatId::RefSnapshot, small), small);
-
-    String big = "{\"type\":\"cas_ref_snap\",\"v\":1}\n{\"pad\":\"";
-    big += String(8192, 'a');
-    big += "\"}\n";
-    const String sealed = sealObject(FormatId::RefSnapshot, big);
-    ASSERT_TRUE(looksZstd(sealed));
-    EXPECT_LT(sealed.size(), big.size());
-    EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed), big);
-
-    /// Never formats never compress on write and reject compressed input on read.
-    EXPECT_EQ(sealObject(FormatId::PoolMeta, big), big);
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::PoolMeta, sealed); });
-
-    /// Declared content size over the cap fails BEFORE the output allocation: 65 MiB of text
-    /// against RefSnapshot's 64 MiB cap (compresses to ~nothing, so the test is cheap on disk
-    /// bytes; the 65 MiB source string is the only big allocation).
-    const String over(65 * 1024 * 1024, 'b');
-    const String sealed_over = sealObject(FormatId::RefSnapshot, over);
-    ASSERT_TRUE(looksZstd(sealed_over));
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::RefSnapshot, sealed_over); });
-
-    /// A flipped byte inside the frame is caught by zstd (frame checksum is on).
-    String corrupted = sealed;
-    corrupted[corrupted.size() / 2] ^= 0x01;
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::RefSnapshot, corrupted); });
 }
 
 TEST(CASTextValueEscaping, ForwardSlashPinnedUnescaped)

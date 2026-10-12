@@ -20,7 +20,6 @@ Content-addressed (`CAS`) storage exposes three system tables and a family of `C
 |---|---|---|
 | [`system.cas_mounts`](/operations/system-tables/cas_mounts) | One row per mount slot in the pool, read live from the backend on every query | Who is in the pool right now, lease/epoch state, which node holds GC leadership |
 | [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) | One `Start`/`Finish` row per GC round, plus one `Phase` row per phase reached | GC round outcomes, duration, and where a round's `LIST`/`GET`/`PUT`/`DELETE` budget went |
-| [`system.cas_log`](/operations/system-tables/cas_log) | One row per writer/GC decision (blob puts, dedup adoptions, retire decisions, dangling-access findings) | Fine-grained forensics for one part, one blob hash, or one round |
 
 `system.cas_mounts` is the only one of the three with no persisted backing log — it is a live view,
 so a transient backend error on one disk is skipped rather than blinding the whole query. The other
@@ -29,9 +28,8 @@ two are ordinary `system.*_log` tables and follow the usual flush/retention sett
 ## Key metrics {#key-metrics}
 
 Every `CAS`-related `ProfileEvent` carries the uppercase `CAS`/`CASGC` prefix. This is a curated
-subset for a first health pass; the full list groups by object class (`CASBlob*`, `CASManifest*`,
-`CASRoot*`, `CASGC*`, `CASServer*`, `CASOther*`, `CASRef*`, `CASMeta*`) and is enumerated in
-`src/Common/ProfileEvents.cpp`.
+subset for a first health pass; the per-request events group by key class (`CASBlob*` for blobs,
+`CASOther*` for `_pool_meta` and anything else) and are enumerated in `src/Common/ProfileEvents.cpp`.
 
 | Metric | Healthy range | A spike or nonzero means |
 |---|---|---|

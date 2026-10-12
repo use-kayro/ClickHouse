@@ -37,21 +37,13 @@ struct PoolMeta
     /// because changing it would move the blob payload offset for existing objects; a new hash algorithm
     /// is rejected unless `allow_new` is set, and concurrent admission is retried from fresh metadata.
     ///
-    /// `allow_mint` gates the create-if-absent path: minting a fresh `_pool_meta` is a
-    /// consequential write that establishes a brand-new pool identity, so it is permitted ONLY on the
-    /// writable startup path that has just passed the zero-write residual proof (`Pool::open`). Every
-    /// non-bootstrap caller — a read-only/observe open, `openForDecommission` — passes `false`; an absent
-    /// `_pool_meta` then fails closed with `INVALID_STATE` instead of silently minting (which, on an
-    /// observe scan over a partially-erased pool, would poison the next writable mount). The validate path
-    /// (meta already present) never consults it.
-    ///
-    /// Defaults to `false` — a safety gate must fail CLOSED when a caller leaves it unstated, so a future
-    /// pool-lifecycle entry point cannot silently re-arm the observe-mint footgun by omission. The two
-    /// production callers pass it explicitly; only test minting sites opt in with `allow_mint=true`.
+    /// `writer` gates every write of `_pool_meta`: only the pool's writer mints it (absent => `INVALID_STATE`
+    /// elsewhere) or admits a new algorithm into it (unadmitted => `BAD_ARGUMENTS` elsewhere, whatever
+    /// `allow_new` says). Defaults to `false`, so a caller that leaves it unstated writes nothing.
     static PoolMeta createOrValidate(
         CasOperation &, const Layout &, uint64_t blob_header_len,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
-        bool allow_mint = false);
+        bool writer = false);
 };
 
 /// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the

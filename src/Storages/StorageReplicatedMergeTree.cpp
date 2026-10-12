@@ -529,17 +529,16 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
         if (disk->getDataSourceDescription().metadata_type == MetadataStorageType::Keeper)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "ReplicatedMergeTree doesn't work with 's3_with_keeper' disk type");
 
-        /// B33 (lifted, CAS replication 2b + Phase 3.2): ReplicatedMergeTree on a content-addressed disk
-        /// is allowed. INSERT/SELECT/merge/mutation and fetch-by-relink (the CA analogue of zero-copy
-        /// replication) route through the working whole-part CA transaction / the relink path. The
-        /// replication-queue CLONE paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM, the
-        /// cloneAndLoadDataPart-on-the-queue path) were audited in Phase 3.2: they reach the SAME
-        /// whole-part ContentAddressedTransaction the non-replicated stack uses (see
-        /// `MergeTreeData::checkAlterPartitionIsPossible`, reached here by dynamic dispatch — the
-        /// Phase 3.2 fail-closed override in this class was a pure delegation and was deleted by the
-        /// tail de-patch), NOT the per-file-autocommit B21 mode, so they are now permitted. The
-        /// zero-copy lockSharedData/unlockSharedData calls these reach are safe no-ops on CA (they
-        /// early-return on !supportZeroCopyReplication, which CA is).
+        /// ReplicatedMergeTree on a content-addressed disk is allowed: parts are built by whole-part CA
+        /// transactions and persist as their Keeper records (`CasKeeperPartRecord.h`). Blob bodies are
+        /// written only by the server whose replicas can become merge leader, a role the disk reads from
+        /// the server's `merge_tree` settings: a table may not override it.
+        if (disk->isContentAddressed()
+            && (*getSettings())[MergeTreeSetting::replicated_can_become_leader]
+                != getContext()->getMergeTreeSettings()[MergeTreeSetting::replicated_can_become_leader])
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Table on content-addressed disk {} cannot override `replicated_can_become_leader`: the server's "
+                "`merge_tree` setting decides which server writes the pool's blobs", disk->getName());
     }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
@@ -631,11 +630,19 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
     std::optional<std::unordered_set<std::string>> expected_parts_on_this_replica;
     bool skip_sanity_checks = false;
+    /// A part on a content-addressed disk exists only in its Keeper record: without Keeper the table would load
+    /// no part, and the replica would then fetch (and the writer's GC remove) every part it has.
+    const bool on_cas_disk = !casRecordDisks(getDisks()).empty();
     /// It does not make sense for CREATE query
     if (LoadingStrictnessLevel::ATTACH <= mode)
     {
         try
         {
+            if (on_cas_disk && !current_zookeeper)
+                throw Exception(ErrorCodes::NO_ZOOKEEPER,
+                    "Table {} is on a content-addressed disk, whose parts exist only in their Keeper records: it does not "
+                    "start without Keeper", getStorageID().getNameForLogs());
+
             if (LoadingStrictnessLevel::ATTACH == mode && current_zookeeper && current_zookeeper->exists(replica_path + "/is_active"))
             {
                 throw Exception(ErrorCodes::REPLICA_ALREADY_EXISTS, "There already is an active replica with this replica path {}", replica_path);
@@ -664,21 +671,19 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
                 LOG_WARNING(log, "Skipping the limits on severity of changes to data parts and columns (flag force_restore_data).");
             } /// In case of force_restore it doesn't make sense to check anything
-            else if (current_zookeeper && current_zookeeper->exists(replica_path))
+
+            Strings parts_on_replica;
+            if ((on_cas_disk || !skip_sanity_checks) && current_zookeeper
+                && current_zookeeper->tryGetChildren(fs::path(replica_path) / "parts", parts_on_replica) == Coordination::Error::ZOK)
             {
-                std::vector<std::string> parts_on_replica;
-                if (current_zookeeper->tryGetChildren(fs::path(replica_path) / "parts", parts_on_replica) == Coordination::Error::ZOK)
-                {
-                    expected_parts_on_this_replica.emplace();
-                    for (const auto & part : parts_on_replica)
-                        expected_parts_on_this_replica->insert(part);
-                    holdPartsFromCasRecords(parts_on_replica);
-                }
+                if (!skip_sanity_checks)
+                    expected_parts_on_this_replica.emplace(parts_on_replica.begin(), parts_on_replica.end());
+                holdPartsFromCasRecords(parts_on_replica);
             }
         }
         catch (const Coordination::Exception & e)
         {
-            if (!Coordination::isHardwareError(e.code))
+            if (!Coordination::isHardwareError(e.code) || on_cas_disk)
                 throw;
             LOG_ERROR(log, "Caught exception while checking table metadata in ZooKeeper, will recheck later: {}", e.displayText());
         }
@@ -3486,8 +3491,13 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
     {
         /// Fetches with zero-copy-replication are cheap, but cloneAndLoadDataPart(must_on_same_disk=true) will do full copy.
         /// It's okay to check the setting for current table and disk for the source table, because src and dst part are on the same disk.
-        bool prefer_fetch_from_other_replica = !part_desc->replica.empty() && (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-            && part_desc->src_table_part && part_desc->src_table_part->isStoredOnRemoteDiskWithZeroCopySupport();
+        /// On a content-addressed disk only the pool's writer builds a part (a local clone is a build): any other
+        /// replica fetches the result, attached from its Keeper record.
+        bool prefer_fetch_from_other_replica = !part_desc->replica.empty() && part_desc->src_table_part
+            && (((*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
+                    && part_desc->src_table_part->isStoredOnRemoteDiskWithZeroCopySupport())
+                || (part_desc->src_table_part->getDataPartStorage().isContentAddressed()
+                    && !(*storage_settings_ptr)[MergeTreeSetting::replicated_can_become_leader]));
 
         if (part_desc->src_table_part && !prefer_fetch_from_other_replica)
         {
@@ -5042,8 +5052,8 @@ void StorageReplicatedMergeTree::holdPartsFromCasRecords(const Strings & parts_o
     if (candidates.empty() || parts_on_replica.empty())
         return;
 
-    /// A part some disk of the policy already has -- a content-addressed disk's ref table, or another disk it
-    /// was moved to -- stays there; only the rest is read from Keeper (on a writer: nothing) and attached from
+    /// A part some disk of the policy already has -- held in memory by a content-addressed disk, or on another
+    /// disk it was moved to -- stays there; only the rest is read from Keeper (on a writer: nothing) and attached from
     /// its record, so the `loadDataParts` that follows finds every part without listing the object store.
     const Disks disks = getDisks();
     Strings missing;
@@ -5066,52 +5076,6 @@ void StorageReplicatedMergeTree::holdPartsFromCasRecords(const Strings & parts_o
             ++held;
     LOG_INFO(log, "Attached {} of {} parts of this replica from their Keeper records ({} not on any disk)",
         held, parts_on_replica.size(), missing.size());
-}
-
-void StorageReplicatedMergeTree::backfillCasPartRecords()
-{
-    if (casRecordDisks(getDisks()).empty())
-        return;
-    DataPartsVector parts;
-    for (const auto & part : getDataPartsVectorForInternalUsage({MergeTreeDataPartState::Active}))
-        if (part->getDataPartStorage().isContentAddressed())
-            parts.push_back(part);
-    if (parts.empty())
-        return;
-
-    /// One batched lookup; the missing records get the bytes a commit would have written, built from the
-    /// part views the load already read (no object-store write or LIST). Idempotent: a record another
-    /// replica created meanwhile is left as it is.
-    auto zookeeper = getZooKeeper();
-    Strings paths;
-    paths.reserve(parts.size());
-    for (const auto & part : parts)
-        paths.push_back(casPartRecordPath(zookeeper_path, part->name));
-    auto existing = zookeeper->exists(paths);
-
-    Strings names;
-    std::vector<zkutil::ZooKeeper::FutureCreate> futures;
-    for (size_t i = 0; i < parts.size(); ++i)
-    {
-        if (existing[i].error == Coordination::Error::ZOK)
-            continue;
-        if (auto record = makeCasPartRecord(*parts[i]))
-        {
-            names.push_back(parts[i]->name);
-            futures.push_back(zookeeper->asyncTryCreateNoThrow(paths[i], *record, zkutil::CreateMode::Persistent));
-        }
-    }
-    size_t created = 0;
-    for (size_t i = 0; i < futures.size(); ++i)
-    {
-        const auto code = futures[i].get().error;
-        if (code == Coordination::Error::ZOK)
-            ++created;
-        else if (code != Coordination::Error::ZNODEEXISTS)
-            LOG_WARNING(log, "Cannot create the Keeper record of part {}: {}", names[i], code);
-    }
-    if (!futures.empty())
-        LOG_INFO(log, "Backfilled {} Keeper part records ({} already present)", created, futures.size() - created);
 }
 
 CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const IContentAddressedExchange & disk)
@@ -5156,42 +5120,16 @@ CasKeeperRecordSnapshot StorageReplicatedMergeTree::snapshotCasRecords(const ICo
             listed.insert(parts.begin(), parts.end());
     }
 
-    NameSet recorded;
     for (size_t i = 0; i < names.size(); ++i)
     {
         if (got[i].error != Coordination::Error::ZOK)
             continue;   /// removed meanwhile
-        CasKeeperRecordState state{.part = names[i], .data = std::move(got[i].data), .blobs = {}, .listed = listed.contains(names[i]),
-                                   .version = got[i].stat.version, .mtime_ms = got[i].stat.mtime};
-        try
-        {
-            const CasKeeperPartRecord decoded = disk.decodeKeeperPartRecord(state.data);
-            recorded.insert(names[i]);   /// a part of another pool of the policy is that pool's GC's business
-            if (decoded.pool_uuid != disk.getPoolUUID())
-                continue;
-            state.blobs = casRecordBlobFiles(decoded);
-        }
-        catch (const Exception & e)
-        {
-            /// Blobs unknown: never removed, and while its part is listed, nothing is deleted.
-            recorded.erase(names[i]);
-            LOG_WARNING(log, "Cannot read the Keeper record of part {}: {}", names[i], e.message());
-            continue;
-        }
-        snapshot.records.push_back(std::move(state));
-    }
-
-    /// A listed part without a record: its blobs are unknown unless this replica holds it on a disk that is
-    /// not content-addressed. (One another replica lists on such a disk, and this replica does not hold, counts
-    /// until this replica fetches it or no replica lists it any more.)
-    for (const auto & name : listed)
-    {
-        if (recorded.contains(name))
-            continue;
-        const auto part = getPartIfExists(name, {MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-        if (part && !part->getDataPartStorage().isContentAddressed())
-            continue;
-        ++snapshot.unrecorded_listed;
+        /// A record this build cannot read has unknown blobs: the round fails (removes and deletes nothing).
+        const CasKeeperPartRecord decoded = disk.decodeKeeperPartRecord(got[i].data);
+        if (decoded.pool_uuid != disk.getPoolUUID())
+            continue;   /// a part of another pool of the policy is that pool's GC's business
+        snapshot.records.push_back({.part = names[i], .data = std::move(got[i].data), .blobs = casRecordBlobFiles(decoded),
+                                    .listed = listed.contains(names[i]), .version = got[i].stat.version, .mtime_ms = got[i].stat.mtime});
     }
     return snapshot;
 }
@@ -10393,13 +10331,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
         try
         {
             Coordination::Requests ops;
-            for (size_t i = 0; i < dst_parts.size(); ++i)
-            {
-                /// The parts' disk transaction commits only after this multi-op, so they get no record here
-                /// (ordinary fetch); the next boot backfills them.
-                dest_table_storage->getCommitPartOps(ops, dst_parts[i], block_id_paths[i], /*copied_from_replica_path*/ std::nullopt);
-                ephemeral_locks[i].getUnlockOp(ops);
-            }
+            for (auto & lock : ephemeral_locks)
+                lock.getUnlockOp(ops);
 
             /// Check and update version to avoid race with DROP_RANGE
             ops.emplace_back(zkutil::makeSetRequest(dest_alter_partition_version_path, "", dest_alter_partition_version_stat.version));
@@ -10416,6 +10349,9 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
                 for (auto & part : dst_parts)
                     dest_table_storage->renameTempPartAndReplaceUnlocked(part, transaction, dest_data_parts_lock, /*rename_in_transaction=*/ false);
+                /// After the rename, which publishes the parts' manifests on a content-addressed disk.
+                for (size_t i = 0; i < dst_parts.size(); ++i)
+                    dest_table_storage->getCommitPartOps(ops, dst_parts[i], block_id_paths[i], /*copied_from_replica_path*/ std::nullopt);
 
                 for (const auto & dst_part : dst_parts)
                     dest_table_storage->lockSharedData(*dst_part, false, /*hardlinked_files*/ {});

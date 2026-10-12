@@ -9,14 +9,11 @@
                 <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
                 <!-- A single shared bucket path. BOTH servers load this same config, so they mount
                      the SAME pool. -->
-                <!-- RustFS (not MinIO): the CA mount capability probe requires enforced conditional-DELETE
-                     semantics (CasProbe step 6); MinIO OSS silently honors a mismatched-token DELETE and the
-                     fail-closed probe aborts server startup (PR#2073 CI triage). -->
+                <!-- RustFS (not MinIO): the record GC's exact-ETag DELETE needs enforced conditional-DELETE
+                     semantics; MinIO OSS silently honors a mismatched-token DELETE. -->
                 <endpoint>http://rustfs1:11121/test/shared_pool/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
-                <!-- Two servers mounting one pool: this acknowledgement is mandatory; without it the
-                     second mounter refuses to attach (see PoolMeta ownership check). -->
                 <!-- GC on, a round per second: only the writer's rounds delete, and they must never
                      reclaim a blob a live part on either replica still references. -->
                 <cas_gc_enabled>1</cas_gc_enabled>

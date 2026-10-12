@@ -1,194 +1,100 @@
 # Content-Addressed (CAS) metadata storage
 
-This directory implements the `cas` metadata storage for
-`DiskObjectStorage`: a "git for `MergeTree`" content-addressed pool over
-S3-family object storage. Instead of per-part metadata files pointing at
-randomly-named remote objects, every unique payload is stored **once** in a
-shared pool under a key derived from its **content hash**, a part is an
-immutable **manifest** listing its files, and a per-table **ref table** maps
-part names to manifests. Replicas that share one pool deduplicate bytes
-structurally: fetching a part can *relink* the sender's manifest entries by
-hash instead of copying data. This replaces zero-copy replication's shared
-mutable state with immutable, hash-addressed objects plus a small CAS
-(compare-and-swap) protocol.
+This directory implements the `cas` metadata storage for `DiskObjectStorage`: a content-addressed pool of
+blobs over S3-family object storage, for `ReplicatedMergeTree` tables. Every unique payload is stored
+**once** in a shared pool under a key derived from its **content hash**; a part is the list of its files
+(blob references plus small inline files). Replicas that share one pool share the bytes.
 
-## The data model in five objects
+## What lives where (TEC-851 step 3c)
 
-- **Blob** — the unit of payload. Keyed by its content digest
-  (`CasLayout::blobKey`); an envelope wraps the payload
-  (`Formats/CasBlobEnvelopeFormat`). Blobs are logically immutable and shared: equivalent
-  physical incarnations may replace one another under the same hash key. The pool
-  is the only index, and identity is always established by (re-)hashing the
-  bytes — there are no trust-the-checksum shortcuts. A freshness sidecar
-  (`blobMetaKey` = `blobKey` + `.meta`) carries GC state per hash.
-- **Manifest** — an immutable description of one part: the full file tree with
-  per-file blob references or inline bytes. Small per-part files
-  (`uuid.txt`, `checksums.txt`, ...) live *inside* the manifest as inline tree
-  entries, not as separate objects. Keyed under
-  `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst`.
-- **Ref table** — the mutable naming layer, one namespace per table
-  (`SERVER_ID/TABLE_UUID`), keyed under one LIFE of that namespace: an
-  append-only transaction log plus periodic snapshots (`cas/ns/stream/<life_id>/...`), with mutable
-  checkpoints and namespace files under `cas/ns/state/<life_id>/...`. The catalog resolves each opaque
-  physical ID to its logical namespace life (see `NamespaceLifeId`); stream objects are replayed
-  into an in-memory table mapping
-  ref names (part directory names) to manifests. All mutations go through a
-  precommit/promote two-step so a manifest always has an owner while visible.
-- **Server root** — one per server (`server_root_id` in the disk config): a
-  single-writer mount slot with lease + writer-epoch fencing
-  (`gc/server-roots/<srid>/{owner,epoch,mount}`). A fenced (expired or stolen)
-  writer can never mutate the pool again with stale state.
-- **GC** — derived from the Keeper part records of the tables on the pool; see `Gc/CasKeeperGc.h`.
-
-Everything persisted is a text format with a versioned header line; see
-`Formats/README.md` for the registry, key map, and evolution rules.
-
-## Lifecycle walkthroughs
-
-- **Write**: `ContentAddressedTransaction` buffers or spills file writes
-  (`scratch_path`, or opt-in S3 staging), hashes the payload, and hands it to
-  `Pool/CasPartWriteTxn`: start every materialization with blob `HEAD`, adopt a present
-  non-condemned body or publish the writer's source unconditionally, reconcile `.meta` to
-  `Clean`, and record explicit `Materialized` proof; then stage the manifest, `precommitAdd` the ref,
-  then promote it to committed in the ref log.
-- **Read**: disk path → `Parts/PartPathParser` (namespace + part + file) →
-  ref table resolves the manifest → `Pool/CasManifestReader` locates the
-  entry → blob `StoredObject`s or in-manifest inline bytes.
-- **Fetch between replicas** (`ContentAddressedExchange`): the sender ships
-  its manifest bytes; the receiver rebuilds the part by *adopting* the listed
-  blobs by hash in its own namespace (no payload transfer) and publishes a
-  fresh manifest. Any decode or promote failure just falls back to the
-  ordinary byte fetch.
-- **GC round** (`Gc/CasKeeperGc`, paced by `Gc/CasGcScheduler`): see `Gc/CasKeeperGc.h`.
+- **The object store holds blob bodies and the pool's identity object `_pool_meta`, nothing else.** Only
+  the pool's writer writes them: the server whose replicas can become merge leader
+  (`merge_tree.replicated_can_become_leader`; a CAS table may not override it). `_pool_meta` is minted once,
+  by the writer, on a brand-new pool; every other open only reads it.
+- **A part's persistent copy is its Keeper record** `<zk>/cas_parts/<part>` (`Storages/MergeTree/CasKeeperPartRecord.h`):
+  its inline files and its pool, created in the commit multi-op of the replica that produced the part. A part
+  that cannot have a record is refused at commit. A replica that fetches the part attaches it from the record
+  (no request to the source, none to the object store) and checks the record in its own commit multi-op.
+- **Every node holds its parts in memory** (`Parts/PartFolderAccess`: `HeldParts`) and re-attaches them from
+  their records when a table starts, with no LIST. A table on a CAS disk does not start without Keeper.
+- **Liveness and dedup** come from `Pool/CasBlobRefCount`: one reference per distinct blob of every part this
+  server holds, and one per blob a part under construction claimed. A build claims a blob before it decides;
+  a blob nothing references is uploaded unconditionally under a fresh envelope, a referenced one is adopted
+  with no request.
+- **GC** (`Gc/CasKeeperGc`, paced by `Gc/CasGcScheduler`) runs on the writer (`cas_gc_enabled`, every
+  `cas_gc_interval_sec`). Each table marks the records no replica lists and, `old_parts_lifetime` later,
+  removes them in a multi-op that checks this replica's `is_active`/`host` versions (the only fencing). A blob
+  a removed record named that no remaining record names is deleted only if, after its ETag is read, nothing on
+  this server references it -- by that exact ETag. The pending candidates live in memory only: a writer restart
+  between a record removal and the deletes leaks those blobs, never loses one.
+- **Readers** (servers that do not write blobs) build no part (`NOT_IMPLEMENTED`, before any blob is
+  consulted): no INSERT, local clone, merge or mutation. They commit only fetched parts, attached from their
+  records: REPLACE parts are fetched, and merged and mutated parts too (`always_fetch_merged_part` covers
+  mutations on a CAS disk; without it the local attempt is refused before any request).
+- **One writer per pool.** Nothing in the server prevents two servers with `replicated_can_become_leader = 1`
+  on one pool; keeping exactly one is a deployment precondition (readers 0, writer 1).
+- **Refused on a content-addressed disk**, because nothing would persist the result: a table-level or loose
+  file, FREEZE, DETACH, a fetch into `detached/`, a MOVE to or from another disk (`moving/`), and non-replicated
+  MergeTree tables.
 
 ## Source layout
-
-The tree is **layered**: entry points at the top level, implementation in
-per-subsystem subdirectories with a strict one-direction include rule.
 
 ```
 Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facade (top level)
 ```
 
-- **`Primitives/`** — the vocabulary, zero outward dependencies: `CasBlobDigest`
-  (`BlobHashAlgo` + `BlobDigest` + `DigestCodec` + `BlobRef` — blob identity),
-  `CasTypes.h` (the other identity types: `RootNamespace`, `Dialect`,
-  `ManifestId`, `RefTxnId`), `CasNamespaceLifeId` (`NamespaceLifeId` — one LIFE of
-  a namespace's ref layer, the pair every ref key is built from),
-  `CasBlobHashingWriteBuffer` (streaming
-  hash-and-passthrough machinery), `CasXxh3Streamer` (the isolated vendored
-  xxHash wrapper), `CasCodecUtil` (identifier/hex codec helpers), `CasEvent`
-  (audit-event POD + sink).
-- **`Formats/`** — everything persisted: bytes **and** keys. The per-object
-  text/format files (`CasFormat`, `CasTextFormat`, `CasPartManifestFormat`,
-  `CasRefLogFormat`, …) plus `CasLayout` (the object-key schema). See
-  `Formats/README.md` for the format registry.
-- **`Backend/`** — the request-contract seam: `CasBackend` (the transport
-  primitives, dealing only in the store's own raw incarnation strings:
-  `read`/`head`/`list`/`remove`/`write`/`stream`/`publish`),
-  `CasObjectStorageBackend`, `CasInMemoryBackend`, `CasInstrumentedBackend`,
-  `CasRequests` (the retrying, `Etag`-typed layer above it — `create`/
-  `replace`/`readModifyWrite`/`read`/`remove`/`probeSentinel`/`stream`/
-  `publish`, admitted and budgeted by `Retry` and `CasRequestBudget`),
-  `CasProbe` (mount-time capability probe).
-- **`Pool/`** — the pool engine: `CasPool` (composition root), `CasPartWriteTxn`
-  (one-part write transaction), `CasRefLedger` + `CasRefProtocol` (ref-table
-  log/snapshot/replay), `CasServerRoot` (mount-claim protocol +
-  single-writer slot + staging sweeper), `CasPoolMeta`, `CasBlobMeta`,
-  `CasManifestReader`, `CasPlainObjects` (the `roots/...` verbatim
-  passthrough), `CasMountRuntime` (fence state shared with lanes).
-- **`Gc/`** — garbage collection: `CasGcScheduler` (pacing thread), `CasKeeperGc`
-  (the round, see `Gc/CasKeeperGc.h`), `CasOrphanManifestSweep`.
-- **`Tools/`** — operator verbs (`clickhouse-disks`): `CasFsck`,
-  `CasDecommission`, `CasInspect`.
-- **`Parts/`** — part semantics over the pool: `PartPathParser` (the
-  ClickHouse-path classifier), `PartFolderAccess` (`PartRefKey` + `Freshness`
-  + `PartFolderView` + `CachedPartFolderAccess`).
-- **Top level (facade)** — the entry points: `ContentAddressedMetadataStorage`
-  (the `IMetadataStorage` facade), `ContentAddressedTransaction` (the
-  `IMetadataTransaction`, including the write buffers), `ContentAddressedExchange`
-  (the replication seam).
+A file includes only its own layer and layers to its left. `Tools` and `Parts` are siblings.
 
-## Include-direction rule
-
-A file may include only its **own layer** and layers to its **left** in the
-order above. `Tools` and `Parts` are siblings with no edges between them. This
-is enforced by convention (README rule) — there is no CI check.
-
-**Named exceptions** (deliberate):
-
-- The staging sweeper in `Pool/CasServerRoot` bypasses `Backend` and reaches straight into
-  `IObjectStorage`.
-- `Backend` may read `Formats` traits (the provider-metadata mirror).
+- **`Primitives/`** -- the vocabulary: `CasBlobDigest` (`BlobHashAlgo`, `BlobDigest`, `BlobRef`), `CasTypes.h`,
+  `CasBlobHashingWriteBuffer` (streaming hash-and-passthrough), `CasXxh3Streamer`, `CasCodecUtil`.
+- **`Formats/`** -- what is persisted: `CasBlobEnvelopeFormat` (the blob envelope), `CasPoolMetaFormat`
+  (`_pool_meta`), `CasPartManifestFormat` (the in-memory part file list and the Keeper record's encoding),
+  `CasLayout` (object keys), and the text-format helpers they share.
+- **`Backend/`** -- the request contract: `CasBackend` (transport primitives), `CasObjectStorageBackend`,
+  `CasInMemoryBackend`, `CasInstrumentedBackend` (per-key-class `ProfileEvents`), `CasRequests` (the retrying,
+  `Etag`-typed layer, budgeted by `Retry` and `CasRequestBudget`).
+- **`Pool/`** -- `CasPool` (`_pool_meta` + the request plane, fenced by teardown + `BlobRefCount`),
+  `CasPartBlobs` (the blobs of one part under construction: the one upload path), `CasBlobRefCount`,
+  `CasBlobUploadPool`, `CasPoolMeta`.
+- **`Gc/`** -- `CasKeeperGc` (the round), `CasGcScheduler` (pacing thread, `system.cas_gc_log` rows).
+- **`Tools/`** -- `CasInspect` (`clickhouse-disks cas-inspect`: `_pool_meta` or a blob envelope to JSON).
+- **`Parts/`** -- `PartPathParser` (the ClickHouse-path classifier), `PartFolderAccess` (`PartRefKey`,
+  `PartFolderView`, `HeldParts`).
+- **Top level** -- `ContentAddressedMetadataStorage` (the `IMetadataStorage` facade),
+  `ContentAddressedTransaction` (the `IMetadataTransaction` and its write buffers), `ContentAddressedExchange`
+  (the narrow seam replication and the record GC use).
 
 ## Configuration
 
-A CAS disk is an `object_storage` disk with `metadata_type` =
-`cas`. Minimal example (see
-`tests/config/config.d/cas_storage_policy_for_merge_tree_by_default.xml`
-and its `_s3_` sibling for the lane configs used in CI):
+A CAS disk is an `object_storage` disk with `metadata_type` = `cas`:
 
 ```xml
 <disks>
     <cas>
         <type>object_storage</type>
-        <object_storage_type>s3</object_storage_type> <!-- or local -->
+        <object_storage_type>s3</object_storage_type>
         <metadata_type>cas</metadata_type>
-        <!-- Required, validated identity of the layout subtree this server owns.
-             Must be unique per server sharing the pool. -->
+        <!-- Required: prefix of this server's in-memory namespaces. -->
         <cas_server_root_id>replica-1</cas_server_root_id>
-        <path>cas_pool/</path>
-        <!-- Real server-local scratch dir for the write-buffer spill. -->
-        <cas_scratch_path>cas_scratch/</cas_scratch_path>
         <cas_gc_enabled>1</cas_gc_enabled>
         <cas_gc_interval_sec>60</cas_gc_interval_sec>
     </cas>
 </disks>
 ```
 
-`<readonly>1</readonly>` opens the disk in observe-only mode: no mount-slot
-claim, no capability probe, no writes — the mode `clickhouse-disks` tools and
-post-mortem inspection use. The full knob set (staging backend, cache sizes,
-GC sharding, hash algorithm, request budgets) is parsed in
-`ContentAddressedSettings.cpp`; each knob is documented at its declaration site. Blob publication
-has no presence-cache setting: `HEAD` is mandatory. `gcs_max_conditional_put_bytes` applies to all
-conditional non-blob writes, including create-if-absent artifacts and conditional replacements, but
-not to multipart-capable blob publication.
+The knob set (scratch path, staging backend, hash algorithm, request attempt budget) is declared in
+`ContentAddressedSettings.cpp`, each knob documented at its declaration.
 
 ## Operations and observability
 
-- `clickhouse-disks` verbs (all require the disk opened read-only): `fsck`
-  (independent reachability audit of refs → manifests → blobs), `cas-inspect`
-  (decode one pool object by its raw key to JSON), `cas-drop-member` (decommission a dead pool member).
-- `system.cas_log` — one row per CAS protocol event
-  (uploads, adopts, promotes, condemns, deletes, mount-slot writes, ...);
-  the primary audit trail when investigating pool state.
-- The GC and writer paths also emit `ProfileEvents` counters (grep
-  `ProfileEvents.cpp` for `Cas`).
+- `system.cas_gc_log` -- a Start, a row per phase and a Finish row per GC round on the writer.
+- `system.cas_mounts` -- one row per CAS disk of this server: its GC's health.
+- `SYSTEM CAS GC RUN | STOP | START` -- one synchronous round; pause or resume the background scheduler.
+- `clickhouse-disks cas-inspect <key>` -- decode `_pool_meta` or a blob's envelope.
+- `ProfileEvents` -- grep `ProfileEvents.cpp` for `CAS`.
 
 ## Testing
 
-- **Unit tests** (`unit_tests_dbms`): every CAS suite name starts with `Cas`, so
-  `--gtest_filter='Cas*'` runs the whole set — including parameterized suites,
-  whose instantiation prefixes are `Cas`-prefixed too so the `<Inst>/<Suite>`
-  spelling still matches. `utils/cas-gate/generate_cas_suites.sh` fails loud on a
-  CAS suite that does not match, so a new suite cannot silently sit outside the
-  filter; `utils/cas-gate/run_cas_gate_per_suite.sh` runs them one process per
-  suite, so an abort cannot hide the suites after it.
-- **Stateless lanes**: the functional-test jobs "`cas storage`"
-  (local object storage) and "`cas s3 storage`" run the whole
-  stateless suite with `MergeTree` defaulting to a CAS disk. Tests that
-  legitimately cannot run there carry the `no-cas-storage` tag.
-- **Soak / chaos**: `utils/ca-soak/` — multi-replica docker-compose
-  harnesses (fault proxies, GC sharding variants, AWS S3/GCS backends) and
-  adversarial scenarios.
-
-## Reading order
-
-To understand a request end to end, read in this order:
-
-1. `ContentAddressedMetadataStorage` — the facade / routing.
-2. `Parts/PartFolderAccess` (`PartRefKey` → the folder view / cache).
-3. `Pool/CasPool` — the pool composition root and `open` protocol.
-4. `Pool/CasPartWriteTxn` — one-part write transaction.
-5. `Gc/CasKeeperGc` — the GC round.
+- **Unit tests** (`unit_tests_dbms`): every CAS suite name starts with `Cas`/`CAS`.
+- **Integration**: `tests/integration/test_cas_*` (`test_cas_no_s3_metadata` is the 3c contract: writer +
+  two readers, object writes per key class, no LIST, the refusals, the record GC).

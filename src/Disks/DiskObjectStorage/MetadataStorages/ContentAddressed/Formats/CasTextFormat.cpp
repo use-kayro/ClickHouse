@@ -6,11 +6,8 @@
 #include <IO/ReadHelpers.h>
 #include <base/find_symbols.h>
 #include <base/hex.h>
-#include <base/scope_guard.h>
 #include <algorithm>
-#include <cstring>
 #include <limits>
-#include <zstd.h>
 
 namespace DB
 {
@@ -443,71 +440,6 @@ std::optional<TextHeader> sniffHeaderLine(std::string_view bytes)
     {
         return std::nullopt;
     }
-}
-
-/// ---- the zstd arm ----
-
-bool looksZstd(std::string_view bytes)
-{
-    static constexpr char kZstdFramePrefix[4] = {'\x28', '\xB5', '\x2F', '\xFD'};
-    return bytes.size() >= 4 && memcmp(bytes.data(), kZstdFramePrefix, 4) == 0;
-}
-
-namespace
-{
-constexpr int kZstdLevel = 3;
-}
-
-String sealObject(FormatId id, String text)
-{
-    const FormatTraits & t = traitsFor(id);
-    if (t.compression != CompressionPolicy::Always)
-        return text;
-
-    ZSTD_CCtx * cctx = ZSTD_createCCtx();
-    if (cctx == nullptr)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: cannot create zstd context", t.type);
-    SCOPE_EXIT({ ZSTD_freeCCtx(cctx); });
-    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, kZstdLevel);
-    ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
-
-    String out;
-    out.resize(ZSTD_compressBound(text.size()));
-    const size_t written = ZSTD_compress2(cctx, out.data(), out.size(), text.data(), text.size());
-    if (ZSTD_isError(written))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: zstd compression failed: {}", t.type, ZSTD_getErrorName(written));
-    out.resize(written);
-    return out;
-}
-
-String openObject(FormatId id, std::string_view stored)
-{
-    const FormatTraits & t = traitsFor(id);
-    if (!looksZstd(stored))
-    {
-        if (stored.size() > t.object_cap)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS {}: raw object size {} exceeds the {}-byte cap", t.type, stored.size(), t.object_cap);
-        return String(stored);
-    }
-    if (t.compression != CompressionPolicy::Always)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: compressed object in a format whose policy is raw", t.type);
-
-    const uint64_t content = ZSTD_getFrameContentSize(stored.data(), stored.size());
-    if (content == ZSTD_CONTENTSIZE_UNKNOWN || content == ZSTD_CONTENTSIZE_ERROR)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: zstd frame without a declared content size", t.type);
-    if (content > t.object_cap)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS {}: declared decompressed size {} exceeds the {}-byte cap", t.type, content, t.object_cap);
-
-    String out;
-    out.resize(content);
-    const size_t got = ZSTD_decompress(out.data(), out.size(), stored.data(), stored.size());
-    if (ZSTD_isError(got) || got != content)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: zstd decompression failed: {}",
-            t.type, ZSTD_isError(got) ? ZSTD_getErrorName(got) : "short output");
-    return out;
 }
 
 }

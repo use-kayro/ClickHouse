@@ -22,12 +22,6 @@
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
-/// Direct, though `ContentAddressedMetadataStorage.h` above would also pull it in: this TU renders
-/// `FsckReport`'s hard findings into the SQL row, and `CasFsck.h`'s `kFsckHardFindings` tripwire is what
-/// breaks THIS build when a finding is added. Depending on another header's include list for that would
-/// make the coverage silently removable.
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/IDisk.h>
 #include <Formats/FormatSchemaInfo.h>
 #include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
@@ -1051,18 +1045,6 @@ BlockIO InterpreterSystemQuery::execute()
             result = runContentAddressedGcRun(query.disk);
             break;
         }
-        case Type::CAS_FSCK:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CAS_FSCK);
-            result = runContentAddressedFsck(query.disk);
-            break;
-        }
-        case Type::CAS_FORGET:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CAS_FORGET);
-            contentAddressedForget(query.disk);
-            break;
-        }
         case Type::CAS_GC_STOP:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_STOP);
@@ -1073,58 +1055,6 @@ BlockIO InterpreterSystemQuery::execute()
         {
             getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_START);
             contentAddressedGcStart(query.disk);
-            break;
-        }
-        case Type::CAS_DROP_POOL_MEMBER:
-        {
-            getContext()->checkAccess(AccessType::SYSTEM_CAS_DROP_POOL_MEMBER);
-
-            auto disk = getContext()->getDisk(query.disk);
-            auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-            if (!ca)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "SYSTEM CAS DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
-            ca->checkNotReadOnly("SYSTEM CAS DROP POOL MEMBER");
-
-            const auto & host_store = ca->store();
-            const auto report = Cas::decommissionPoolMember(
-                host_store->poolBackendPtr(), host_store->poolConfig(), query.replica, {},
-                [ca] { ca->requestGcRoundSoon(); });
-
-            /// One-row summary result set (precedent: SYNC_FILESYSTEM_CACHE's MutableColumns/
-            /// SourceFromSingleChunk construction above).
-            ColumnsDescription columns{NamesAndTypesList{
-                {"server_root_id", std::make_shared<DataTypeString>()},
-                {"namespaces_removed", std::make_shared<DataTypeUInt64>()},
-                {"namespaces_already_removed", std::make_shared<DataTypeUInt64>()},
-                {"committed_refs_removed", std::make_shared<DataTypeUInt64>()},
-                {"precommits_removed", std::make_shared<DataTypeUInt64>()},
-                {"manifest_debris_removed", std::make_shared<DataTypeUInt64>()},
-                {"staging_objects_removed", std::make_shared<DataTypeUInt64>()},
-                {"mountpoint_objects_removed", std::make_shared<DataTypeUInt64>()},
-                {"slot_removed", std::make_shared<DataTypeUInt8>()},
-                {"warnings", std::make_shared<DataTypeString>()},
-            }};
-            Block sample_block;
-            for (const auto & column : columns)
-                sample_block.insert({column.type->createColumn(), column.type, column.name});
-
-            MutableColumns res_columns = sample_block.cloneEmptyColumns();
-            size_t i = 0;
-            res_columns[i++]->insert(report.srid);
-            res_columns[i++]->insert(report.namespaces_removed);
-            res_columns[i++]->insert(report.namespaces_already_removed);
-            res_columns[i++]->insert(report.committed_refs_removed);
-            res_columns[i++]->insert(report.precommits_removed);
-            res_columns[i++]->insert(report.manifest_debris_removed);
-            res_columns[i++]->insert(report.staging_objects_removed);
-            res_columns[i++]->insert(report.mountpoint_objects_removed);
-            res_columns[i++]->insert(static_cast<UInt8>(report.slot_removed));
-            res_columns[i++]->insert(fmt::format("{}", fmt::join(report.warnings, "; ")));
-
-            size_t num_rows = res_columns[0]->size();
-            auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
-            result.pipeline = QueryPipeline(std::move(source));
             break;
         }
         case Type::RESTART_DISK:
@@ -2344,21 +2274,18 @@ void InterpreterSystemQuery::syncMerges()
 namespace
 {
 
-/// One-row-per-disk result-set builders for the CAS GC verbs, mirroring the SYSTEM CAS
-/// DROP POOL MEMBER precedent (ColumnsDescription + MutableColumns + SourceFromSingleChunk; see also
-/// SYNC_FILESYSTEM_CACHE above).
+/// One-row-per-disk result-set builders for the CAS GC verbs (ColumnsDescription + MutableColumns +
+/// SourceFromSingleChunk; see also SYNC_FILESYSTEM_CACHE above).
 ColumnsDescription contentAddressedGcRoundColumns()
 {
     return ColumnsDescription{NamesAndTypesList{
         {"disk", std::make_shared<DataTypeString>()},
         {"writer", std::make_shared<DataTypeUInt8>()},
         {"round", std::make_shared<DataTypeUInt64>()},
-        {"objects_condemned", std::make_shared<DataTypeUInt64>()},
         {"objects_deleted", std::make_shared<DataTypeUInt64>()},
         {"objects_absent", std::make_shared<DataTypeUInt64>()},
         {"objects_replaced", std::make_shared<DataTypeUInt64>()},
         {"objects_spared", std::make_shared<DataTypeUInt64>()},
-        {"fence_outs", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2368,77 +2295,10 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(disk_name);
     res_columns[i++]->insert(static_cast<UInt8>(rep.writer));
     res_columns[i++]->insert(rep.round);
-    res_columns[i++]->insert(rep.condemned);
     res_columns[i++]->insert(rep.deleted);
     res_columns[i++]->insert(rep.absent);
     res_columns[i++]->insert(rep.replaced);
     res_columns[i++]->insert(rep.spared);
-    res_columns[i++]->insert(rep.fence_outs);
-}
-
-/// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
-/// keyword (YAGNI -- the offline `clickhouse-disks cas-fsck --detail` applet already covers per-object
-/// listing). Field order/names mirror `Cas::FsckReport`, and every hard finding is a column -- see the
-/// rule stated below. `formatFsckSummary` (`CasFsck.cpp`) prints the same counters as one line, under
-/// some shorter names (`janitor_pending`) and plus `dedup_ratio` and the partial flag.
-ColumnsDescription contentAddressedFsckColumns()
-{
-    return ColumnsDescription{NamesAndTypesList{
-        {"disk", std::make_shared<DataTypeString>()},
-        {"reachable", std::make_shared<DataTypeUInt64>()},
-        {"dangling", std::make_shared<DataTypeUInt64>()},
-        {"unreachable", std::make_shared<DataTypeUInt64>()},
-        {"pending_gc", std::make_shared<DataTypeUInt64>()},
-        {"unaccounted", std::make_shared<DataTypeUInt64>()},
-        /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
-        /// consumer ever gets, so a hard finding the row omits is a finding no query can see.
-        /// `kFsckHardFindings` (`CasFsck.h`) is the list `clean` is computed from, and the `static_assert`
-        /// beside it breaks the build in THIS translation unit when a term is added. Read that assert's
-        /// message before bumping its count -- it names this site as one of the three that owes an
-        /// update, and says that two of the three have no test that can fail on their behalf. WHICH two
-        /// is in the comment above the assert, not in the message; this site is one of them.
-        ///
-        /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
-        /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
-        /// could not prove either way, so a zero here is what makes the other zeros mean something.
-        {"chain_broken", std::make_shared<DataTypeUInt64>()},
-        {"unchecked", std::make_shared<DataTypeUInt64>()},
-        /// A malformed/non-canonical namespace-tree key, or an ambiguous/unreadable catalog
-        /// incarnation — a term of `clean`.
-        {"lifeless_keys", std::make_shared<DataTypeUInt64>()},
-        /// A COMPLETE, canonical namespace-life key whose life is absent from a catalog cut taken after
-        /// the listing: janitor-pending debris, NOT a term of `clean` (see `FsckClass::JanitorPending`).
-        {"namespace_janitor_pending", std::make_shared<DataTypeUInt64>()},
-        {"namespace_janitor_pending_bytes", std::make_shared<DataTypeUInt64>()},
-        {"namespace_janitor_pending_lives", std::make_shared<DataTypeUInt64>()},
-        {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
-        {"physical_bytes", std::make_shared<DataTypeUInt64>()},
-        {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
-        {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
-        {"total_blob_refs", std::make_shared<DataTypeUInt64>()},
-    }};
-}
-
-void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & disk_name, const Cas::FsckReport & rep)
-{
-    size_t i = 0;
-    res_columns[i++]->insert(disk_name);
-    res_columns[i++]->insert(rep.reachable);
-    res_columns[i++]->insert(rep.dangling);
-    res_columns[i++]->insert(rep.unreachable);
-    res_columns[i++]->insert(rep.pending_gc);
-    res_columns[i++]->insert(rep.unaccounted);
-    res_columns[i++]->insert(rep.chain_broken);
-    res_columns[i++]->insert(rep.unchecked);
-    res_columns[i++]->insert(rep.lifeless_keys);
-    res_columns[i++]->insert(rep.namespace_janitor_pending);
-    res_columns[i++]->insert(rep.namespace_janitor_pending_bytes);
-    res_columns[i++]->insert(rep.namespace_janitor_pending_lives);
-    res_columns[i++]->insert(rep.ref_records_walked);
-    res_columns[i++]->insert(rep.physical_bytes);
-    res_columns[i++]->insert(rep.referenced_logical_bytes);
-    res_columns[i++]->insert(rep.distinct_blobs);
-    res_columns[i++]->insert(rep.total_blob_refs);
 }
 
 }
@@ -2481,68 +2341,13 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRun(const String & disk_nam
     return result;
 }
 
-BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name)
-{
-    /// FSCK runs on a RUNNING disk (rev.8): the scan is read-only and revalidates every ref-walk finding
-    /// against a fresh authoritative read, so it needs no quiesce. The disk is REQUIRED, enforced by the
-    /// parser -- no fan-out form.
-    if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS FSCK requires an explicit disk name");
-
-    auto disk = getContext()->getDisk(disk_name);
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-
-    const Cas::FsckReport rep = ca->runFsckNow(/* detail= */ false);   /// summary only (no DETAIL keyword yet)
-
-    ColumnsDescription columns = contentAddressedFsckColumns();
-    Block sample_block;
-    for (const auto & column : columns)
-        sample_block.insert({column.type->createColumn(), column.type, column.name});
-    MutableColumns res_columns = sample_block.cloneEmptyColumns();
-    appendContentAddressedFsckRow(res_columns, disk_name, rep);
-
-    size_t num_rows = res_columns[0]->size();
-    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
-    BlockIO result;
-    result.pipeline = QueryPipeline(std::move(source));
-    return result;
-}
-
-void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
-{
-    /// The operator "fire-marshal" verb (spec §5): a force-Vanish that decommissions a content-addressed
-    /// disk NODE-LOCALLY. Unlike the store()-class verbs, FORGET must work on a disk that is NOT live --
-    /// that is its whole purpose (a stuck transient/IdentityLost pool, an operator-asserted decommission) --
-    /// so it does NOT go through `checkOpAdmitted`/`store()` (which refuse a not-live disk). It is a
-    /// lifecycle verb like the Factory class: it reaches the pool directly and drives it to
-    /// `Vanished(forgotten)`. FORGET is an operator ASSERTION, not an erasure proof; the resulting [D5]
-    /// error message says so.
-    if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS FORGET requires an explicit disk name");
-
-    auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
-    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
-    if (!ca)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-
-    ca->forgetDisk();
-    LOG_WARNING(log,
-        "SYSTEM CAS FORGET decommissioned content-addressed disk '{}' (node-local; erasure "
-        "NOT verified). The disk stays registered and answers store-class access with a typed error; a "
-        "server restart re-registers the name.",
-        disk_name);
-}
-
 void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
 {
     /// SYSTEM CAS GC STOP (spec §6): stop ONLY the background GC scheduler on this disk. The
     /// disk stays fully usable -- reads and writes are unaffected; this is granular operator control of GC
     /// alone (e.g. to pause reclamation during an incident), not a lifecycle transition. STOP-IN-PLACE: the
     /// scheduler object is retained so a later GC START restarts the SAME instance (its in-memory
-    /// `KeeperGc` state preserved). Idempotent; works even on a not-live/Vanished disk (stopping GC on a
-    /// sick disk is legitimate). The disk is REQUIRED -- there is no fan-out form.
+    /// `KeeperGc` state preserved). Idempotent. The disk is REQUIRED -- there is no fan-out form.
     if (disk_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS GC STOP requires an explicit disk name");
 
@@ -3149,21 +2954,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CAS_GC_RUN:
         {
             required_access.emplace_back(AccessType::SYSTEM_CAS_GC_RUN);
-            break;
-        }
-        case Type::CAS_DROP_POOL_MEMBER:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CAS_DROP_POOL_MEMBER);
-            break;
-        }
-        case Type::CAS_FSCK:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CAS_FSCK);
-            break;
-        }
-        case Type::CAS_FORGET:
-        {
-            required_access.emplace_back(AccessType::SYSTEM_CAS_FORGET);
             break;
         }
         case Type::CAS_GC_STOP:
