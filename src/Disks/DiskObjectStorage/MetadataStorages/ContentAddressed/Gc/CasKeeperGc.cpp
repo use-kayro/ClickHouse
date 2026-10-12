@@ -103,8 +103,8 @@ void KeeperGc::runRound(RoundReport & report)
         if (!read)
         {
             t.metric("unreadable", 1);
-            LOG_INFO(log, "CAS GC: some table on the disk cannot be read this round (not loaded yet, or not "
-                     "replicated); removing nothing");
+            LOG_INFO(log, "CAS GC: some table on the disk cannot be read this round (detached, or not replicated); "
+                     "removing nothing");
             return;
         }
         size_t records = 0;

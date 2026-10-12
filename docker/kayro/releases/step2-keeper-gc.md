@@ -65,10 +65,12 @@ Sem mudança no ReplicatedMergeTree, sem lock novo, sem campo novo.
 
 ### Outras regras
 
-- **Quais tabelas.** Vêm do `DatabaseCatalog`, por um provider que o Storages instala no startup (`casKeeperRecordSourcesOnDisk`): sem registry, lock ou registro por tabela. A rodada não roda enquanto:
+- **Quais tabelas.** Vêm do `DatabaseCatalog`, por um provider que o Storages instala no startup (`casKeeperRecordSourcesOnDisk`): sem registry, lock ou registro por tabela. A rodada espera as tabelas que ainda estão carregando ou iniciando (o iterador com `skip_not_loaded=false`) e não roda enquanto:
   - alguma tabela no disco não for replicada (não tem registros, então os blobs dela são desconhecidos);
-  - alguma tabela ainda não estiver carregada, ou estiver detached (`system.detached_tables`);
+  - alguma tabela estiver detached (`system.detached_tables`);
   - alguma tabela estiver read-only, por exemplo porque falhou ao iniciar.
+
+  Se o load ou o startup de uma tabela falhou, ou foi cancelado pelo `stopLoading` do shutdown, a espera lança `ASYNC_LOAD_WAIT_FAILED`. A rodada fica registrada como `Failed` e o log diz "CA GC round failed (will retry next tick)", não "cannot be read". Nada é apagado. Uma rodada manual (`SYSTEM CAS GC RUN`) durante o boot segura `gc_scheduler_mutex` até todas as tabelas terem iniciado.
 - **Ausência transitória não precisa de guarda.** Uma tabela fora do catálogo por um momento (reload, `RESTART REPLICA`) é segura: um blob só sai depois que a rodada da condenação e a da deleção não acharam registro que o referencie, e toda rodada poupa o que uma parte listada referencia.
 - **Só o writer.** A rodada só roda onde toda tabela do disco é escrita ali (`is_leader && !is_readonly`, ou seja, `replicated_can_become_leader`). No não-writer, o snapshot retorna antes de ler registros: as rodadas dos readers não fazem leitura no Keeper nem requisição ao S3.
 - **Builds em andamento.** Um blob só é apagado depois que `Pool::minActive()`, lido antes dos registros, passou do corte de build dele. Toda build deste servidor que existia quando o blob foi condenado já terminou: commitou (e o registro está no snapshot) ou foi abandonada. Uma build que começa depois do marcador vê `Condemned` e re-envia. É o watermark de build em processo que já existe (`min_active_build_sequence`); ele substitui a leitura das staged edges do writer pelos ref logs, que precisaria do LIST que este passo remove.

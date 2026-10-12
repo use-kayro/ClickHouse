@@ -361,7 +361,7 @@ public:
 };
 
 /// The tables on `disk` whose Keeper records its pool's GC reads, or nullopt when some table on it cannot be
-/// read this round (not loaded yet, or not replicated: its blobs are unknown). Storages installs it once at
+/// read this round (detached, or not replicated: its blobs are unknown). Storages installs it once at
 /// startup (it walks `DatabaseCatalog`); until then, and in tools without tables, a disk's GC does nothing.
 using CasKeeperRecordSourcesProvider
     = std::optional<std::vector<std::shared_ptr<ICasKeeperRecordSource>>> (*)(const IContentAddressedExchange & disk);
