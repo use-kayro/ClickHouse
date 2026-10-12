@@ -78,6 +78,7 @@ def start_cluster():
         macros={"replica": "node1"},
         with_rustfs=True,
         with_zookeeper=True,
+        keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
         stay_alive=True,
     )
     cluster.add_instance(
@@ -86,6 +87,7 @@ def start_cluster():
         macros={"replica": "node2"},
         with_rustfs=True,
         with_zookeeper=True,
+        keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
         stay_alive=True,
     )
 

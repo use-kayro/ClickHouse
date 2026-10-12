@@ -157,6 +157,9 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
     /// supplies the manifest ID used to validate a retained view. The emit is deferred: a warm
     /// `CachedForLoad` hit below serves the call without doing any real resolve work worth auditing, so
     /// this call site decides itself, per path, whether to re-emit the identical `RefResolve` event.
+    if (auto held = keeperPart(key))
+        return held->view;
+
     auto resolved = resolve(key, freshness, Cas::ResolveAudit::Deferred);
     if (!resolved)
         return nullptr;
@@ -286,6 +289,8 @@ void CachedPartFolderAccess::eraseView(const PartRefKey & key)
 std::optional<Cas::Resolved>
 CachedPartFolderAccess::resolve(const PartRefKey & key, Freshness freshness, Cas::ResolveAudit audit) const
 {
+    if (auto held = keeperPart(key))
+        return Cas::Resolved{held->view->manifestId(), 0, held->held_at_ms};
     return store->resolveRef(key.ns, key.ref, /*allow_stale=*/freshness == Freshness::CachedForLoad, audit);
 }
 
@@ -480,6 +485,29 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     /// through the pool's manifest cache after a fresh ref resolve, publishing equivalent entries at
     /// the destination, and then dropping the source. The source blobs are adopted by evidence of the
     /// live source edge, never re-probed; the decode is never taken from a retained view.
+    /// A Keeper-held source moves in memory (std::map: `operator[]` keeps `it` valid), and only onto a
+    /// destination that is not already held.
+    {
+        std::lock_guard lock(keeper_mutex);
+        auto ns_it = keeper_parts.find(src.ns.string());
+        if (ns_it != keeper_parts.end())
+        {
+            if (auto it = ns_it->second.find(src.ref); it != ns_it->second.end())
+            {
+                auto & dst_refs = keeper_parts[dst.ns.string()];
+                if (dst_refs.contains(dst.ref))
+                    throw Exception(ErrorCodes::ABORTED,
+                        "republishRef: destination '{}' is already held — refusing (rename/attach conflict)",
+                        dst.ns.string() + "/" + dst.ref);
+                KeeperPart moved = it->second;
+                moved.view = std::make_shared<const PartFolderView>(
+                    dst, Cas::ManifestId{dst.ns, {}}, 0, moved.view->manifest());
+                ns_it->second.erase(src.ref);
+                dst_refs.emplace(dst.ref, std::move(moved));
+                return true;
+            }
+        }
+    }
     auto resolved = store->resolveRef(src.ns, src.ref);
     if (!resolved)
         return false;
@@ -565,6 +593,8 @@ Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, st
 
 void CachedPartFolderAccess::dropRef(const PartRefKey & key)
 {
+    if (forgetKeeperPart(key))
+        return;
     store->dropRef(key.ns, key.ref);
     eraseView(key);
 }
@@ -576,6 +606,8 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     /// the window between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is
     /// replay-safe, so an already-gone ref is success; any other exception still propagates. The view
     /// is also erased on the early-return absent path.
+    if (forgetKeeperPart(key))
+        return;
     if (!store->resolveRef(key.ns, key.ref, /*allow_stale=*/true))
     {
         eraseView(key);
@@ -599,6 +631,8 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
 {
     try
     {
+        if (forgetKeeperPart(key))
+            return;
         store->dropRef(key.ns, key.ref);
     }
     catch (...)
@@ -680,6 +714,10 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
 
 void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
 {
+    {
+        std::lock_guard lock(keeper_mutex);
+        keeper_parts.erase(ns.string());
+    }
     store->dropNamespace(ns);
     if (view_cache)
     {
@@ -687,6 +725,55 @@ void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
         view_cache->remove([&](const String & k, const auto &) { return k.starts_with(prefix); });
     }
     ProfileEvents::increment(ProfileEvents::CASPartFolderViewInvalidations);
+}
+
+void CachedPartFolderAccess::holdKeeperPart(const PartRefKey & key, std::shared_ptr<const Cas::PartManifest> manifest)
+{
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    auto view = std::make_shared<const PartFolderView>(key, Cas::ManifestId{key.ns, {}}, 0, std::move(manifest));
+    std::lock_guard lock(keeper_mutex);
+    keeper_parts[key.ns.string()].insert_or_assign(key.ref, KeeperPart{std::move(view), now_ms});
+}
+
+std::vector<String> CachedPartFolderAccess::keeperRefs(const Cas::RootNamespace & ns, std::string_view prefix) const
+{
+    std::vector<String> refs;
+    std::lock_guard lock(keeper_mutex);
+    auto ns_it = keeper_parts.find(ns.string());
+    if (ns_it == keeper_parts.end())
+        return refs;
+    for (auto it = ns_it->second.lower_bound(String(prefix)); it != ns_it->second.end() && it->first.starts_with(prefix); ++it)
+        refs.push_back(it->first);
+    return refs;
+}
+
+bool CachedPartFolderAccess::isKeeperPart(const PartRefKey & key) const
+{
+    return keeperPart(key).has_value();
+}
+
+std::optional<CachedPartFolderAccess::KeeperPart> CachedPartFolderAccess::keeperPart(const PartRefKey & key) const
+{
+    std::lock_guard lock(keeper_mutex);
+    auto ns_it = keeper_parts.find(key.ns.string());
+    if (ns_it == keeper_parts.end())
+        return std::nullopt;
+    auto it = ns_it->second.find(key.ref);
+    if (it == ns_it->second.end())
+        return std::nullopt;
+    return it->second;
+}
+
+bool CachedPartFolderAccess::forgetKeeperPart(const PartRefKey & key)
+{
+    std::lock_guard lock(keeper_mutex);
+    auto ns_it = keeper_parts.find(key.ns.string());
+    if (ns_it == keeper_parts.end() || !ns_it->second.erase(key.ref))
+        return false;
+    if (ns_it->second.empty())
+        keeper_parts.erase(ns_it);
+    return true;
 }
 
 void CachedPartFolderAccess::recordDecision(const String & cache_key, LastDecision decision,

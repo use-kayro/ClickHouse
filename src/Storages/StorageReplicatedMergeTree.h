@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Interpreters/CancellationCode.h>
+#include <Storages/MergeTree/CasKeeperPartRecord.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/PartLog.h>
 #include <Parsers/SyncReplicaMode.h>
@@ -661,22 +662,40 @@ private:
         const DataPartPtr & part,
         Coordination::Requests & ops,
         String part_name,
-        NameSet & absent_replicas_paths);
+        NameSet & absent_replicas_paths,
+        const std::optional<String> & copied_from_replica_path);
 
     String getChecksumsForZooKeeper(const MergeTreeDataPartChecksums & checksums) const;
 
     bool getOpsToCheckPartChecksumsAndCommit(const ZooKeeperWithFaultInjectionPtr & zookeeper, const MutableDataPartPtr & part,
                                              std::optional<HardlinkedFiles> hardlinked_files, bool replace_zero_copy_lock,
-                                             Coordination::Requests & ops, size_t & num_check_ops);
+                                             Coordination::Requests & ops, size_t & num_check_ops,
+                                             const std::optional<String> & copied_from_replica_path);
 
     /// Accepts a PreActive part, atomically checks its checksums with ones on other replicas and commit the part
-    DataPartsVector checkPartChecksumsAndCommit(Transaction & transaction, const MutableDataPartPtr & part, std::optional<HardlinkedFiles> hardlinked_files = {}, bool replace_zero_copy_lock=false);
+    /// `copied_from_replica_path`: `nullopt` when this replica produced the part, else the replica it was copied
+    /// from (see `addCasPartRecordOps`).
+    DataPartsVector checkPartChecksumsAndCommit(Transaction & transaction, const MutableDataPartPtr & part,
+                                                const std::optional<String> & copied_from_replica_path,
+                                                std::optional<HardlinkedFiles> hardlinked_files = {}, bool replace_zero_copy_lock=false);
 
     bool partIsAssignedToBackgroundOperation(const DataPartPtr & part) const override;
 
-    void getCommitPartOps(Coordination::Requests & ops, const DataPartPtr & part, const String & block_id_path = "") const;
+    /// Also the part's Keeper record when it is on a content-addressed disk (`addCasPartRecordOps`); call it
+    /// after the part's disk transaction is committed (`Transaction::renameParts`).
+    void getCommitPartOps(Coordination::Requests & ops, const DataPartPtr & part, const std::vector<String> & block_id_paths,
+                          const std::optional<String> & copied_from_replica_path) const;
 
-    void getCommitPartOps(Coordination::Requests & ops, const DataPartPtr & part, const std::vector<String> & block_id_paths) const;
+    /// Before `loadDataParts`: makes the content-addressed disks hold this replica's parts from their Keeper
+    /// records (`<zookeeper_path>/cas_parts`, `CasKeeperPartRecord.h`), so a restart re-attaches them
+    /// without listing the object store.
+    void holdPartsFromCasRecords(const Strings & parts_on_replica);
+
+    /// In the attach thread, after `createNewZooKeeperNodes`: creates the missing Keeper records of this
+    /// replica's active parts on content-addressed disks (parts committed before records existed), with the
+    /// same bytes a commit writes -- from the part views the load already read, so no object-store write or
+    /// LIST. Idempotent: a record another replica created meanwhile is left as it is.
+    void backfillCasPartRecords();
 
     /// Adds actions to `ops` that remove a part from ZooKeeper.
     /// Set has_children to true for "old-style" parts (those with /columns and /checksums child znodes).

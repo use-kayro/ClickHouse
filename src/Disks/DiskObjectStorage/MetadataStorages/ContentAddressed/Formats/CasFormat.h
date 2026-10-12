@@ -56,6 +56,7 @@ enum class FormatId : uint16_t
     RefCkpt = 23,         /// cas_ref_ckpt    — per-namespace checkpoint (INV-4)
     RefCatalog = 24,      /// cas_ref_catalog — the whole-pool namespace catalog (INV-3)
     GcMaintenanceState = 25, /// cas_gc_maintenance_state — leak-only namespace-janitor cursor
+    PartFiles = 26,       /// cas_part_files  — a part's Inline entries, held in Keeper (`<zookeeper_path>/cas_parts/<part>`)
 };
 
 /// Returns the writer generation stamped on newly written objects. The current pre-roster writer

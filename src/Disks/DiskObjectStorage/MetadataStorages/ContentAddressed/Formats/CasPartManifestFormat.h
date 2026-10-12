@@ -114,6 +114,32 @@ bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body);
 /// The body `root_namespace_id` must equal the owning root namespace.
 bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body);
 
+/// Text codec for `cas_part_files`, a part's Keeper record: one copy per part at the table level,
+/// `<zookeeper_path>/cas_parts/<part>` (`Storages/MergeTree/CasKeeperPartRecord.h`). Immutable per part name
+/// (a part name is never reused within a table). It carries exactly the part's Inline entries -- the files
+/// whose bytes exist nowhere but inside a manifest -- and the pool their blobs live in:
+///
+///   header line                 {"type":"cas_part_files","v":N}
+///   descriptor meta line         {"pool":"<32 hex pool_id>"}
+///   one entry-record line each   {"path":path,"place":"inline","size":n}, in canonical path order
+///   trailer line                 {"n":entry-count}
+///   PAYLOAD ZONE                 as in `cas_part_manifest`
+///
+/// The Blob entries are not repeated: the inline `checksums.txt` already names every other file with its
+/// size and its CityHash128, which is the `ch128` blob digest. `encodePartFiles` throws `LOGICAL_ERROR`
+/// for a Blob entry; `decodePartFiles` throws `CORRUPTED_DATA` for one.
+struct PartFiles
+{
+    UInt128 pool_id{};
+    std::vector<ManifestEntry> entries;   /// Inline only
+};
+String encodePartFiles(const PartFiles & part_files);
+PartFiles decodePartFiles(std::string_view data);
+
+/// Canonical path order with duplicate-path rejection (`CORRUPTED_DATA`, naming `what`): the order every
+/// entry-record codec writes and every part view relies on. The pointers alias `entries`.
+std::vector<const ManifestEntry *> sortedUniqueEntries(const std::vector<ManifestEntry> & entries, std::string_view what);
+
 /// Pure ordered-entry lookup primitives over a decoded manifest. `decodePartManifest` guarantees
 /// strict ascending order by `path`; `PartFolderView` composes these lookups with wiring policy.
 

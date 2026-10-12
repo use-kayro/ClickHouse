@@ -44,7 +44,13 @@ def start_cluster():
     # without the disk, the disk configuration is installed with the node's own server root, and each
     # node is restarted once the fake answers.
     for name in NODES:
-        cluster.add_instance(name, macros={"replica": name}, with_zookeeper=True, stay_alive=True)
+        cluster.add_instance(
+            name,
+            macros={"replica": name},
+            with_zookeeper=True,
+            keeper_required_feature_flags=["create_if_not_exists"],  # Keeper part records (TEC-849)
+            stay_alive=True,
+        )
     cluster.add_instance(
         GCS_HOST, hostname=GCS_HOST, image="altinityinfra/python-bottle", tag="latest", stay_alive=True
     )
@@ -59,6 +65,9 @@ def start_cluster():
             )
             node.replace_in_config(CONFIG_IN_CONTAINER, "__SERVER_ROOT_ID__", name)
             node.restart_clickhouse()
+            # This test is about relink, which serves every part without a Keeper record
+            # (`cas_part_files`, TEC-849); a part with a record never reaches it.
+            node.query("SYSTEM ENABLE FAILPOINT cas_part_record_omit")
         yield cluster
     finally:
         cluster.shutdown()

@@ -15,6 +15,16 @@ TEST(CASInlinePlacement, ColumnAndMarkFilesStayBlob)
     EXPECT_TRUE(partFileMustStayBlob("primary.idx"));   // potentially large; stays blob (follow-up tuning)
 }
 
+TEST(CASInlinePlacement, StatisticsStayBlob)
+{
+    /// Statistics are the small-file class that grows large; inline they would dominate the Keeper part
+    /// record (`cas_part_files`).
+    EXPECT_TRUE(partFileMustStayBlob("statistics.packed"));
+    EXPECT_TRUE(partFileMustStayBlob("statistics_value.stats"));
+    EXPECT_TRUE(partFileMustStayBlob("p.proj/statistics.packed"));
+    EXPECT_FALSE(partFileMustStayBlob("p.proj/columns.txt"));
+}
+
 TEST(CASInlinePlacement, EagerMetadataFilesAreInlineCandidates)
 {
     EXPECT_FALSE(partFileMustStayBlob("checksums.txt"));
